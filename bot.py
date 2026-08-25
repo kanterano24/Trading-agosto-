@@ -86,7 +86,6 @@ PRIMARY_PAIRS = [
     "GBPUSD-OTC",
     "USDJPY-OTC",
     "EURJPY-OTC",
-    "AUDUSD-OTC",
 ]
 
 
