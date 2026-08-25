@@ -2,13 +2,33 @@ from __future__ import annotations
 
 from typing import Any, Dict, Optional
 import pandas as pd
+import time
 
 # ============================================================
 # CONFIG
 # ============================================================
 
 MIN_CONTINUITY_BODY_RATIO = 0.40
-MIN_SCORE_TO_TRADE = 70   # 🔥 puedes subir a 80 o 85 para ultra sniper
+MIN_SCORE_TO_TRADE = 70
+
+# ============================================================
+# ⛔ CONTROL DE REPETICIÓN (COOLDOWN)
+# ============================================================
+
+last_trade_time = {}
+
+def can_trade(pair: str, current_time: float, cooldown=240):
+    last_time = last_trade_time.get(pair)
+
+    if last_time is None:
+        return True
+
+    return (current_time - last_time) >= cooldown
+
+
+def register_trade(pair: str, current_time: float):
+    last_trade_time[pair] = current_time
+
 
 # ============================================================
 # UTILIDADES
@@ -79,18 +99,70 @@ def get_candle_data(candle):
     }
 
 # ============================================================
-# 🔥 MICRO CONTINUIDAD (BASE)
+# 🧠 3 VELAS EXTERIORES
+# ============================================================
+
+def analyze_last_3_candles(candles_5s):
+    if not candles_5s or len(candles_5s) < 3:
+        return {"valid": False}
+
+    last3 = candles_5s[-3:]
+    data = [get_candle_data(c) for c in last3]
+    data = [d for d in data if d]
+
+    if len(data) < 3:
+        return {"valid": False}
+
+    bullish = 0
+    bearish = 0
+    strong = 0
+    progression_up = 0
+    progression_down = 0
+
+    for i, c in enumerate(data):
+        if c["close"] > c["open"]:
+            bullish += 1
+        else:
+            bearish += 1
+
+        if c["body_ratio"] > 0.5:
+            strong += 1
+
+        if i > 0:
+            prev = data[i - 1]
+            if c["close"] > prev["close"]:
+                progression_up += 1
+            if c["close"] < prev["close"]:
+                progression_down += 1
+
+    if bullish >= 2 and progression_up >= 1:
+        direction = "BULLISH"
+    elif bearish >= 2 and progression_down >= 1:
+        direction = "BEARISH"
+    else:
+        return {"valid": False}
+
+    if strong < 2:
+        return {"valid": False}
+
+    return {
+        "valid": True,
+        "direction": direction
+    }
+
+# ============================================================
+# 🔥 MICRO CONTINUIDAD
 # ============================================================
 
 def analyze_micro_continuity(candles_5s, direction):
     if not candles_5s or len(candles_5s) < 6:
-        return {"valid": False, "reason": "pocas velas 5s"}
+        return {"valid": False}
 
     data = [get_candle_data(c) for c in candles_5s[:6]]
     data = [d for d in data if d]
 
     if len(data) < 6:
-        return {"valid": False, "reason": "datos incompletos"}
+        return {"valid": False}
 
     same_color = 0
     strong_body = 0
@@ -113,13 +185,10 @@ def analyze_micro_continuity(candles_5s, direction):
             if direction == "BEARISH" and c["close"] < prev["close"]:
                 progression += 1
 
-    if same_color >= 4 and strong_body >= 3 and progression >= 3:
-        return {"valid": True, "reason": "continuidad fuerte"}
-
-    return {"valid": False, "reason": "sin continuidad limpia"}
+    return {"valid": same_color >= 4 and strong_body >= 3 and progression >= 3}
 
 # ============================================================
-# 🧠 SCORE IA (PROBABILIDAD REAL)
+# 🧠 SCORE IA
 # ============================================================
 
 def calculate_ai_score(candles_5s, direction):
@@ -166,26 +235,26 @@ def calculate_ai_score(candles_5s, direction):
     return min(int(score / 2.5), 100)
 
 # ============================================================
-# 🔴 FILTRO ANTIRETROCESO
+# 🔴 FILTRO WICK
 # ============================================================
 
 def wick_filter(candle_data, direction):
     if candle_data is None:
-        return False, "sin datos"
+        return False
 
     if direction == "BULLISH" and candle_data["lower_wick_ratio"] > 0.4:
-        return False, "retroceso fuerte"
+        return False
 
     if direction == "BEARISH" and candle_data["upper_wick_ratio"] > 0.4:
-        return False, "retroceso fuerte"
+        return False
 
-    return True, ""
+    return True
 
 # ============================================================
 # 🧠 ANALISIS PRINCIPAL
 # ============================================================
 
-def analyze_market(candle_1m, candles_5s=None, previous_m1=None):
+def analyze_market(candle_1m, candles_5s=None, previous_m1=None, pair="EURUSD-OTC"):
     result = {
         "signal": None,
         "valid": False,
@@ -195,6 +264,13 @@ def analyze_market(candle_1m, candles_5s=None, previous_m1=None):
         "reason": ""
     }
 
+    current_time = time.time()
+
+    if not can_trade(pair, current_time):
+        result["state"] = "COOLDOWN"
+        result["reason"] = "esperando 4 min"
+        return result
+
     current = get_candle_data(candle_1m)
     if current is None:
         return result
@@ -203,46 +279,40 @@ def analyze_market(candle_1m, candles_5s=None, previous_m1=None):
     if len(hist) < 6:
         return result
 
-    # DIRECCIÓN M1
     direction = "BULLISH" if hist["close"].iloc[-1] > hist["close"].iloc[0] else "BEARISH"
     result["direction"] = direction
 
-    # MICRO CONTINUIDAD
+    last3 = analyze_last_3_candles(candles_5s)
+    if not last3["valid"]:
+        result["state"] = "NO_LAST3"
+        return result
+
+    if last3["direction"] != direction:
+        result["state"] = "CONFLICT"
+        return result
+
     micro = analyze_micro_continuity(candles_5s, direction)
     if not micro["valid"]:
         result["state"] = "NO_CONTINUITY"
-        result["reason"] = micro["reason"]
         return result
 
-    # SCORE IA
     ai_score = calculate_ai_score(candles_5s, direction)
     result["score"] = ai_score
 
     if ai_score < MIN_SCORE_TO_TRADE:
-        result["state"] = "LOW_PROBABILITY"
-        result["reason"] = f"score bajo ({ai_score})"
+        result["state"] = "LOW_SCORE"
         return result
 
-    # FILTRO WICK
-    valid_wick, reason = wick_filter(current, direction)
-    if not valid_wick:
-        result["state"] = "REJECT_WICK"
-        result["reason"] = reason
+    if not wick_filter(current, direction):
+        result["state"] = "WICK_REJECT"
         return result
 
-    # CLASIFICACIÓN
-    if ai_score >= 85:
-        quality = "ALTA PRECISION 🔥"
-    elif ai_score >= 75:
-        quality = "BUENA"
-    else:
-        quality = "MEDIA"
+    register_trade(pair, current_time)
 
-    # SEÑAL FINAL
     result["signal"] = "call" if direction == "BULLISH" else "put"
     result["valid"] = True
-    result["state"] = "SNIPER_ENTRY"
-    result["reason"] = f"{quality} | score={ai_score}"
+    result["state"] = "SNIPER"
+    result["reason"] = f"score={ai_score}"
 
     return result
 
@@ -250,21 +320,9 @@ def analyze_market(candle_1m, candles_5s=None, previous_m1=None):
 # FIX BOT
 # ============================================================
 
-def analyze_live_candle(candle_1m, candles_5s=None, previous_m1=None):
-    return analyze_market(candle_1m, candles_5s, previous_m1)
+def analyze_live_candle(candle_1m, candles_5s=None, previous_m1=None, pair="EURUSD-OTC"):
+    return analyze_market(candle_1m, candles_5s, previous_m1, pair)
 
 
-def analyze_minute(*args, **kwargs):
-    return analyze_market(*args, **kwargs)
-
-
-def get_signal(candle_1m, candles_5s=None, previous_m1=None):
-    return analyze_market(candle_1m, candles_5s, previous_m1).get("signal")
-
-
-def signal(*args, **kwargs):
-    return get_signal(*args, **kwargs)
-
-
-if __name__ == "__main__":
-    print("🚀 SNIPER IA ACTIVADO")
+def get_signal(candle_1m, candles_5s=None, previous_m1=None, pair="EURUSD-OTC"):
+    return analyze_market(candle_1m, candles_5s, previous_m1, pair).get("signal")
