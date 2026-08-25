@@ -38,7 +38,7 @@ def safe_dataframe(df: Optional[pd.DataFrame]) -> pd.DataFrame:
     return df
 
 
-def get_candle_data(candle):
+def analyze_candle(candle):
     if candle is None:
         return None
 
@@ -58,32 +58,38 @@ def get_candle_data(candle):
         "close": c,
         "high": h,
         "low": l,
-        "range": rng,
         "body_ratio": body / rng if rng else 0,
         "upper_wick": (h - max(o, c)) / rng if rng else 0,
         "lower_wick": (min(o, c) - l) / rng if rng else 0,
     }
 
-
 # ============================================================
-# 🧠 ANALISIS PRINCIPAL
+# 🧠 MULTI-PAIR ANALYSIS REAL
 # ============================================================
 
-def analyze_market(candle_1m, previous_m1=None):
+def analyze_market(candle_1m, previous_m1=None, pair: str = None):
 
     result = {
         "valid": False,
         "signal": None,
         "score": 0,
         "direction": "NEUTRAL",
+        "pair": pair,
         "reason": ""
     }
+
+    # ❌ SI NO HAY PAR → NO OPERAR
+    if not pair:
+        return result
 
     hist = safe_dataframe(previous_m1)
 
     if len(hist) < 6:
         return result
 
+    # =========================
+    # DIRECCIÓN
+    # =========================
     direction = "BULLISH" if hist["close"].iloc[-1] > hist["close"].iloc[0] else "BEARISH"
     result["direction"] = direction
 
@@ -91,7 +97,7 @@ def analyze_market(candle_1m, previous_m1=None):
 
     same = 0
     body = 0
-    progress = 0
+    progression = 0
 
     for i, c in enumerate(candles):
         is_bull = c["close"] > c["open"]
@@ -105,18 +111,39 @@ def analyze_market(candle_1m, previous_m1=None):
         if i > 0:
             prev = candles[i - 1]
             if direction == "BULLISH" and c["close"] > prev["close"]:
-                progress += 1
+                progression += 1
             if direction == "BEARISH" and c["close"] < prev["close"]:
-                progress += 1
+                progression += 1
 
-    score = same * 15 + body * 10 + progress * 10
+    # =========================
+    # SCORE BASE
+    # =========================
+    score = same * 15 + body * 10 + progression * 10
     score = min(int(score / 2.5), 100)
+
+    # =========================
+    # 🔥 BIAS POR PAR
+    # =========================
+    bias = 1.0
+
+    if "EURUSD" in pair:
+        bias = 1.0
+    elif "GBP" in pair:
+        bias = 1.02
+    elif "JPY" in pair:
+        bias = 0.98
+    elif "OTC" in pair:
+        bias = 1.01
+
+    score = min(int(score * bias), 100)
 
     result["score"] = score
 
+    # =========================
+    # SEÑAL FINAL
+    # =========================
     if score >= MIN_SCORE_TO_TRADE:
         result["valid"] = True
         result["signal"] = "call" if direction == "BULLISH" else "put"
-        result["reason"] = "OK"
 
     return result
