@@ -5,14 +5,14 @@ import time
 import threading
 import requests
 import pandas as pd
-from typing import Dict, List, Optional, Any
+from collections import defaultdict
 
 from iqoptionapi.stable_api import IQ_Option
 from strategy import analyze_market
 
-# ============================================================
+# =========================
 # CONFIG
-# ============================================================
+# =========================
 
 IQ_EMAIL = os.getenv("IQ_EMAIL")
 IQ_PASSWORD = os.getenv("IQ_PASSWORD")
@@ -23,35 +23,22 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 TIMEFRAME = 60
 EXPIRATION = 1
 
-# ============================================================
-# 💰 MONEY MANAGEMENT
-# ============================================================
-
-BASE_AMOUNT = 10
-CURRENT_AMOUNT = BASE_AMOUNT
-MAX_AMOUNT = 200
-
-WIN = 0
-LOSS = 0
-
-# ============================================================
-# STATE
-# ============================================================
-
 BOT_RUNNING = False
 IQ = None
 
-AVAILABLE_PAIRS: List[str] = []
-LAST_REFRESH = 0
-REFRESH_INTERVAL = 900  # 15 min
+# =========================
+# STREAM SYSTEM
+# =========================
 
-OPEN_TRADES: Dict[int, Dict[str, Any]] = {}
+STREAM_CACHE = defaultdict(pd.DataFrame)
+STREAM_STARTED = set()
+LOCK = threading.Lock()
 
-# ============================================================
+# =========================
 # TELEGRAM
-# ============================================================
+# =========================
 
-def send(msg, key="msg", force=False):
+def send(msg):
     try:
         requests.post(
             f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
@@ -61,177 +48,161 @@ def send(msg, key="msg", force=False):
     except:
         pass
 
+# =========================
+# CONNECT
+# =========================
 
-# ============================================================
-# OTC LIST
-# ============================================================
+def connect():
+    global IQ
+    IQ = IQ_Option(IQ_EMAIL, IQ_PASSWORD)
+    IQ.connect()
+    send("🟢 CONECTADO")
 
-def get_otc_pairs():
-    try:
-        data = IQ.get_all_init_v2()
-        pairs = set()
+# =========================
+# PAIRS FIX (5 ONLY)
+# =========================
 
-        for t in ["binary", "turbo"]:
-            for a in data.get(t, {}).get("actives", {}).values():
-                name = a.get("name", "")
-                if "-OTC" in name:
-                    pairs.add(name)
+def get_pairs():
+    data = IQ.get_all_init_v2()
+    pairs = []
 
-        return list(pairs)
-    except:
-        return []
+    for t in ["binary", "turbo"]:
+        for a in data.get(t, {}).get("actives", {}).values():
+            name = a.get("name", "")
+            if "-OTC" in name:
+                pairs.append(name)
+
+    pairs = sorted(pairs)[:5]   # 🔥 SOLO 5 PARES
+    return pairs
+
+# =========================
+# STREAMS ULTRA RÁPIDOS
+# =========================
+
+def start_stream(pair):
+    if pair in STREAM_STARTED:
+        return
+
+    IQ.start_candles_stream(pair, TIMEFRAME, 60)
+    STREAM_STARTED.add(pair)
 
 
-def refresh_pairs():
-    global AVAILABLE_PAIRS, LAST_REFRESH
+def stream_worker(pair):
+    while True:
+        try:
+            candles = IQ.get_realtime_candles(pair, TIMEFRAME)
 
-    if time.time() - LAST_REFRESH > REFRESH_INTERVAL:
-        AVAILABLE_PAIRS = get_otc_pairs()
-        LAST_REFRESH = time.time()
+            if candles:
+                df = pd.DataFrame([
+                    {
+                        "from": int(t),
+                        "open": c["open"],
+                        "close": c["close"],
+                        "high": c.get("max", c.get("high")),
+                        "low": c.get("min", c.get("low")),
+                    }
+                    for t, c in candles.items()
+                ])
 
-        send(f"🔄 OTC actualizados: {len(AVAILABLE_PAIRS)}", "refresh", True)
+                df.sort_values("from", inplace=True)
+                df = df.tail(60)
+
+                with LOCK:
+                    STREAM_CACHE[pair] = df
+
+        except:
+            pass
+
+        time.sleep(0.2)
+
+# =========================
+# START ALL STREAMS
+# =========================
+
+def start_all(pairs):
+    for p in pairs:
+        start_stream(p)
+
+        t = threading.Thread(
+            target=stream_worker,
+            args=(p,),
+            daemon=True
+        )
+        t.start()
+
+# =========================
+# ANALYSIS
+# =========================
+
+def analyze_all():
+    results = []
+
+    for pair in list(STREAM_CACHE.keys()):
+        with LOCK:
+            df = STREAM_CACHE.get(pair)
+
+        if df is None or len(df) < 10:
+            continue
+
+        r = analyze_market(df.iloc[-1], previous_m1=df, pair=pair)
+
+        if r.get("valid"):
+            r["pair"] = pair
+            results.append(r)
+
+    return results
 
 
-# ============================================================
+def best(results):
+    return max(results, key=lambda x: x["score"]) if results else None
+
+# =========================
 # TELEGRAM CONTROL
-# ============================================================
-
-LAST_UPDATE = None
+# =========================
 
 def telegram_worker():
-    global BOT_RUNNING, LAST_UPDATE
+    global BOT_RUNNING
+
+    last = None
 
     while True:
         try:
             r = requests.get(
                 f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates",
-                params={"offset": LAST_UPDATE + 1 if LAST_UPDATE else None},
+                params={"offset": last + 1 if last else None},
                 timeout=3
             ).json()
 
             for u in r.get("result", []):
-                LAST_UPDATE = u["update_id"]
-
-                msg = u.get("message", {})
-                text = msg.get("text", "").lower()
-                chat = str(msg.get("chat", {}).get("id"))
-
-                if chat != str(TELEGRAM_CHAT_ID):
-                    continue
+                last = u["update_id"]
+                text = u["message"]["text"].lower()
 
                 if text == "/start":
                     BOT_RUNNING = True
-                    send("🟢 BOT ON", "start", True)
+                    send("🟢 BOT ON")
 
                 elif text == "/stop":
                     BOT_RUNNING = False
-                    send("🔴 BOT OFF", "stop", True)
-
-                elif text == "/status":
-                    send(
-                        f"Estado: {BOT_RUNNING}\nOTC: {len(AVAILABLE_PAIRS)}\nWIN:{WIN} LOSS:{LOSS}",
-                        "status",
-                        True
-                    )
+                    send("🔴 BOT OFF")
 
         except:
             pass
 
         time.sleep(1)
 
-
-# ============================================================
-# IQ
-# ============================================================
-
-def connect():
-    global IQ
-    IQ = IQ_Option(IQ_EMAIL, IQ_PASSWORD)
-    IQ.connect()
-    send("🟢 Conectado IQ", "connect", True)
-
-
-# ============================================================
-# RESULTS
-# ============================================================
-
-def check_results():
-    global WIN, LOSS, CURRENT_AMOUNT
-
-    for oid, t in list(OPEN_TRADES.items()):
-        try:
-            if time.time() < t["expiry"]:
-                continue
-
-            res = IQ.check_win_v4(oid)
-
-            if res is None:
-                continue
-
-            profit = float(res)
-
-            if profit > 0:
-                WIN += 1
-                CURRENT_AMOUNT = min(BASE_AMOUNT * (1 + WIN * 0.5), MAX_AMOUNT)
-            else:
-                LOSS += 1
-                CURRENT_AMOUNT = BASE_AMOUNT
-
-            send(
-                f"📊 RESULT\n{t['pair']}\n{'WIN' if profit>0 else 'LOSS'}\n{profit}",
-                f"r_{oid}",
-                True
-            )
-
-            del OPEN_TRADES[oid]
-
-        except:
-            pass
-
-
-# ============================================================
-# ANALYZE ALL OTC
-# ============================================================
-
-def select_best(results):
-    if not results:
-        return None
-    return sorted(results, key=lambda x: x["score"], reverse=True)[0]
-
-
-def analyze_all():
-    results = []
-
-    for pair in AVAILABLE_PAIRS:
-        try:
-            candles = IQ.get_candles(pair, TIMEFRAME, 60, time.time())
-            df = pd.DataFrame(candles)
-
-            if len(df) < 10:
-                continue
-
-            r = analyze_market(df.iloc[-1], previous_m1=df)
-
-            if r.get("valid"):
-                r["pair"] = pair
-                results.append(r)
-
-        except:
-            continue
-
-    return results
-
-
-# ============================================================
+# =========================
 # MAIN
-# ============================================================
+# =========================
 
 def main():
     connect()
 
+    pairs = get_pairs()   # 🔥 SOLO 5
+    start_all(pairs)
+
     threading.Thread(target=telegram_worker, daemon=True).start()
 
-    send("🤖 BOT LISTO", "ready", True)
+    send(f"🤖 SNIPER READY | {len(pairs)} PAIRS")
 
     while True:
         try:
@@ -240,37 +211,16 @@ def main():
                 time.sleep(1)
                 continue
 
-            refresh_pairs()
-            check_results()
-
             results = analyze_all()
-            best = select_best(results)
+            b = best(results)
 
-            if not best:
-                time.sleep(1)
-                continue
+            if b:
+                IQ.buy(10, b["pair"], b["signal"], EXPIRATION)
+                send(f"🚀 {b['pair']} {b['signal']} | {b['score']}")
 
-            pair = best["pair"]
-            signal = best["signal"]
+            time.sleep(0.3)
 
-            ok, oid = IQ.buy(CURRENT_AMOUNT, pair, signal, EXPIRATION)
-
-            if ok:
-                OPEN_TRADES[oid] = {
-                    "pair": pair,
-                    "expiry": time.time() + 60
-                }
-
-                send(
-                    f"🚀 TRADE\n{pair}\n{signal.upper()}\n${CURRENT_AMOUNT}\nScore:{best['score']}",
-                    f"t_{pair}",
-                    True
-                )
-
-            time.sleep(1)
-
-        except Exception as e:
-            print(e)
+        except:
             time.sleep(1)
 
 
