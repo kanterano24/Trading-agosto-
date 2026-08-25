@@ -4,13 +4,13 @@ import logging
 import os
 import threading
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Optional
 
 import pandas as pd
 import requests
 
 from iqoptionapi.stable_api import IQ_Option
-from strategy import analyze_live_candle, analyze_market
+from strategy import analyze_market
 
 # ============================================================
 # CONFIG
@@ -23,207 +23,247 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 TIMEFRAME = 60
-CANDLE_COUNT = 62
-
-AMOUNT = 116
 EXPIRATION = 1
 
-POLL_INTERVAL = 0.05
-MAX_ENTRY_DELAY = 5
-
-MIN_MARKET_SCORE = 82
-
 # ============================================================
-# 🔕 FILTRO ANTI-SPAM
+# 💰 GESTIÓN DE MONTO DINÁMICO
 # ============================================================
 
-LAST_TELEGRAM_MESSAGE = ""
-LAST_TELEGRAM_TIME = 0.0
-TELEGRAM_MIN_INTERVAL = 10
+BASE_AMOUNT = 10
+CURRENT_AMOUNT = BASE_AMOUNT
+MAX_AMOUNT = 200
 
+WIN_STREAK = 0
+LOSS_STREAK = 0
 
-def is_important_message(message: str) -> bool:
-    keywords = [
-        "OPERACIÓN ABIERTA",
-        "RESULTADO",
-        "MEJOR MERCADO",
-        "N+1",
-    ]
-    return any(k in message for k in keywords)
+MODE = "compound"  # recomendado
 
+# ============================================================
+# ESTADO
+# ============================================================
+
+BOT_RUNNING = False
+IQ: Optional[IQ_Option] = None
+LAST_UPDATE_ID = None
+
+OPEN_TRADES: Dict[int, Dict[str, Any]] = {}
+
+# ============================================================
+# 🚫 ANTI-SPAM
+# ============================================================
+
+LAST_MSG = {}
+COOLDOWN = 10
+
+def can_send(key):
+    now = time.time()
+    if key in LAST_MSG and now - LAST_MSG[key] < COOLDOWN:
+        return False
+    LAST_MSG[key] = now
+    return True
 
 # ============================================================
 # TELEGRAM
 # ============================================================
 
-def telegram_send(message: str) -> bool:
-    global LAST_TELEGRAM_MESSAGE, LAST_TELEGRAM_TIME
-
+def telegram_send(msg, key="msg"):
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         return False
 
-    if not is_important_message(message):
+    if not can_send(key):
         return False
-
-    now = time.time()
-
-    if message == LAST_TELEGRAM_MESSAGE:
-        return False
-
-    if now - LAST_TELEGRAM_TIME < TELEGRAM_MIN_INTERVAL:
-        return False
-
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
 
     try:
-        response = requests.post(
-            url,
-            data={
-                "chat_id": TELEGRAM_CHAT_ID,
-                "text": message,
-            },
+        requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+            data={"chat_id": TELEGRAM_CHAT_ID, "text": msg},
             timeout=3,
         )
-
-        if response.status_code != 200:
-            logging.warning("Telegram error: %s", response.text)
-            return False
-
-        LAST_TELEGRAM_MESSAGE = message
-        LAST_TELEGRAM_TIME = now
         return True
-
-    except Exception as e:
-        logging.warning("Telegram fallo: %s", e)
+    except:
         return False
 
+# ============================================================
+# 📊 ACTUALIZAR MONTO
+# ============================================================
+
+def update_amount(profit):
+    global CURRENT_AMOUNT, WIN_STREAK, LOSS_STREAK
+
+    if profit > 0:
+        WIN_STREAK += 1
+        LOSS_STREAK = 0
+
+        CURRENT_AMOUNT = min(
+            BASE_AMOUNT * (1 + WIN_STREAK * 0.5),
+            MAX_AMOUNT
+        )
+
+    elif profit < 0:
+        LOSS_STREAK += 1
+        WIN_STREAK = 0
+        CURRENT_AMOUNT = BASE_AMOUNT
+
+    else:
+        CURRENT_AMOUNT = BASE_AMOUNT
+
+# ============================================================
+# TELEGRAM WORKER
+# ============================================================
+
+def telegram_worker():
+    global LAST_UPDATE_ID, BOT_RUNNING
+
+    while True:
+        try:
+            res = requests.get(
+                f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates",
+                params={"offset": LAST_UPDATE_ID + 1 if LAST_UPDATE_ID else None},
+                timeout=3,
+            ).json()
+
+            for u in res.get("result", []):
+                LAST_UPDATE_ID = u["update_id"]
+
+                msg = u.get("message", {})
+                text = msg.get("text", "")
+
+                if not isinstance(text, str):
+                    continue
+
+                text = text.lower().strip()
+                chat_id = str(msg.get("chat", {}).get("id"))
+
+                if str(chat_id) != str(TELEGRAM_CHAT_ID):
+                    continue
+
+                if text.startswith("/start"):
+                    BOT_RUNNING = True
+                    telegram_send("🟢 BOT ACTIVADO", "start")
+
+                elif text.startswith("/stop"):
+                    BOT_RUNNING = False
+                    telegram_send("🔴 BOT DETENIDO", "stop")
+
+                elif text.startswith("/status"):
+                    telegram_send(
+                        f"Estado: {'ACTIVO' if BOT_RUNNING else 'DETENIDO'}\n"
+                        f"Monto actual: ${CURRENT_AMOUNT}",
+                        "status"
+                    )
+
+        except:
+            pass
+
+        time.sleep(1)
+
+# ============================================================
+# CONEXIÓN
+# ============================================================
+
+def connect():
+    global IQ
+    IQ = IQ_Option(IQ_EMAIL, IQ_PASSWORD)
+    IQ.connect()
+    telegram_send("🟢 Conectado a IQ Option", "connect")
 
 # ============================================================
 # RESULTADOS
 # ============================================================
 
-OPEN_TRADES: Dict[int, Dict[str, Any]] = {}
-
-def check_trade_results():
-    if IQ is None:
-        return
-
+def check_results():
     now = int(time.time())
 
-    for order_id, trade in list(OPEN_TRADES.items()):
-        if trade["checked"]:
-            continue
-
-        if now < trade["expiry"]:
+    for oid, t in list(OPEN_TRADES.items()):
+        if now < t["expiry"]:
             continue
 
         try:
-            result = IQ.check_win_v4(order_id)
+            result = IQ.check_win_v4(oid)
 
             if result is None:
                 continue
 
-            trade["checked"] = True
-
             profit = float(result)
+            update_amount(profit)
 
-            outcome = "WIN 🟢" if profit > 0 else "LOSS 🔴" if profit < 0 else "EMPATE ⚪"
+            outcome = "WIN 🟢" if profit > 0 else "LOSS 🔴"
 
             telegram_send(
                 f"📊 RESULTADO\n\n"
-                f"Par: {trade['pair']}\n"
-                f"Dirección: {trade['signal'].upper()}\n"
-                f"Resultado: {outcome}\n"
-                f"Ganancia: {profit}"
+                f"{t['pair']} {outcome}\n"
+                f"💰 {profit}\n\n"
+                f"📈 WIN: {WIN_STREAK}\n"
+                f"📉 LOSS: {LOSS_STREAK}\n"
+                f"💵 Próximo: ${CURRENT_AMOUNT}",
+                f"res_{oid}"
             )
 
-        except Exception as e:
-            logging.warning("Error resultado: %s", e)
+            del OPEN_TRADES[oid]
 
-
-# ============================================================
-# IQ
-# ============================================================
-
-IQ: Optional[IQ_Option] = None
-
-def connect_iq():
-    global IQ
-    IQ = IQ_Option(IQ_EMAIL, IQ_PASSWORD)
-    check, reason = IQ.connect()
-    if not check:
-        raise Exception(reason)
-
+        except:
+            pass
 
 # ============================================================
-# STREAM
-# ============================================================
-
-def get_candles(pair):
-    candles = IQ.get_candles(pair, 60, 100, time.time())
-    return pd.DataFrame(candles)
-
-
-# ============================================================
-# TRADING
-# ============================================================
-
-LAST_TRADE = 0
-
-def trade(pair, signal):
-    global LAST_TRADE
-
-    ok, order_id = IQ.buy(AMOUNT, pair, signal, EXPIRATION)
-
-    if ok:
-        telegram_send(
-            f"✅ OPERACIÓN ABIERTA\n\n"
-            f"{pair}\n{signal.upper()}"
-        )
-
-        OPEN_TRADES[order_id] = {
-            "pair": pair,
-            "signal": signal,
-            "expiry": int(time.time()) + (EXPIRATION * 60),
-            "checked": False
-        }
-
-        LAST_TRADE = time.time()
-
-
-# ============================================================
-# MAIN LOOP
+# MAIN
 # ============================================================
 
 def main():
-    connect_iq()
+    connect()
 
-    pair = "EURUSD-OTC"
+    threading.Thread(
+        target=telegram_worker,
+        daemon=True
+    ).start()
+
+    telegram_send("🤖 BOT LISTO", "ready")
 
     while True:
         try:
-            check_trade_results()
+            if not BOT_RUNNING:
+                time.sleep(1)
+                continue
 
-            df = get_candles(pair)
+            check_results()
+
+            pair = "EURUSD-OTC"
+
+            candles = IQ.get_candles(pair, 60, 60, time.time())
+            df = pd.DataFrame(candles)
 
             result = analyze_market(
                 df.iloc[-1],
                 previous_m1=df
             )
 
-            if result["valid"] and time.time() - LAST_TRADE > 240:
-                telegram_send(
-                    f"🏆 MEJOR MERCADO\n\n{pair}\n{result['signal'].upper()}"
+            if result.get("valid"):
+                signal = result["signal"]
+
+                ok, oid = IQ.buy(
+                    CURRENT_AMOUNT,
+                    pair,
+                    signal,
+                    EXPIRATION
                 )
 
-                trade(pair, result["signal"])
+                if ok:
+                    telegram_send(
+                        f"🚀 TRADE {pair} {signal.upper()}\n💵 ${CURRENT_AMOUNT}",
+                        f"trade_{pair}"
+                    )
+
+                    OPEN_TRADES[oid] = {
+                        "pair": pair,
+                        "expiry": int(time.time()) + 60
+                    }
 
             time.sleep(1)
 
         except Exception as e:
             logging.error(e)
-            time.sleep(2)
+            time.sleep(1)
 
+# ============================================================
 
 if __name__ == "__main__":
     main()
