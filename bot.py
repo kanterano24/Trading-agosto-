@@ -26,7 +26,7 @@ TIMEFRAME = 60
 EXPIRATION = 1
 
 # ============================================================
-# 💰 GESTIÓN DE MONTO DINÁMICO
+# 💰 GESTIÓN DINÁMICA
 # ============================================================
 
 BASE_AMOUNT = 10
@@ -36,10 +36,8 @@ MAX_AMOUNT = 200
 WIN_STREAK = 0
 LOSS_STREAK = 0
 
-MODE = "compound"  # recomendado
-
 # ============================================================
-# ESTADO
+# ESTADO GENERAL
 # ============================================================
 
 BOT_RUNNING = False
@@ -47,6 +45,21 @@ IQ: Optional[IQ_Option] = None
 LAST_UPDATE_ID = None
 
 OPEN_TRADES: Dict[int, Dict[str, Any]] = {}
+
+# ============================================================
+# 🧠 IA SIMPLE QUE APRENDE
+# ============================================================
+
+AI_MEMORY = {
+    "total": 0,
+    "wins": 0,
+    "losses": 0,
+    "weights": {
+        "score": 1.0,
+        "continuity": 1.0,
+        "trend": 1.0,
+    }
+}
 
 # ============================================================
 # 🚫 ANTI-SPAM
@@ -63,14 +76,15 @@ def can_send(key):
     return True
 
 # ============================================================
-# TELEGRAM
+# TELEGRAM SEND
 # ============================================================
 
-def telegram_send(msg, key="msg"):
+def telegram_send(msg: str, key: str = "msg", force: bool = False):
+
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         return False
 
-    if not can_send(key):
+    if not force and not can_send(key):
         return False
 
     try:
@@ -84,10 +98,30 @@ def telegram_send(msg, key="msg"):
         return False
 
 # ============================================================
-# 📊 ACTUALIZAR MONTO
+# IA UPDATE
 # ============================================================
 
-def update_amount(profit):
+def update_ai(profit: float):
+
+    AI_MEMORY["total"] += 1
+
+    if profit > 0:
+        AI_MEMORY["wins"] += 1
+        AI_MEMORY["weights"]["score"] *= 1.01
+        AI_MEMORY["weights"]["continuity"] *= 1.02
+        AI_MEMORY["weights"]["trend"] *= 1.01
+    else:
+        AI_MEMORY["losses"] += 1
+        AI_MEMORY["weights"]["score"] *= 0.99
+        AI_MEMORY["weights"]["continuity"] *= 0.98
+        AI_MEMORY["weights"]["trend"] *= 0.99
+
+# ============================================================
+# MONTO DINÁMICO
+# ============================================================
+
+def update_amount(profit: float):
+
     global CURRENT_AMOUNT, WIN_STREAK, LOSS_STREAK
 
     if profit > 0:
@@ -99,12 +133,9 @@ def update_amount(profit):
             MAX_AMOUNT
         )
 
-    elif profit < 0:
+    else:
         LOSS_STREAK += 1
         WIN_STREAK = 0
-        CURRENT_AMOUNT = BASE_AMOUNT
-
-    else:
         CURRENT_AMOUNT = BASE_AMOUNT
 
 # ============================================================
@@ -112,6 +143,7 @@ def update_amount(profit):
 # ============================================================
 
 def telegram_worker():
+
     global LAST_UPDATE_ID, BOT_RUNNING
 
     while True:
@@ -126,30 +158,44 @@ def telegram_worker():
                 LAST_UPDATE_ID = u["update_id"]
 
                 msg = u.get("message", {})
-                text = msg.get("text", "")
-
-                if not isinstance(text, str):
-                    continue
-
-                text = text.lower().strip()
+                text = str(msg.get("text", "")).lower()
                 chat_id = str(msg.get("chat", {}).get("id"))
 
-                if str(chat_id) != str(TELEGRAM_CHAT_ID):
+                if chat_id != str(TELEGRAM_CHAT_ID):
                     continue
 
                 if text.startswith("/start"):
                     BOT_RUNNING = True
-                    telegram_send("🟢 BOT ACTIVADO", "start")
+                    telegram_send("🟢 BOT ACTIVADO", "start", force=True)
 
                 elif text.startswith("/stop"):
                     BOT_RUNNING = False
-                    telegram_send("🔴 BOT DETENIDO", "stop")
+                    telegram_send("🔴 BOT DETENIDO", "stop", force=True)
 
                 elif text.startswith("/status"):
                     telegram_send(
                         f"Estado: {'ACTIVO' if BOT_RUNNING else 'DETENIDO'}\n"
-                        f"Monto actual: ${CURRENT_AMOUNT}",
-                        "status"
+                        f"Monto: ${CURRENT_AMOUNT}\n"
+                        f"WIN: {WIN_STREAK} | LOSS: {LOSS_STREAK}",
+                        "status",
+                        force=True
+                    )
+
+                elif text.startswith("/ai"):
+                    winrate = (
+                        AI_MEMORY["wins"] / AI_MEMORY["total"] * 100
+                        if AI_MEMORY["total"] > 0 else 0
+                    )
+
+                    telegram_send(
+                        "🧠 IA STATUS\n\n"
+                        f"Total: {AI_MEMORY['total']}\n"
+                        f"Wins: {AI_MEMORY['wins']}\n"
+                        f"Losses: {AI_MEMORY['losses']}\n"
+                        f"Winrate: {winrate:.2f}%\n\n"
+                        f"Pesos: {AI_MEMORY['weights']}",
+                        "ai",
+                        force=True
                     )
 
         except:
@@ -158,7 +204,7 @@ def telegram_worker():
         time.sleep(1)
 
 # ============================================================
-# CONEXIÓN
+# CONEXIÓN IQ
 # ============================================================
 
 def connect():
@@ -172,10 +218,11 @@ def connect():
 # ============================================================
 
 def check_results():
+
     now = int(time.time())
 
-    for oid, t in list(OPEN_TRADES.items()):
-        if now < t["expiry"]:
+    for oid, trade in list(OPEN_TRADES.items()):
+        if now < trade["expiry"]:
             continue
 
         try:
@@ -185,18 +232,19 @@ def check_results():
                 continue
 
             profit = float(result)
+
             update_amount(profit)
+            update_ai(profit)
 
             outcome = "WIN 🟢" if profit > 0 else "LOSS 🔴"
 
             telegram_send(
                 f"📊 RESULTADO\n\n"
-                f"{t['pair']} {outcome}\n"
+                f"{trade['pair']} {outcome}\n"
                 f"💰 {profit}\n\n"
-                f"📈 WIN: {WIN_STREAK}\n"
-                f"📉 LOSS: {LOSS_STREAK}\n"
-                f"💵 Próximo: ${CURRENT_AMOUNT}",
-                f"res_{oid}"
+                f"WIN: {WIN_STREAK} | LOSS: {LOSS_STREAK}\n"
+                f"💵 Monto: ${CURRENT_AMOUNT}",
+                f"result_{oid}"
             )
 
             del OPEN_TRADES[oid]
@@ -205,10 +253,11 @@ def check_results():
             pass
 
 # ============================================================
-# MAIN
+# MAIN LOOP
 # ============================================================
 
 def main():
+
     connect()
 
     threading.Thread(
@@ -220,6 +269,7 @@ def main():
 
     while True:
         try:
+
             if not BOT_RUNNING:
                 time.sleep(1)
                 continue
@@ -231,12 +281,10 @@ def main():
             candles = IQ.get_candles(pair, 60, 60, time.time())
             df = pd.DataFrame(candles)
 
-            result = analyze_market(
-                df.iloc[-1],
-                previous_m1=df
-            )
+            result = analyze_market(df.iloc[-1], previous_m1=df)
 
             if result.get("valid"):
+
                 signal = result["signal"]
 
                 ok, oid = IQ.buy(
@@ -247,15 +295,15 @@ def main():
                 )
 
                 if ok:
-                    telegram_send(
-                        f"🚀 TRADE {pair} {signal.upper()}\n💵 ${CURRENT_AMOUNT}",
-                        f"trade_{pair}"
-                    )
-
                     OPEN_TRADES[oid] = {
                         "pair": pair,
                         "expiry": int(time.time()) + 60
                     }
+
+                    telegram_send(
+                        f"🚀 TRADE {pair} {signal.upper()}\n💵 ${CURRENT_AMOUNT}",
+                        f"trade_{pair}"
+                    )
 
             time.sleep(1)
 
