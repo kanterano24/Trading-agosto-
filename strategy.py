@@ -10,18 +10,11 @@ import pandas as pd
 
 MIN_SCORE_TO_TRADE = 75
 
-MIN_CANDLES = 12
+MIN_CANDLES = 8
 
 MIN_BODY_RATIO = 0.30
 
 MAX_DOJI_RATIO = 0.25
-
-# Evita entrar cuando las últimas velas están demasiado
-# extendidas en una sola dirección.
-MAX_SAME_DIRECTION = 4
-
-# Mínimo de confirmaciones para considerar una entrada.
-MIN_CONFIRMATIONS = 3
 
 
 # ============================================================
@@ -146,25 +139,11 @@ def market_structure(df):
         elif closes[i] < closes[i - 1]:
             falling += 1
 
-    # --------------------------------------------------------
-    # ESTRUCTURA ALCISTA
-    # --------------------------------------------------------
-
-    if (
-        rising >= 4
-        and closes[-1] > closes[0]
-    ):
+    if rising >= 4 and closes[-1] > closes[0]:
 
         return "BULLISH"
 
-    # --------------------------------------------------------
-    # ESTRUCTURA BAJISTA
-    # --------------------------------------------------------
-
-    if (
-        falling >= 4
-        and closes[-1] < closes[0]
-    ):
+    if falling >= 4 and closes[-1] < closes[0]:
 
         return "BEARISH"
 
@@ -207,7 +186,7 @@ def continuity_score(
 
 
 # ============================================================
-# MOMENTUM
+# IMPULSO
 # ============================================================
 
 def momentum_score(
@@ -304,7 +283,8 @@ def rejection_score(
     if direction == "BULLISH":
 
         if (
-            info["lower_wick"] >= body * 0.50
+            info["lower_wick"]
+            >= body * 0.50
             and info["bull"]
         ):
 
@@ -317,6 +297,7 @@ def rejection_score(
 
             return 1
 
+
     # --------------------------------------------------------
     # RECHAZO BAJISTA
     # --------------------------------------------------------
@@ -324,7 +305,8 @@ def rejection_score(
     if direction == "BEARISH":
 
         if (
-            info["upper_wick"] >= body * 0.50
+            info["upper_wick"]
+            >= body * 0.50
             and info["bear"]
         ):
 
@@ -365,6 +347,7 @@ def last_candle_score(
 
         return 0
 
+
     # --------------------------------------------------------
     # ALCISTA
     # --------------------------------------------------------
@@ -373,16 +356,14 @@ def last_candle_score(
 
         if info["bull"]:
 
-            if info["body_ratio"] >= 0.75:
-                return 4
-
-            if info["body_ratio"] >= 0.60:
+            if info["body_ratio"] >= 0.70:
                 return 3
 
             if info["body_ratio"] >= 0.50:
                 return 2
 
             return 1
+
 
     # --------------------------------------------------------
     # BAJISTA
@@ -392,10 +373,7 @@ def last_candle_score(
 
         if info["bear"]:
 
-            if info["body_ratio"] >= 0.75:
-                return 4
-
-            if info["body_ratio"] >= 0.60:
+            if info["body_ratio"] >= 0.70:
                 return 3
 
             if info["body_ratio"] >= 0.50:
@@ -429,7 +407,6 @@ def exhaustion_check(
         if (
             direction == "BULLISH"
             and info["bull"]
-            and info["body_ratio"] >= 0.50
         ):
 
             same_direction += 1
@@ -437,22 +414,21 @@ def exhaustion_check(
         elif (
             direction == "BEARISH"
             and info["bear"]
-            and info["body_ratio"] >= 0.50
         ):
 
             same_direction += 1
 
-    # --------------------------------------------------------
-    # CUATRO VELAS FUERTES CONSECUTIVAS
-    # --------------------------------------------------------
+    # Si las 4 últimas velas fueron
+    # extremadamente continuas, evitamos
+    # entrar tarde.
 
-    if same_direction >= MAX_SAME_DIRECTION:
+    if same_direction >= 4:
 
         last = candle_info(
             df.iloc[-1]
         )
 
-        if last["body_ratio"] >= 0.70:
+        if last["body_ratio"] >= 0.75:
 
             return True
 
@@ -498,7 +474,7 @@ def near_recent_extreme(
     )
 
     # --------------------------------------------------------
-    # ALCISTA CERCA DEL MÁXIMO
+    # ALCISTA cerca de máximo
     # --------------------------------------------------------
 
     if direction == "BULLISH":
@@ -513,8 +489,9 @@ def near_recent_extreme(
 
             return True
 
+
     # --------------------------------------------------------
-    # BAJISTA CERCA DEL MÍNIMO
+    # BAJISTA cerca de mínimo
     # --------------------------------------------------------
 
     if direction == "BEARISH":
@@ -530,156 +507,6 @@ def near_recent_extreme(
             return True
 
     return False
-
-
-# ============================================================
-# CONFIRMACIÓN DE ESTRUCTURA
-# ============================================================
-
-def structure_confirmation(
-    df,
-    direction,
-):
-
-    if len(df) < 8:
-        return False
-
-    recent = df.tail(8)
-
-    bullish = 0
-    bearish = 0
-
-    for _, candle in recent.iterrows():
-
-        info = candle_info(candle)
-
-        if info["body_ratio"] < 0.25:
-            continue
-
-        if info["bull"]:
-            bullish += 1
-
-        elif info["bear"]:
-            bearish += 1
-
-    if direction == "BULLISH":
-
-        return bullish >= bearish + 2
-
-    if direction == "BEARISH":
-
-        return bearish >= bullish + 2
-
-    return False
-
-
-# ============================================================
-# CONFIRMACIÓN DE LA ÚLTIMA VELA
-# ============================================================
-
-def final_candle_confirmation(
-    df,
-    direction,
-):
-
-    if len(df) < 3:
-        return False
-
-    last = candle_info(
-        df.iloc[-1]
-    )
-
-    previous = candle_info(
-        df.iloc[-2]
-    )
-
-    # --------------------------------------------------------
-    # ALCISTA
-    # --------------------------------------------------------
-
-    if direction == "BULLISH":
-
-        if not last["bull"]:
-            return False
-
-        # La última vela debe superar
-        # el cierre anterior.
-        if (
-            float(df["close"].iloc[-1])
-            <= float(df["close"].iloc[-2])
-        ):
-            return False
-
-        # Evitar vela completamente débil.
-        if last["body_ratio"] < 0.35:
-            return False
-
-        return True
-
-    # --------------------------------------------------------
-    # BAJISTA
-    # --------------------------------------------------------
-
-    if direction == "BEARISH":
-
-        if not last["bear"]:
-            return False
-
-        if (
-            float(df["close"].iloc[-1])
-            >= float(df["close"].iloc[-2])
-        ):
-            return False
-
-        if last["body_ratio"] < 0.35:
-            return False
-
-        return True
-
-    return False
-
-
-# ============================================================
-# VELA CONTRARIA FUERTE
-# ============================================================
-
-def opposite_candle_check(
-    df,
-    direction,
-):
-
-    if len(df) < 3:
-        return False
-
-    last_three = df.tail(3)
-
-    opposite = 0
-
-    for _, candle in last_three.iterrows():
-
-        info = candle_info(candle)
-
-        if direction == "BULLISH":
-
-            if (
-                info["bear"]
-                and info["body_ratio"] >= 0.60
-            ):
-
-                opposite += 1
-
-        elif direction == "BEARISH":
-
-            if (
-                info["bull"]
-                and info["body_ratio"] >= 0.60
-            ):
-
-                opposite += 1
-
-    # Dos velas contrarias fuertes
-    # invalidan la entrada.
-    return opposite >= 2
 
 
 # ============================================================
@@ -706,6 +533,7 @@ def analyze_market(
 
     }
 
+
     # --------------------------------------------------------
     # PAR OBLIGATORIO
     # --------------------------------------------------------
@@ -714,15 +542,6 @@ def analyze_market(
 
         return result
 
-    # --------------------------------------------------------
-    # DESCARTAR OTC
-    # --------------------------------------------------------
-
-    pair_name = str(pair).upper()
-
-    if "OTC" in pair_name:
-
-        return result
 
     # --------------------------------------------------------
     # PREPARAR DATOS
@@ -736,6 +555,7 @@ def analyze_market(
 
         return result
 
+
     # --------------------------------------------------------
     # ESTRUCTURA
     # --------------------------------------------------------
@@ -746,22 +566,11 @@ def analyze_market(
 
     result["direction"] = direction
 
+
     if direction == "NEUTRAL":
 
         return result
 
-    # --------------------------------------------------------
-    # CONFIRMACIÓN DE ESTRUCTURA
-    # --------------------------------------------------------
-
-    confirmed_structure = structure_confirmation(
-        hist,
-        direction,
-    )
-
-    if not confirmed_structure:
-
-        return result
 
     # --------------------------------------------------------
     # ÚLTIMAS VELAS
@@ -769,27 +578,26 @@ def analyze_market(
 
     candles = hist.tail(6)
 
-    candle_records = candles.to_dict(
-        "records"
-    )
 
     # --------------------------------------------------------
     # CONTINUIDAD
     # --------------------------------------------------------
 
     continuity = continuity_score(
-        candle_records,
+        candles.to_dict("records"),
         direction,
     )
+
 
     # --------------------------------------------------------
     # MOMENTUM
     # --------------------------------------------------------
 
     momentum = momentum_score(
-        candle_records,
+        candles.to_dict("records"),
         direction,
     )
+
 
     # --------------------------------------------------------
     # ÚLTIMA VELA
@@ -802,6 +610,7 @@ def analyze_market(
         direction,
     )
 
+
     # --------------------------------------------------------
     # RECHAZO
     # --------------------------------------------------------
@@ -811,20 +620,29 @@ def analyze_market(
         direction,
     )
 
+
     # --------------------------------------------------------
     # SCORE
     # --------------------------------------------------------
 
     score = 0
 
-    # Estructura confirmada
-    score += 25
+
+    # Estructura
+    if direction in (
+        "BULLISH",
+        "BEARISH",
+    ):
+
+        score += 25
+
 
     # Continuidad
     score += min(
-        continuity * 6,
-        24,
+        continuity * 7,
+        28,
     )
+
 
     # Momentum
     score += min(
@@ -832,14 +650,17 @@ def analyze_market(
         20,
     )
 
+
     # Última vela
     score += last_score * 5
+
 
     # Rechazo
     score += rejection * 4
 
+
     # --------------------------------------------------------
-    # PROGRESO DEL PRECIO
+    # BONIFICACIÓN POR PROGRESO
     # --------------------------------------------------------
 
     closes = hist["close"].tail(6)
@@ -867,10 +688,12 @@ def analyze_market(
 
             progress += 1
 
+
     score += min(
         progress * 3,
         15,
     )
+
 
     # --------------------------------------------------------
     # PENALIZACIÓN POR EXTREMO
@@ -882,6 +705,7 @@ def analyze_market(
     ):
 
         score -= 10
+
 
     # --------------------------------------------------------
     # PENALIZACIÓN POR AGOTAMIENTO
@@ -896,29 +720,6 @@ def analyze_market(
 
         score -= 20
 
-    # --------------------------------------------------------
-    # VELAS CONTRARIAS FUERTES
-    # --------------------------------------------------------
-
-    if opposite_candle_check(
-        hist,
-        direction,
-    ):
-
-        score -= 15
-
-    # --------------------------------------------------------
-    # CONFIRMACIÓN FINAL
-    # --------------------------------------------------------
-
-    final_confirmed = final_candle_confirmation(
-        hist,
-        direction,
-    )
-
-    if not final_confirmed:
-
-        score -= 15
 
     # --------------------------------------------------------
     # LIMITAR SCORE
@@ -934,13 +735,15 @@ def analyze_market(
 
     result["score"] = score
 
+
     # --------------------------------------------------------
-    # SCORE MÍNIMO
+    # SEÑAL
     # --------------------------------------------------------
 
     if score < MIN_SCORE_TO_TRADE:
 
         return result
+
 
     # --------------------------------------------------------
     # EVITAR ENTRADA SI LA ÚLTIMA VELA
@@ -951,37 +754,29 @@ def analyze_market(
         last
     )
 
-    # --------------------------------------------------------
-    # CALL
-    # --------------------------------------------------------
 
     if direction == "BULLISH":
 
         if not last_info["bull"]:
-            return result
 
-        if not final_confirmed:
             return result
 
         result["signal"] = "call"
 
-    # --------------------------------------------------------
-    # PUT
-    # --------------------------------------------------------
 
     elif direction == "BEARISH":
 
         if not last_info["bear"]:
-            return result
 
-        if not final_confirmed:
             return result
 
         result["signal"] = "put"
 
+
     else:
 
         return result
+
 
     # --------------------------------------------------------
     # VALIDACIÓN FINAL
