@@ -30,28 +30,38 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 TIMEFRAME = 60
 
-# Expiración real de la operación
+# EXPIRACIÓN REAL DE LA OPERACIÓN
 EXPIRATION = 1
 
 
 # ============================================================
-# 6 PARES REALES FIJOS
-#
-# IMPORTANTE:
-# - NO OTC
-# - NO -OP
-# - NO se obtienen automáticamente
-# - NO se usa get_all_open_time()
+# PARES CANDIDATOS
 # ============================================================
 
-REAL_PAIRS = [
+PAIR_CANDIDATES = [
     "EURUSD",
+    "GBPUSD",
+    "USDCHF",
     "EURGBP",
     "EURJPY",
     "GBPJPY",
-    "GBPUSD",
+    "USDJPY",
+    "AUDUSD",
+    "USDCAD",
     "NZDUSD",
+    "EURCAD",
+    "GBPCAD",
+    "AUDJPY",
+    "CADJPY",
+    "CHFJPY",
 ]
+
+
+# ============================================================
+# CANTIDAD DE PARES QUE QUEREMOS MANTENER ACTIVOS
+# ============================================================
+
+MAX_ACTIVE_PAIRS = 5
 
 
 # ============================================================
@@ -62,6 +72,9 @@ BASE_AMOUNT = 556
 
 CURRENT_AMOUNT = BASE_AMOUNT
 
+# IMPORTANTE:
+# Debe ser mayor que BASE_AMOUNT si quieres que el monto
+# pueda crecer después de ganancias.
 MAX_AMOUNT = 5000
 
 WIN_STREAK = 0
@@ -81,6 +94,12 @@ IQ: Optional[IQ_Option] = None
 LAST_UPDATE_ID = None
 
 OPEN_TRADES: Dict[int, Dict[str, Any]] = {}
+
+ACTIVE_PAIRS: List[str] = []
+
+LAST_PAIR_REFRESH = 0
+
+PAIR_REFRESH_INTERVAL = 10
 
 
 # ============================================================
@@ -110,10 +129,7 @@ def can_send(key: str) -> bool:
 # TELEGRAM
 # ============================================================
 
-def telegram_send(
-    msg: str,
-    key: str = "msg",
-):
+def telegram_send(msg: str, key: str = "msg"):
 
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         return False
@@ -134,13 +150,7 @@ def telegram_send(
 
         return True
 
-    except Exception as e:
-
-        logging.error(
-            "Telegram error: %s",
-            e,
-        )
-
+    except Exception:
         return False
 
 
@@ -148,9 +158,7 @@ def telegram_send(
 # 💰 ACTUALIZAR MONTO
 # ============================================================
 
-def update_amount(
-    profit: float,
-):
+def update_amount(profit: float):
 
     global CURRENT_AMOUNT
     global WIN_STREAK
@@ -162,9 +170,7 @@ def update_amount(
         LOSS_STREAK = 0
 
         CURRENT_AMOUNT = min(
-            BASE_AMOUNT * (
-                1 + WIN_STREAK * 0.5
-            ),
+            BASE_AMOUNT * (1 + WIN_STREAK * 0.5),
             MAX_AMOUNT,
         )
 
@@ -194,102 +200,62 @@ def telegram_worker():
         try:
 
             if not TELEGRAM_TOKEN:
-
                 time.sleep(5)
                 continue
 
             params = {}
 
             if LAST_UPDATE_ID is not None:
+                params["offset"] = LAST_UPDATE_ID + 1
 
-                params["offset"] = (
-                    LAST_UPDATE_ID + 1
-                )
-
-            response = requests.get(
+            res = requests.get(
                 f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates",
                 params=params,
                 timeout=5,
-            )
+            ).json()
 
-            data = response.json()
+            for u in res.get("result", []):
 
-            for update in data.get(
-                "result",
-                [],
-            ):
+                LAST_UPDATE_ID = u["update_id"]
 
-                LAST_UPDATE_ID = update[
-                    "update_id"
-                ]
+                msg = u.get("message", {})
 
-                message = update.get(
-                    "message",
-                    {},
-                )
+                text = msg.get("text", "")
 
-                text = message.get(
-                    "text",
-                    "",
-                )
-
-                if not isinstance(
-                    text,
-                    str,
-                ):
+                if not isinstance(text, str):
                     continue
 
                 text = text.lower().strip()
 
                 chat_id = str(
-                    message.get(
-                        "chat",
-                        {},
-                    ).get(
-                        "id",
-                    )
+                    msg.get("chat", {}).get("id")
                 )
 
-                if chat_id != str(
-                    TELEGRAM_CHAT_ID
-                ):
+                if chat_id != str(TELEGRAM_CHAT_ID):
                     continue
 
 
-                # =================================================
+                # ------------------------------------------------
                 # START
-                # =================================================
+                # ------------------------------------------------
 
-                if text.startswith(
-                    "/start"
-                ):
+                if text.startswith("/start"):
 
                     BOT_RUNNING = True
 
                     telegram_send(
                         "🟢 BOT ACTIVADO\n\n"
-                        "📊 Mercado REAL\n"
-                        "🚫 Sin OTC\n"
-                        "🚫 Sin -OP\n\n"
-                        "🔎 Analizando 6 pares fijos:\n"
-                        "• EURUSD\n"
-                        "• EURGBP\n"
-                        "• EURJPY\n"
-                        "• GBPJPY\n"
-                        "• GBPUSD\n"
-                        "• NZDUSD\n\n"
-                        "⏱ Expiración: 1 minuto.",
+                        "Buscando pares OTC abiertos "
+                        "con expiración de 1 minuto.",
                         "start",
                     )
 
 
-                # =================================================
+                # ------------------------------------------------
                 # STOP
-                # =================================================
+                # ------------------------------------------------
 
-                elif text.startswith(
-                    "/stop"
-                ):
+                elif text.startswith("/stop"):
 
                     BOT_RUNNING = False
 
@@ -299,36 +265,30 @@ def telegram_worker():
                     )
 
 
-                # =================================================
+                # ------------------------------------------------
                 # STATUS
-                # =================================================
+                # ------------------------------------------------
 
-                elif text.startswith(
-                    "/status"
-                ):
+                elif text.startswith("/status"):
 
-                    pairs = "\n".join(
-                        f"• {pair}"
-                        for pair in REAL_PAIRS
-                    )
+                    pairs = ", ".join(ACTIVE_PAIRS)
+
+                    if not pairs:
+                        pairs = "Ninguno"
 
                     telegram_send(
-                        "🤖 ESTADO DEL BOT\n\n"
+                        f"🤖 ESTADO DEL BOT\n\n"
                         f"Estado: "
                         f"{'ACTIVO 🟢' if BOT_RUNNING else 'DETENIDO 🔴'}\n\n"
                         f"💰 Monto: ${CURRENT_AMOUNT}\n"
                         f"⏱ Expiración: {EXPIRATION} minuto\n\n"
-                        "📊 PARES REALES FIJOS:\n"
+                        f"📊 Pares activos:\n"
                         f"{pairs}",
                         "status",
                     )
 
-        except Exception as e:
-
-            logging.error(
-                "Telegram worker error: %s",
-                e,
-            )
+        except Exception:
+            pass
 
         time.sleep(1)
 
@@ -358,104 +318,192 @@ def connect():
 
     try:
 
-        connected = IQ.check_connect()
+        check = IQ.check_connect()
 
     except Exception:
 
-        connected = False
+        check = False
 
-    if not connected:
+    if not check:
 
         raise RuntimeError(
             "No se pudo conectar a IQ Option."
         )
 
     telegram_send(
-        "🟢 CONECTADO A IQ OPTION\n\n"
-        "📊 Mercado REAL\n"
-        "🚫 Sin OTC\n"
-        "🚫 Sin -OP\n\n"
-        "6 pares fijos cargados.",
+        "🟢 CONECTADO A IQ OPTION",
         "connect",
     )
 
 
 # ============================================================
-# VALIDAR NOMBRE DEL PAR
-# ============================================================
-#
-# Esta función evita que accidentalmente entre:
-#
-# EURUSD-OTC
-# EURUSD-OP
-# EURUSD-OTC-OP
-#
-# El bot solamente acepta los nombres de REAL_PAIRS.
+# OBTENER ESTADO DE PARES
 # ============================================================
 
-def is_valid_real_pair(
-    pair: str,
-) -> bool:
+def get_open_pairs() -> List[str]:
 
-    if not isinstance(
-        pair,
-        str,
+    global IQ
+
+    if IQ is None:
+        return []
+
+    try:
+
+        open_time = IQ.get_all_open_time()
+
+        if not open_time:
+            return []
+
+        binary = open_time.get("binary", {})
+
+        digital = open_time.get("digital", {})
+
+        result = []
+
+        for pair in PAIR_CANDIDATES:
+
+            is_open = False
+
+
+            # ------------------------------------------------
+            # BINARY
+            # ------------------------------------------------
+
+            if pair in binary:
+
+                data = binary[pair]
+
+                if isinstance(data, dict):
+
+                    is_open = bool(
+                        data.get("open", False)
+                    )
+
+
+            # ------------------------------------------------
+            # DIGITAL
+            # ------------------------------------------------
+            # No usamos DIGITAL para comprar porque este bot
+            # utiliza IQ.buy(), es decir, binary options.
+            # Esta sección solamente evita considerar digital
+            # como binary disponible.
+            # ------------------------------------------------
+
+            if is_open:
+
+                result.append(pair)
+
+        return result
+
+    except Exception as e:
+
+        logging.error(
+            "Error obteniendo pares abiertos: %s",
+            e,
+        )
+
+        return []
+
+
+# ============================================================
+# ACTUALIZAR LOS 5 PARES
+# ============================================================
+
+def refresh_active_pairs(force: bool = False) -> List[str]:
+
+    global ACTIVE_PAIRS
+    global LAST_PAIR_REFRESH
+
+    now = time.time()
+
+    if (
+        not force
+        and now - LAST_PAIR_REFRESH < PAIR_REFRESH_INTERVAL
     ):
-        return False
 
-    pair = pair.strip().upper()
+        return ACTIVE_PAIRS
 
-    if pair not in REAL_PAIRS:
-        return False
+    LAST_PAIR_REFRESH = now
 
-    if "-OTC" in pair:
-        return False
+    open_pairs = get_open_pairs()
 
-    if "-OP" in pair:
-        return False
+    old_pairs = set(ACTIVE_PAIRS)
 
-    return True
+    new_pairs = []
+
+    for pair in open_pairs:
+
+        if pair not in new_pairs:
+
+            new_pairs.append(pair)
+
+        if len(new_pairs) >= MAX_ACTIVE_PAIRS:
+            break
+
+
+    # --------------------------------------------------------
+    # Detectar cambios
+    # --------------------------------------------------------
+
+    new_set = set(new_pairs)
+
+    removed = old_pairs - new_set
+
+    added = new_set - old_pairs
+
+
+    if removed:
+
+        for pair in removed:
+
+            telegram_send(
+                f"🔴 PAR DESCARTADO\n\n"
+                f"{pair}\n"
+                f"Motivo: mercado cerrado/no disponible.",
+                f"closed_{pair}",
+            )
+
+
+    if added:
+
+        for pair in added:
+
+            telegram_send(
+                f"🟢 PAR DISPONIBLE\n\n"
+                f"{pair}\n"
+                f"⏱ Expiración configurada: 1 minuto.",
+                f"open_{pair}",
+            )
+
+
+    ACTIVE_PAIRS = new_pairs
+
+    return ACTIVE_PAIRS
+
+
+# ============================================================
+# COMPROBAR SI UN PAR SIGUE ABIERTO
+# ============================================================
+
+def pair_is_open(pair: str) -> bool:
+
+    open_pairs = get_open_pairs()
+
+    return pair in open_pairs
 
 
 # ============================================================
 # OBTENER VELAS
 # ============================================================
 
-def get_market_data(
-    pair: str,
-):
+def get_market_data(pair: str):
 
     global IQ
 
     if IQ is None:
         return None
 
-
-    # --------------------------------------------------------
-    # PROTECCIÓN ABSOLUTA CONTRA OTC / -OP
-    # --------------------------------------------------------
-
-    if not is_valid_real_pair(pair):
-
-        logging.error(
-            "PAR RECHAZADO: %s",
-            pair,
-        )
-
-        return None
-
-
     try:
-
-        # IMPORTANTE:
-        # Se envía exactamente:
-        #
-        # EURUSD
-        # GBPUSD
-        # etc.
-        #
-        # Nunca EURUSD-OP
-        # Nunca EURUSD-OTC
 
         candles = IQ.get_candles(
             pair,
@@ -465,17 +513,9 @@ def get_market_data(
         )
 
         if not candles:
-
-            logging.warning(
-                "Sin velas para %s",
-                pair,
-            )
-
             return None
 
-        df = pd.DataFrame(
-            candles
-        )
+        df = pd.DataFrame(candles)
 
         if df.empty:
             return None
@@ -487,45 +527,11 @@ def get_market_data(
             "low",
         }
 
-        if not required.issubset(
-            df.columns
-        ):
+        if not required.issubset(df.columns):
 
             logging.error(
                 "Faltan columnas en %s",
                 pair,
-            )
-
-            return None
-
-
-        # ----------------------------------------------------
-        # LIMPIAR DATOS
-        # ----------------------------------------------------
-
-        for column in required:
-
-            df[column] = pd.to_numeric(
-                df[column],
-                errors="coerce",
-            )
-
-        df.dropna(
-            subset=list(required),
-            inplace=True,
-        )
-
-        df.reset_index(
-            drop=True,
-            inplace=True,
-        )
-
-        if len(df) < 8:
-
-            logging.warning(
-                "Pocas velas para %s: %s",
-                pair,
-                len(df),
             )
 
             return None
@@ -547,28 +553,14 @@ def get_market_data(
 # ANALIZAR PAR
 # ============================================================
 
-def analyze_pair(
-    pair: str,
-):
+def analyze_pair(pair: str):
 
-    # --------------------------------------------------------
-    # Nunca permitir nombres incorrectos
-    # --------------------------------------------------------
-
-    if not is_valid_real_pair(
-        pair
-    ):
-
-        return None
-
-    df = get_market_data(
-        pair
-    )
+    df = get_market_data(pair)
 
     if df is None:
         return None
 
-    if len(df) < 8:
+    if len(df) < 6:
         return None
 
     try:
@@ -608,49 +600,22 @@ def execute_trade(
     if IQ is None:
         return False
 
+    if signal not in ("call", "put"):
+        return False
+
 
     # --------------------------------------------------------
-    # VALIDAR PAR
+    # ÚLTIMA COMPROBACIÓN ANTES DE OPERAR
     # --------------------------------------------------------
 
-    if not is_valid_real_pair(
-        pair
-    ):
-
-        logging.error(
-            "OPERACIÓN RECHAZADA - PAR NO REAL: %s",
-            pair,
-        )
+    if not pair_is_open(pair):
 
         telegram_send(
-            f"⚠️ OPERACIÓN RECHAZADA\n\n"
-            f"Par inválido: {pair}\n"
-            f"Solo se permiten pares reales.",
-            f"invalid_{pair}",
+            f"⚠️ OPERACIÓN DESCARTADA\n\n"
+            f"{pair}\n"
+            f"Motivo: el par se cerró antes de entrar.",
+            f"notopen_{pair}",
         )
-
-        return False
-
-
-    # --------------------------------------------------------
-    # VALIDAR SEÑAL
-    # --------------------------------------------------------
-
-    if signal not in (
-        "call",
-        "put",
-    ):
-
-        return False
-
-
-    # --------------------------------------------------------
-    # EVITAR OPERAR DOS VECES
-    # --------------------------------------------------------
-
-    if pair_has_open_trade(
-        pair
-    ):
 
         return False
 
@@ -659,7 +624,7 @@ def execute_trade(
 
         amount = CURRENT_AMOUNT
 
-        ok, order_id = IQ.buy(
+        ok, oid = IQ.buy(
             amount,
             pair,
             signal,
@@ -669,12 +634,11 @@ def execute_trade(
         if not ok:
 
             telegram_send(
-                "⚠️ NO SE PUDO EJECUTAR\n\n"
-                f"📊 Par: {pair}\n"
-                f"📈 Señal: {signal.upper()}\n"
-                f"🎯 Score: {score}\n"
-                f"💵 Monto: ${amount}\n"
-                f"⏱ Expiración: {EXPIRATION} min",
+                f"⚠️ NO SE PUDO EJECUTAR\n\n"
+                f"{pair}\n"
+                f"Señal: {signal.upper()}\n"
+                f"Score: {score}\n"
+                f"Expiración: {EXPIRATION} min",
                 f"buyfail_{pair}",
             )
 
@@ -685,9 +649,7 @@ def execute_trade(
         # GUARDAR OPERACIÓN
         # ----------------------------------------------------
 
-        OPEN_TRADES[
-            order_id
-        ] = {
+        OPEN_TRADES[oid] = {
 
             "pair": pair,
 
@@ -697,9 +659,7 @@ def execute_trade(
 
             "score": score,
 
-            "opened": int(
-                time.time()
-            ),
+            "opened": int(time.time()),
 
             "expiry": int(
                 time.time()
@@ -709,13 +669,13 @@ def execute_trade(
 
 
         telegram_send(
-            "🚀 TRADE EJECUTADO\n\n"
+            f"🚀 TRADE EJECUTADO\n\n"
             f"📊 Par: {pair}\n"
             f"📈 Señal: {signal.upper()}\n"
             f"🎯 Score: {score}\n"
             f"💵 Monto: ${amount}\n"
             f"⏱ Expiración: {EXPIRATION} minuto",
-            f"trade_{order_id}",
+            f"trade_{oid}",
         )
 
         return True
@@ -742,11 +702,9 @@ def check_results():
     if IQ is None:
         return
 
-    now = int(
-        time.time()
-    )
+    now = int(time.time())
 
-    for order_id, trade in list(
+    for oid, trade in list(
         OPEN_TRADES.items()
     ):
 
@@ -755,20 +713,14 @@ def check_results():
 
         try:
 
-            result = IQ.check_win_v4(
-                order_id
-            )
+            result = IQ.check_win_v4(oid)
 
             if result is None:
                 continue
 
-            profit = float(
-                result
-            )
+            profit = float(result)
 
-            update_amount(
-                profit
-            )
+            update_amount(profit)
 
             if profit > 0:
 
@@ -784,7 +736,7 @@ def check_results():
 
 
             telegram_send(
-                "📊 RESULTADO\n\n"
+                f"📊 RESULTADO\n\n"
                 f"📊 {trade['pair']}\n"
                 f"📈 {trade['signal'].upper()}\n"
                 f"{outcome}\n"
@@ -792,18 +744,16 @@ def check_results():
                 f"📈 WIN: {WIN_STREAK}\n"
                 f"📉 LOSS: {LOSS_STREAK}\n"
                 f"💵 Próximo monto: ${CURRENT_AMOUNT}",
-                f"result_{order_id}",
+                f"result_{oid}",
             )
 
-            del OPEN_TRADES[
-                order_id
-            ]
+            del OPEN_TRADES[oid]
 
         except Exception as e:
 
             logging.error(
                 "Error resultado %s: %s",
-                order_id,
+                oid,
                 e,
             )
 
@@ -812,72 +762,37 @@ def check_results():
 # EVITAR OPERAR VARIAS VECES EL MISMO PAR
 # ============================================================
 
-def pair_has_open_trade(
-    pair: str,
-) -> bool:
+def pair_has_open_trade(pair: str) -> bool:
 
     for trade in OPEN_TRADES.values():
 
-        if trade.get(
-            "pair"
-        ) == pair:
-
+        if trade.get("pair") == pair:
             return True
 
     return False
 
 
 # ============================================================
-# MOSTRAR LOS 6 PARES
+# MOSTRAR PARES ACTIVOS
 # ============================================================
 
 def send_active_pairs():
 
+    pairs = ACTIVE_PAIRS
+
+    if not pairs:
+        return
+
     telegram_send(
         "🔎 PARES EN ANÁLISIS\n\n"
-        "📊 MERCADO REAL\n"
-        "🚫 SIN OTC\n"
-        "🚫 SIN -OP\n\n"
         + "\n".join(
-            f"• {pair}"
-            for pair in REAL_PAIRS
+            f"• {p}"
+            for p in pairs
         )
         + "\n\n"
         f"⏱ Expiración: {EXPIRATION} minuto",
         "active_pairs",
     )
-
-
-# ============================================================
-# ANALIZAR LOS 6 PARES
-# ============================================================
-
-def analyze_all_pairs():
-
-    results = []
-
-    for pair in REAL_PAIRS:
-
-        # ----------------------------------------------------
-        # Protección adicional
-        # ----------------------------------------------------
-
-        if not is_valid_real_pair(
-            pair
-        ):
-            continue
-
-        result = analyze_pair(
-            pair
-        )
-
-        if result:
-
-            results.append(
-                result
-            )
-
-    return results
 
 
 # ============================================================
@@ -890,24 +805,15 @@ def main():
 
     logging.basicConfig(
         level=logging.ERROR,
-        format=(
-            "%(asctime)s | "
-            "%(levelname)s | "
-            "%(message)s"
-        ),
+        format="%(asctime)s | %(levelname)s | %(message)s",
     )
-
-
-    # ========================================================
-    # CONECTAR
-    # ========================================================
 
     connect()
 
 
-    # ========================================================
+    # --------------------------------------------------------
     # TELEGRAM
-    # ========================================================
+    # --------------------------------------------------------
 
     threading.Thread(
         target=telegram_worker,
@@ -917,32 +823,22 @@ def main():
 
     telegram_send(
         "🤖 BOT LISTO\n\n"
-        "📊 Mercado REAL\n"
-        "🚫 Sin OTC\n"
-        "🚫 Sin -OP\n\n"
-        "🔎 6 pares fijos cargados:\n"
-        "• EURUSD\n"
-        "• EURGBP\n"
-        "• EURJPY\n"
-        "• GBPJPY\n"
-        "• GBPUSD\n"
-        "• NZDUSD\n\n"
-        "⏱ Expiración: 1 minuto\n\n"
-        "Usa /START para comenzar.",
+        "⏱ Expiración: 1 minuto\n"
+        "🔎 Buscando hasta 5 pares OTC abiertos.",
         "ready",
     )
 
 
-    # ========================================================
+    # --------------------------------------------------------
     # BUCLE PRINCIPAL
-    # ========================================================
+    # --------------------------------------------------------
 
     while True:
 
         try:
 
             # ------------------------------------------------
-            # BOT DETENIDO
+            # Si está detenido
             # ------------------------------------------------
 
             if not BOT_RUNNING:
@@ -960,64 +856,75 @@ def main():
 
 
             # ------------------------------------------------
-            # ANALIZAR LOS 6 PARES FIJOS
-            #
-            # NO HAY:
-            #
-            # get_all_open_time()
-            # refresh_active_pairs()
-            # get_open_pairs()
-            #
+            # ACTUALIZAR LOS 5 PARES
             # ------------------------------------------------
 
-            for pair in REAL_PAIRS:
+            pairs = refresh_active_pairs()
+
+
+            # ------------------------------------------------
+            # SI NO HAY PARES
+            # ------------------------------------------------
+
+            if not pairs:
+
+                telegram_send(
+                    "⚠️ SIN PARES DISPONIBLES\n\n"
+                    "Buscando nuevamente...",
+                    "no_pairs",
+                )
+
+                time.sleep(3)
+
+                continue
+
+
+            # ------------------------------------------------
+            # ANALIZAR CADA PAR
+            # ------------------------------------------------
+
+            for pair in list(pairs):
 
                 if not BOT_RUNNING:
                     break
 
 
                 # --------------------------------------------
-                # Protección contra nombres incorrectos
+                # No analizar un par que ya tiene operación
                 # --------------------------------------------
 
-                if not is_valid_real_pair(
-                    pair
-                ):
+                if pair_has_open_trade(pair):
 
                     continue
 
 
                 # --------------------------------------------
-                # No operar si ya existe una operación
+                # Comprobar nuevamente que esté abierto
                 # --------------------------------------------
 
-                if pair_has_open_trade(
-                    pair
-                ):
+                if not pair_is_open(pair):
+
+                    refresh_active_pairs(
+                        force=True
+                    )
 
                     continue
 
 
                 # --------------------------------------------
-                # ANALIZAR
+                # ANALIZAR MERCADO
                 # --------------------------------------------
 
-                result = analyze_pair(
-                    pair
-                )
+                result = analyze_pair(pair)
 
 
                 if not result:
 
-                    time.sleep(0.3)
                     continue
 
 
                 score = int(
-                    result.get(
-                        "score",
-                        0,
-                    )
+                    result.get("score", 0)
                 )
 
                 signal = result.get(
@@ -1026,27 +933,11 @@ def main():
 
 
                 # --------------------------------------------
-                # LOG INTERNO
+                # SOLO OPERAR SI LA ESTRATEGIA
+                # LO AUTORIZA
                 # --------------------------------------------
 
-                logging.info(
-                    "%s | direction=%s | score=%s | signal=%s",
-                    pair,
-                    result.get(
-                        "direction"
-                    ),
-                    score,
-                    signal,
-                )
-
-
-                # --------------------------------------------
-                # OPERAR SOLO SI STRATEGY AUTORIZA
-                # --------------------------------------------
-
-                if result.get(
-                    "valid"
-                ):
+                if result.get("valid"):
 
                     if signal in (
                         "call",
@@ -1061,16 +952,14 @@ def main():
 
 
                 # --------------------------------------------
-                # PEQUEÑA PAUSA
+                # Pequeña pausa para no saturar API
                 # --------------------------------------------
 
-                time.sleep(
-                    0.5
-                )
+                time.sleep(0.3)
 
 
             # ------------------------------------------------
-            # SIGUIENTE CICLO
+            # LOOP
             # ------------------------------------------------
 
             time.sleep(1)
