@@ -9,7 +9,7 @@ import pandas as pd
 # CONFIGURACIÓN GENERAL
 # ============================================================
 
-MIN_CANDLES = 20
+MIN_CANDLES = 22
 
 # Score mínimo absoluto para permitir una operación.
 MIN_SCORE_TO_TRADE = 75
@@ -21,14 +21,14 @@ MIN_BODY_RATIO = 0.30
 MAX_DOJI_RATIO = 0.20
 
 # Tendencia / estructura.
-STRUCTURE_LOOKBACK = 8
+STRUCTURE_LOOKBACK =10
 
 # Consolidación.
-CONSOLIDATION_LOOKBACK = 6
+CONSOLIDATION_LOOKBACK = 8
 CONSOLIDATION_MAX_RATIO = 0.55
 
 # Pullback.
-PULLBACK_LOOKBACK = 5
+PULLBACK_LOOKBACK = 7
 
 # Reversión.
 REVERSAL_WICK_RATIO = 1.20
@@ -317,7 +317,7 @@ def directional_candle_score(
     direction: str,
 ) -> int:
 
-    score = 0
+    score = 2
 
     for _, candle in candles.iterrows():
 
@@ -336,14 +336,14 @@ def directional_candle_score(
             and info["bull"]
         ):
 
-            score += 1
+            score += 3
 
         elif (
             direction == "BEARISH"
             and info["bear"]
         ):
 
-            score += 1
+            score += 3
 
     return score
 
@@ -361,7 +361,7 @@ def momentum_score(
 
         return 0
 
-    score = 0
+    score = 2
 
     closes = candles[
         "close"
@@ -391,7 +391,7 @@ def momentum_score(
                 and closes[i] > closes[i - 1]
             ):
 
-                score += 1
+                score += 3
 
         elif direction == "BEARISH":
 
@@ -400,7 +400,7 @@ def momentum_score(
                 and closes[i] < closes[i - 1]
             ):
 
-                score += 1
+                score += 3
 
     return score
 
@@ -517,61 +517,45 @@ def detect_continuity(
         df.iloc[-1]
     )
 
-    score = 0
-
-    # --------------------------------------------------------
-    # CONTINUIDAD DE VELAS
-    # --------------------------------------------------------
+    score = 2
 
     score += min(
         directional * 12,
         36,
     )
 
-    # --------------------------------------------------------
-    # MOMENTUM
-    # --------------------------------------------------------
-
     score += min(
         momentum * 10,
         30,
     )
-
-    # --------------------------------------------------------
-    # ÚLTIMA VELA
-    # --------------------------------------------------------
 
     if (
         direction == "BULLISH"
         and last_info["bull"]
     ):
 
-        score += 20
+        score += 22
 
         if (
             last_info["body_ratio"]
             >= 0.60
         ):
 
-            score += 10
+            score += 12
 
     elif (
         direction == "BEARISH"
         and last_info["bear"]
     ):
 
-        score += 20
+        score += 22
 
         if (
             last_info["body_ratio"]
             >= 0.60
         ):
 
-            score += 10
-
-    # --------------------------------------------------------
-    # DETECCIÓN
-    # --------------------------------------------------------
+            score += 12
 
     if (
         directional >= 4
@@ -649,10 +633,6 @@ def detect_rejection(
         "range"
     ]
 
-    # --------------------------------------------------------
-    # RECHAZO ALCISTA EN SOPORTE
-    # --------------------------------------------------------
-
     if (
         info["lower_wick_ratio"]
         >= REJECTION_WICK_RATIO
@@ -664,21 +644,21 @@ def detect_rejection(
         )
     ):
 
-        score = 70
+        score = 72
 
         if (
             info["body_ratio"]
             >= 0.40
         ):
 
-            score += 15
+            score += 17
 
         if (
             info["lower_wick_ratio"]
             >= 2.0
         ):
 
-            score += 10
+            score += 12
 
         result.update(
             {
@@ -697,10 +677,6 @@ def detect_rejection(
 
         return result
 
-    # --------------------------------------------------------
-    # RECHAZO BAJISTA EN RESISTENCIA
-    # --------------------------------------------------------
-
     if (
         info["upper_wick_ratio"]
         >= REJECTION_WICK_RATIO
@@ -712,21 +688,21 @@ def detect_rejection(
         )
     ):
 
-        score = 70
+        score = 72
 
         if (
             info["body_ratio"]
             >= 0.40
         ):
 
-            score += 15
+            score += 17
 
         if (
             info["upper_wick_ratio"]
             >= 2.0
         ):
 
-            score += 10
+            score += 12
 
         result.update(
             {
@@ -789,14 +765,6 @@ def detect_reversal(
         )
     )
 
-    # --------------------------------------------------------
-    # REVERSIÓN ALCISTA
-    #
-    # Varias velas bajistas antes
-    # + mecha inferior dominante
-    # + cierre alcista
-    # --------------------------------------------------------
-
     if (
         previous_bears >= 2
         and info["bull"]
@@ -804,7 +772,7 @@ def detect_reversal(
         >= REVERSAL_WICK_RATIO
     ):
 
-        score = 60
+        score = 62
 
         score += min(
             previous_bears * 8,
@@ -835,10 +803,6 @@ def detect_reversal(
 
         return result
 
-    # --------------------------------------------------------
-    # REVERSIÓN BAJISTA
-    # --------------------------------------------------------
-
     if (
         previous_bulls >= 2
         and info["bear"]
@@ -846,7 +810,7 @@ def detect_reversal(
         >= REVERSAL_WICK_RATIO
     ):
 
-        score = 60
+        score = 62
 
         score += min(
             previous_bulls * 8,
@@ -858,7 +822,7 @@ def detect_reversal(
             >= 0.35
         ):
 
-            score += 10
+            score += 12
 
         result.update(
             {
@@ -908,14 +872,6 @@ def detect_pullback(
         -5:-1
     ]
 
-    # --------------------------------------------------------
-    # PULLBACK EN TENDENCIA ALCISTA
-    #
-    # Estructura general alcista
-    # + velas anteriores de retroceso
-    # + última vela vuelve a subir
-    # --------------------------------------------------------
-
     if direction == "BULLISH":
 
         bearish_pullback = (
@@ -940,7 +896,7 @@ def detect_pullback(
             >= MIN_BODY_RATIO
         ):
 
-            score = 60
+            score = 62
 
             score += min(
                 bullish_before * 7,
@@ -952,7 +908,7 @@ def detect_pullback(
                 12,
             )
 
-            score += 15
+            score += 17
 
             result.update(
                 {
@@ -970,10 +926,6 @@ def detect_pullback(
             )
 
             return result
-
-    # --------------------------------------------------------
-    # PULLBACK EN TENDENCIA BAJISTA
-    # --------------------------------------------------------
 
     elif direction == "BEARISH":
 
@@ -1011,7 +963,7 @@ def detect_pullback(
                 12,
             )
 
-            score += 15
+            score += 17
 
             result.update(
                 {
@@ -1094,8 +1046,6 @@ def detect_consolidation(
 
         return result
 
-    # La zona reciente debe tener
-    # menor rango que el movimiento anterior.
     if (
         zone_range
         > previous_range
@@ -1108,10 +1058,6 @@ def detect_consolidation(
         last["close"]
     )
 
-    # --------------------------------------------------------
-    # RUPTURA ALCISTA
-    # --------------------------------------------------------
-
     if (
         last_close > zone_high
         and last_info["bull"]
@@ -1119,14 +1065,14 @@ def detect_consolidation(
         >= 0.40
     ):
 
-        score = 75
+        score = 79
 
         if (
             last_info["body_ratio"]
             >= 0.60
         ):
 
-            score += 10
+            score += 12
 
         result.update(
             {
@@ -1144,10 +1090,6 @@ def detect_consolidation(
         )
 
         return result
-
-    # --------------------------------------------------------
-    # RUPTURA BAJISTA
-    # --------------------------------------------------------
 
     if (
         last_close < zone_low
@@ -1224,9 +1166,6 @@ def exhaustion_check(
 
             same_direction += 1
 
-    # Cuatro velas muy fuertes consecutivas
-    # pueden indicar entrada demasiado tarde.
-
     return (
         same_direction >= 4
     )
@@ -1285,6 +1224,312 @@ def select_best_pattern(
     )
 
     return valid_patterns[0]
+
+
+# ============================================================
+# DETECTAR RECUPERACIÓN
+# ============================================================
+
+def detect_recovery(
+    df: pd.DataFrame,
+) -> Dict[str, Any]:
+
+    result = {
+        "detected": False,
+        "signal": None,
+        "score": 0,
+        "reason": "",
+    }
+
+    if len(df) < 8:
+        return result
+
+    # --------------------------------------------------------
+    # MOVIMIENTO PREVIO
+    # --------------------------------------------------------
+
+    previous = df.iloc[:-1].tail(8)
+
+    last = df.iloc[-1]
+
+    infos = get_candle_infos(
+        previous
+    )
+
+    bullish_pressure = 0
+    bearish_pressure = 0
+
+    bullish_movement = 0.0
+    bearish_movement = 0.0
+
+    for i in range(
+        1,
+        len(infos),
+    ):
+
+        current = infos[i]
+        previous_info = infos[i - 1]
+
+        movement = (
+            current["close"]
+            - previous_info["close"]
+        )
+
+        if movement > 0:
+
+            bullish_movement += movement
+
+            if (
+                current["body_ratio"]
+                >= 0.20
+            ):
+
+                bullish_pressure += 1
+
+        elif movement < 0:
+
+            bearish_movement += abs(
+                movement
+            )
+
+            if (
+                current["body_ratio"]
+                >= 0.20
+            ):
+
+                bearish_pressure += 1
+
+    previous_high = float(
+        previous["high"].max()
+    )
+
+    previous_low = float(
+        previous["low"].min()
+    )
+
+    previous_range = (
+        previous_high
+        - previous_low
+    )
+
+    if previous_range <= 0:
+        return result
+
+    last_info = candle_info(
+        last
+    )
+
+    last_close = last_info[
+        "close"
+    ]
+
+    # ========================================================
+    # RECUPERACIÓN ALCISTA
+    # ========================================================
+
+    bullish_score = 0
+
+    # Presión bajista previa.
+    if (
+        bearish_pressure
+        > bullish_pressure
+    ):
+
+        bullish_score += 25
+
+    # Desplazamiento bajista previo.
+    if (
+        bearish_movement
+        > bullish_movement
+    ):
+
+        bullish_score += 15
+
+    # Recuperación desde el mínimo.
+    recovery_up = (
+        last_close
+        - previous_low
+    ) / previous_range
+
+    if recovery_up >= 0.25:
+        bullish_score += 10
+
+    if recovery_up >= 0.40:
+        bullish_score += 10
+
+    if recovery_up >= 0.55:
+        bullish_score += 10
+
+    # La última vela debe mostrar
+    # recuperación alcista.
+    if last_info["bull"]:
+
+        bullish_score += 15
+
+    # Cuerpo suficiente.
+    if (
+        last_info["body_ratio"]
+        >= 0.30
+    ):
+
+        bullish_score += 5
+
+    if (
+        last_info["body_ratio"]
+        >= 0.50
+    ):
+
+        bullish_score += 5
+
+    # Rechazo de precios bajos.
+    if (
+        last_info["lower_wick"]
+        > last_info["upper_wick"]
+    ):
+
+        bullish_score += 5
+
+    # Cierre en zona superior.
+    if last_info["range"] > 0:
+
+        close_position = (
+            last_close
+            - last_info["low"]
+        ) / last_info["range"]
+
+        if close_position >= 0.65:
+
+            bullish_score += 5
+
+    # ========================================================
+    # RECUPERACIÓN BAJISTA
+    # ========================================================
+
+    bearish_score = 0
+
+    # Presión alcista previa.
+    if (
+        bullish_pressure
+        > bearish_pressure
+    ):
+
+        bearish_score += 25
+
+    # Desplazamiento alcista previo.
+    if (
+        bullish_movement
+        > bearish_movement
+    ):
+
+        bearish_score += 15
+
+    # Recuperación desde el máximo.
+    recovery_down = (
+        previous_high
+        - last_close
+    ) / previous_range
+
+    if recovery_down >= 0.25:
+        bearish_score += 10
+
+    if recovery_down >= 0.40:
+        bearish_score += 10
+
+    if recovery_down >= 0.55:
+        bearish_score += 10
+
+    # La última vela debe mostrar
+    # recuperación bajista.
+    if last_info["bear"]:
+
+        bearish_score += 15
+
+    # Cuerpo suficiente.
+    if (
+        last_info["body_ratio"]
+        >= 0.30
+    ):
+
+        bearish_score += 5
+
+    if (
+        last_info["body_ratio"]
+        >= 0.50
+    ):
+
+        bearish_score += 5
+
+    # Rechazo de precios altos.
+    if (
+        last_info["upper_wick"]
+        > last_info["lower_wick"]
+    ):
+
+        bearish_score += 5
+
+    # Cierre en zona inferior.
+    if last_info["range"] > 0:
+
+        close_position = (
+            last_close
+            - last_info["low"]
+        ) / last_info["range"]
+
+        if close_position <= 0.35:
+
+            bearish_score += 5
+
+    # ========================================================
+    # SELECCIONAR RECUPERACIÓN DOMINANTE
+    # ========================================================
+
+    if (
+        bullish_score
+        >= MIN_SCORE_TO_TRADE
+        and bullish_score
+        > bearish_score
+    ):
+
+        result.update(
+            {
+                "detected": True,
+                "signal": "call",
+                "score": min(
+                    bullish_score,
+                    100,
+                ),
+                "reason": (
+                    "Recuperación alcista "
+                    "detectada"
+                ),
+            }
+        )
+
+        return result
+
+    if (
+        bearish_score
+        >= MIN_SCORE_TO_TRADE
+        and bearish_score
+        > bullish_score
+    ):
+
+        result.update(
+            {
+                "detected": True,
+                "signal": "put",
+                "score": min(
+                    bearish_score,
+                    100,
+                ),
+                "reason": (
+                    "Recuperación bajista "
+                    "detectada"
+                ),
+            }
+        )
+
+    return result
 
 
 # ============================================================
@@ -1395,203 +1640,71 @@ def analyze_market(
     ] = direction
 
     # --------------------------------------------------------
-    # DETECTAR LOS 5 PATRONES
+    # ÚNICA LÓGICA DE ENTRADA
+    # RECUPERACIÓN
     # --------------------------------------------------------
 
-    patterns = []
-
-    # REVERSIÓN
-    reversal = detect_reversal(
+    recovery = detect_recovery(
         hist
     )
 
-    reversal["pattern"] = (
-        "REVERSAL"
-    )
-
-    patterns.append(
-        reversal
-    )
-
-    # RECHAZO
-    rejection = detect_rejection(
-        hist
-    )
-
-    rejection["pattern"] = (
-        "REJECTION"
-    )
-
-    patterns.append(
-        rejection
-    )
-
-    # CONSOLIDACIÓN
-    consolidation = (
-        detect_consolidation(
-            hist
-        )
-    )
-
-    consolidation["pattern"] = (
-        "CONSOLIDATION"
-    )
-
-    patterns.append(
-        consolidation
-    )
-
-    # CONTINUIDAD Y PULLBACK
-    # necesitan una estructura direccional.
-
-    if direction in (
-        "BULLISH",
-        "BEARISH",
+    if not recovery.get(
+        "detected",
+        False,
     ):
 
-        continuity = (
-            detect_continuity(
-                hist,
-                direction,
-            )
-        )
-
-        continuity["pattern"] = (
-            "CONTINUITY"
-        )
-
-        patterns.append(
-            continuity
-        )
-
-        pullback = detect_pullback(
-            hist,
-            direction,
-        )
-
-        pullback["pattern"] = (
-            "PULLBACK"
-        )
-
-        patterns.append(
-            pullback
-        )
-
-    # --------------------------------------------------------
-    # MEJOR PATRÓN
-    # --------------------------------------------------------
-
-    best = select_best_pattern(
-        patterns
-    )
-
-    if best is None:
-
         result["reason"] = (
-            "No se detectó patrón válido"
+            "No se detectó recuperación"
         )
 
         return result
 
     # --------------------------------------------------------
-    # PENALIZACIÓN POR AGOTAMIENTO
-    #
-    # No aplicamos la misma penalización
-    # a reversión, rechazo o consolidación,
-    # porque esos patrones pueden aparecer
-    # precisamente después de un movimiento.
+    # SCORE DE RECUPERACIÓN
     # --------------------------------------------------------
 
     score = int(
-        best["score"]
+        recovery.get(
+            "score",
+            0,
+        )
     )
 
-    pattern = best[
-        "pattern"
-    ]
-
-    signal = best[
+    signal = recovery.get(
         "signal"
-    ]
-
-    if pattern in (
-        "CONTINUITY",
-        "PULLBACK",
-    ):
-
-        signal_direction = (
-            "BULLISH"
-            if signal == "call"
-            else "BEARISH"
-        )
-
-        if exhaustion_check(
-            hist,
-            signal_direction,
-        ):
-
-            score -= 15
-
-    # --------------------------------------------------------
-    # ÚLTIMA VELA
-    # --------------------------------------------------------
-
-    last_info = candle_info(
-        hist.iloc[-1]
-    )
-
-    # Penalizamos velas demasiado pequeñas
-    # en patrones que requieren confirmación.
-
-    if (
-        pattern in (
-            "CONTINUITY",
-            "PULLBACK",
-            "CONSOLIDATION",
-        )
-        and last_info["body_ratio"]
-        < MAX_DOJI_RATIO
-    ):
-
-        score -= 20
-
-    # --------------------------------------------------------
-    # LIMITAR SCORE
-    # --------------------------------------------------------
-
-    score = max(
-        0,
-        min(
-            score,
-            100,
-        ),
-    )
-
-    result["score"] = score
-    result["pattern"] = pattern
-    result["signal"] = signal
-    result["reason"] = best.get(
-        "reason",
-        "",
     )
 
     # --------------------------------------------------------
-    # VALIDACIÓN FINAL
+    # VALIDACIÓN DEL SCORE
     # --------------------------------------------------------
 
     if score < MIN_SCORE_TO_TRADE:
 
-        result["valid"] = False
+        result["score"] = score
 
         result["reason"] = (
-            f"{result['reason']} | "
-            f"Score insuficiente: "
+            f"Recuperación insuficiente: "
             f"{score}/{MIN_SCORE_TO_TRADE}"
         )
 
         return result
 
+    # --------------------------------------------------------
+    # RESULTADO FINAL
+    # --------------------------------------------------------
+
     result["valid"] = True
+
+    result["signal"] = signal
+
+    result["score"] = score
+
+    result["pattern"] = "RECOVERY"
+
+    result["reason"] = recovery.get(
+        "reason",
+        "Recuperación detectada",
+    )
 
     return result
 
