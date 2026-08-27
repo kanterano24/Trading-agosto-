@@ -44,12 +44,11 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 # ============================================================
 
 PAIRS = [
-    "EURUSD",
-    "EURJPY",
-    "EURGBP",
-    "GBPUSD",
-    "USDJPY",
-    "AUDUSD",
+    "EURUSD-OTC",
+    "EURJPY-OTC",
+    "EURGBP-OTC",
+    "GBPUSD-OTC",
+    "USDCHF-OTC",
 ]
 
 TIMEFRAME = 60
