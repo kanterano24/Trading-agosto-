@@ -57,11 +57,23 @@ PAIRS = [
 
 TIMEFRAME = 60
 
+FIVE_SECOND_TIMEFRAME = 5
+
 CANDLE_COUNT = 60
 
-EXPIRATION = 4
+FIVE_SECOND_COUNT = 12
 
-# Frecuencia del análisis en vivo.
+# ============================================================
+# EXPIRACIÓN
+# ============================================================
+
+EXPIRATION = 1
+
+
+# ============================================================
+# FRECUENCIA
+# ============================================================
+
 POLL_INTERVAL = 0.50
 
 
@@ -111,7 +123,7 @@ STREAMS_STARTED = False
 
 
 # ============================================================
-# ESTADO DE VELAS EN VIVO
+# ESTADO DE VELAS
 # ============================================================
 
 LIVE_M1_STATE: Dict[str, Dict[str, Any]] = {}
@@ -330,10 +342,6 @@ def telegram_worker() -> None:
                     .strip()
                 )
 
-                # ------------------------------------------------
-                # START
-                # ------------------------------------------------
-
                 if command.startswith(
                     "/start"
                 ):
@@ -348,14 +356,11 @@ def telegram_worker() -> None:
                         f"${CURRENT_AMOUNT:.2f}\n"
                         f"⏱ Expiración: "
                         f"{EXPIRATION}m\n"
-                        "📡 Análisis M1 en vivo",
+                        "📡 M1 + 12 velas de 5s\n"
+                        "🎯 Entrada automática en N+1",
                         "start",
                         force=True,
                     )
-
-                # ------------------------------------------------
-                # STOP
-                # ------------------------------------------------
 
                 elif command.startswith(
                     "/stop"
@@ -368,10 +373,6 @@ def telegram_worker() -> None:
                         "stop",
                         force=True,
                     )
-
-                # ------------------------------------------------
-                # STATUS
-                # ------------------------------------------------
 
                 elif command.startswith(
                     "/status"
@@ -535,7 +536,7 @@ def get_pair_candidates(
 
 
 # ============================================================
-# OBTENER VELAS HISTÓRICAS
+# OBTENER VELAS HISTÓRICAS M1
 # ============================================================
 
 def get_pair_candles(
@@ -617,6 +618,137 @@ def get_pair_candles(
             )
 
     return None, None
+
+
+# ============================================================
+# OBTENER 12 VELAS DE 5 SEGUNDOS DE N
+# ============================================================
+
+def get_5s_candles_for_minute(
+    logical_pair: str,
+    minute_timestamp: int,
+) -> Optional[pd.DataFrame]:
+
+    if IQ is None:
+        return None
+
+    api_pair = ACTIVE_API_PAIR.get(
+        logical_pair
+    )
+
+    if not api_pair:
+
+        api_pair, _ = (
+            get_pair_candles(
+                logical_pair
+            )
+        )
+
+    if not api_pair:
+        return None
+
+    start_timestamp = int(
+        minute_timestamp
+    )
+
+    end_timestamp = (
+        start_timestamp
+        + TIMEFRAME
+    )
+
+    try:
+
+        candles = IQ.get_candles(
+            api_pair,
+            FIVE_SECOND_TIMEFRAME,
+            FIVE_SECOND_COUNT,
+            end_timestamp,
+        )
+
+        if not candles:
+            return None
+
+        df = pd.DataFrame(
+            candles
+        )
+
+        if df.empty:
+            return None
+
+        required = {
+            "open",
+            "close",
+            "high",
+            "low",
+        }
+
+        if not required.issubset(
+            df.columns
+        ):
+            return None
+
+        if "from" not in df.columns:
+            return None
+
+        timestamps = pd.to_numeric(
+            df["from"],
+            errors="coerce",
+        )
+
+        data = df[
+            (
+                timestamps
+                >= start_timestamp
+            )
+            & (
+                timestamps
+                < end_timestamp
+            )
+        ].copy()
+
+        data = data.sort_values(
+            "from"
+        )
+
+        data = data.drop_duplicates(
+            subset=["from"],
+            keep="last",
+        )
+
+        data.reset_index(
+            drop=True,
+            inplace=True,
+        )
+
+        if len(data) < FIVE_SECOND_COUNT:
+
+            logging.warning(
+                (
+                    "5s incompletas | %s | "
+                    "M1=%s | recibidas=%s/12"
+                ),
+                logical_pair,
+                minute_timestamp,
+                len(data),
+            )
+
+            return None
+
+        return data.tail(
+            FIVE_SECOND_COUNT
+        ).reset_index(
+            drop=True
+        )
+
+    except Exception as e:
+
+        logging.debug(
+            "Error obteniendo 5s %s: %s",
+            api_pair,
+            e,
+        )
+
+        return None
 
 
 # ============================================================
@@ -789,23 +921,37 @@ def start_streams() -> bool:
 
         try:
 
+            # ------------------------------------------------
+            # STREAM M1
+            # ------------------------------------------------
+
             IQ.start_candles_stream(
                 api_pair,
                 TIMEFRAME,
                 CANDLE_COUNT,
             )
 
+            # ------------------------------------------------
+            # STREAM 5 SEGUNDOS
+            # ------------------------------------------------
+
+            IQ.start_candles_stream(
+                api_pair,
+                FIVE_SECOND_TIMEFRAME,
+                FIVE_SECOND_COUNT,
+            )
+
             success += 1
 
             logging.info(
-                "Stream M1 iniciado: %s",
+                "Streams M1 + 5s iniciados: %s",
                 api_pair,
             )
 
         except Exception as e:
 
             logging.error(
-                "Error iniciando stream %s: %s",
+                "Error iniciando streams %s: %s",
                 api_pair,
                 e,
             )
@@ -857,13 +1003,6 @@ def get_live_candle(
 
         if not candles:
             return api_pair, None
-
-        # Las versiones habituales
-        # devuelven un diccionario:
-        #
-        # timestamp -> candle
-        #
-        # Seleccionamos la vela más reciente.
 
         if isinstance(
             candles,
@@ -1126,7 +1265,7 @@ def detect_new_minute(
 
 
 # ============================================================
-# OBTENER LA VELA QUE ACABA DE CERRAR
+# OBTENER VELA CERRADA
 # ============================================================
 
 def get_closed_candle_after_boundary(
@@ -1194,7 +1333,7 @@ def get_closed_candle_after_boundary(
 
 
 # ============================================================
-# ANALIZAR VELA CERRADA
+# ANALIZAR VELA CERRADA + 12 VELAS DE 5 SEGUNDOS
 # ============================================================
 
 def analyze_closed_pair(
@@ -1219,12 +1358,52 @@ def analyze_closed_pair(
     if len(history) < 22:
         return None
 
+    # --------------------------------------------------------
+    # OBTENER EXACTAMENTE LAS 12 VELAS DE 5s
+    # PERTENECIENTES A LA M1 CERRADA
+    # --------------------------------------------------------
+
+    candles_5s = (
+        get_5s_candles_for_minute(
+            logical_pair,
+            closed_timestamp,
+        )
+    )
+
+    if candles_5s is None:
+
+        logging.warning(
+            (
+                "Sin 12 velas 5s completas | "
+                "%s | M1=%s | "
+                "NO se genera operación"
+            ),
+            logical_pair,
+            closed_timestamp,
+        )
+
+        return None
+
+    if len(candles_5s) != FIVE_SECOND_COUNT:
+
+        logging.warning(
+            (
+                "Cantidad 5s incorrecta | "
+                "%s | %s/12"
+            ),
+            logical_pair,
+            len(candles_5s),
+        )
+
+        return None
+
     try:
 
         result = analyze_market(
             candle_1m=candle,
             previous_m1=history,
             pair=logical_pair,
+            candles_5s=candles_5s,
         )
 
     except Exception as e:
@@ -1249,18 +1428,20 @@ def analyze_closed_pair(
         "candle_timestamp"
     ] = closed_timestamp
 
+    result[
+        "five_second_count"
+    ] = len(candles_5s)
+
     return result
 
 
 # ============================================================
-# BUSCAR MEJOR OPERACIÓN DESPUÉS DEL CIERRE
+# BUSCAR TODAS LAS OPERACIONES VÁLIDAS
 # ============================================================
 
-def find_best_trade(
+def find_valid_trades(
     closed_timestamp: int,
-) -> Optional[
-    Dict[str, Any]
-]:
+) -> list:
 
     candidates = []
 
@@ -1302,19 +1483,30 @@ def find_best_trade(
             result
         )
 
+        micro = result.get(
+            "micro_analysis",
+            {},
+        )
+
         logging.info(
-            "%s | %s | score=%s | pattern=%s",
+            (
+                "%s | %s | "
+                "score=%s | "
+                "5s=%s | "
+                "pattern=%s"
+            ),
             logical_pair,
             signal,
             score,
+            micro.get(
+                "direction",
+                "NEUTRAL",
+            ),
             result.get(
                 "pattern",
                 "UNKNOWN",
             ),
         )
-
-    if not candidates:
-        return None
 
     candidates.sort(
         key=lambda x: int(
@@ -1326,7 +1518,27 @@ def find_best_trade(
         reverse=True,
     )
 
-    return candidates[0]
+    return candidates
+
+
+# ============================================================
+# COMPATIBILIDAD CON find_best_trade
+# ============================================================
+
+def find_best_trade(
+    closed_timestamp: int,
+) -> Optional[
+    Dict[str, Any]
+]:
+
+    trades = find_valid_trades(
+        closed_timestamp
+    )
+
+    if not trades:
+        return None
+
+    return trades[0]
 
 
 # ============================================================
@@ -1395,10 +1607,6 @@ def execute_trade(
 
     try:
 
-        # ----------------------------------------------------
-        # CONFIRMACIÓN
-        # ----------------------------------------------------
-
         telegram_send(
             "✅ CONFIRMACIÓN COMPLETA\n\n"
             f"📊 Par: {api_pair}\n"
@@ -1406,8 +1614,8 @@ def execute_trade(
             f"{signal.upper()}\n"
             f"🧠 Patrón: {pattern}\n"
             f"⭐ Score: {score}/100\n"
-            "🔎 Condiciones confirmadas\n"
-            "🚀 Preparando ejecución...",
+            "📡 12 velas de 5s analizadas\n"
+            "🚀 Preparando ejecución en N+1...",
             (
                 f"confirmation_"
                 f"{logical_pair}_"
@@ -1465,10 +1673,6 @@ def execute_trade(
                 time.time()
             ),
         }
-
-        # ----------------------------------------------------
-        # EJECUCIÓN
-        # ----------------------------------------------------
 
         telegram_send(
             "🚀 OPERACIÓN EJECUTADA\n\n"
@@ -1600,10 +1804,6 @@ def main() -> None:
 
         return
 
-    # --------------------------------------------------------
-    # TELEGRAM
-    # --------------------------------------------------------
-
     if (
         TELEGRAM_TOKEN
         and TELEGRAM_CHAT_ID
@@ -1617,10 +1817,6 @@ def main() -> None:
     logging.info(
         "Bot iniciado"
     )
-
-    # --------------------------------------------------------
-    # ESPERAR ACTIVACIÓN
-    # --------------------------------------------------------
 
     while True:
 
@@ -1640,10 +1836,6 @@ def main() -> None:
 
                 continue
 
-            # ------------------------------------------------
-            # INICIAR STREAMS
-            # ------------------------------------------------
-
             if not STREAMS_STARTED:
 
                 start_streams()
@@ -1661,7 +1853,7 @@ def main() -> None:
             )
 
             # ------------------------------------------------
-            # DETECTAR CAMBIO DE VELA
+            # DETECTAR CAMBIO DE M1
             # ------------------------------------------------
 
             new_candles = []
@@ -1684,14 +1876,6 @@ def main() -> None:
                             ),
                         )
                     )
-
-                # ------------------------------------------------
-                # LOG DE ANÁLISIS EN VIVO
-                #
-                # Solo mostramos cada 10 segundos
-                # para no llenar los logs.
-                # NO TELEGRAM.
-                # ------------------------------------------------
 
                 elapsed = float(
                     analysis.get(
@@ -1765,94 +1949,96 @@ def main() -> None:
                     )
 
             # ------------------------------------------------
-            # CUANDO CAMBIA LA M1:
-            #
-            # La vela anterior ya terminó.
-            #
-            # AHORA se analiza la vela cerrada.
+            # PROCESAR CADA M1 QUE ACABA DE CERRAR
             # ------------------------------------------------
 
             for (
                 logical_pair,
-                closed_timestamp,
+                live_timestamp,
             ) in new_candles:
+
+                closed_timestamp = (
+                    live_timestamp
+                    - TIMEFRAME
+                )
 
                 logging.info(
                     (
                         "CIERRE M1 | %s | "
                         "timestamp=%s | "
-                        "calculando confirmación..."
+                        "analizando 12 velas 5s..."
                     ),
                     logical_pair,
-                    closed_timestamp
-                    - TIMEFRAME,
+                    closed_timestamp,
                 )
 
-            # ------------------------------------------------
-            # BUSCAR MEJOR OPORTUNIDAD
-            #
-            # Una sola vez por vela global.
-            # ------------------------------------------------
+                # ------------------------------------------------
+                # Pequeña espera para asegurar publicación
+                # de la M1 cerrada y las 5s.
+                # ------------------------------------------------
 
-            if new_candles:
-
-                closed_timestamp = (
-                    new_candles[0][1]
-                    - TIMEFRAME
-                )
-
-                # Esperamos brevemente para que
-                # la API publique definitivamente
-                # la vela cerrada.
                 time.sleep(
                     0.25
                 )
 
-                best_trade = (
-                    find_best_trade(
+                trades = (
+                    find_valid_trades(
                         closed_timestamp
                     )
                 )
 
-                if best_trade:
+                if not trades:
 
                     logging.info(
                         (
-                            "MEJOR OPORTUNIDAD | "
-                            "%s | %s | "
-                            "score=%s | "
-                            "pattern=%s"
+                            "No hay operación válida | "
+                            "%s | M1=%s"
                         ),
-                        best_trade[
-                            "api_pair"
-                        ],
-                        best_trade[
-                            "signal"
-                        ],
-                        best_trade[
-                            "score"
-                        ],
-                        best_trade.get(
-                            "pattern"
-                        ),
+                        logical_pair,
+                        closed_timestamp,
                     )
 
-                    # ------------------------------------------------
-                    # EJECUCIÓN
-                    #
-                    # Estamos al inicio de N+1.
-                    # ------------------------------------------------
+                    continue
 
-                    execute_trade(
-                        best_trade
-                    )
+                # ------------------------------------------------
+                # IMPORTANTE:
+                #
+                # Se mantiene MAX_OPEN_TRADES = 1.
+                # Por eso se ejecuta únicamente la mejor
+                # señal disponible cuando hay varias.
+                # ------------------------------------------------
 
-                else:
+                best_trade = trades[0]
 
-                    logging.info(
-                        "No hay oportunidad válida "
-                        "en el cierre de la M1."
-                    )
+                logging.info(
+                    (
+                        "MEJOR OPORTUNIDAD | "
+                        "%s | %s | "
+                        "score=%s | "
+                        "5s=%s"
+                    ),
+                    best_trade[
+                        "api_pair"
+                    ],
+                    best_trade[
+                        "signal"
+                    ],
+                    best_trade[
+                        "score"
+                    ],
+                    best_trade.get(
+                        "five_second_count",
+                        0,
+                    ),
+                )
+
+                # ------------------------------------------------
+                # EJECUCIÓN AL INICIO DE N+1
+                # ------------------------------------------------
+
+                execute_trade(
+                    best_trade
+                )
 
             # ------------------------------------------------
             # RESULTADOS
@@ -1881,8 +2067,6 @@ def main() -> None:
                 e,
             )
 
-            # Si el stream falla, se vuelve
-            # a inicializar.
             STREAMS_STARTED = False
 
             time.sleep(2)
