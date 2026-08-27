@@ -14,27 +14,51 @@ MIN_CANDLES = 22
 # Score mínimo absoluto para permitir una operación.
 MIN_SCORE_TO_TRADE = 75
 
-# Tamaño mínimo del cuerpo para considerar una vela con dirección.
+# Diferencia mínima entre CALL y PUT.
+MIN_DIRECTION_ADVANTAGE = 10
+
+# Cuerpo mínimo.
 MIN_BODY_RATIO = 0.30
 
-# Una vela por debajo de este ratio se considera pequeña / indecisa.
+# Doji / indecisión.
 MAX_DOJI_RATIO = 0.20
 
-# Tendencia / estructura.
-STRUCTURE_LOOKBACK =10
+# Estructura.
+STRUCTURE_LOOKBACK = 10
+
+# Soporte / resistencia.
+LEVEL_LOOKBACK = 10
 
 # Consolidación.
 CONSOLIDATION_LOOKBACK = 8
 CONSOLIDATION_MAX_RATIO = 0.55
-
-# Pullback.
-PULLBACK_LOOKBACK = 7
 
 # Reversión.
 REVERSAL_WICK_RATIO = 1.20
 
 # Rechazo.
 REJECTION_WICK_RATIO = 1.00
+
+# Pullback.
+PULLBACK_LOOKBACK = 7
+
+# Volatilidad.
+VOLATILITY_LOOKBACK = 10
+
+# Agotamiento.
+EXHAUSTION_LOOKBACK = 4
+
+# ============================================================
+# PESOS DE CONFLUENCIA
+# ============================================================
+
+WEIGHT_STRUCTURE = 15
+WEIGHT_CANDLE = 20
+WEIGHT_REJECTION = 15
+WEIGHT_MOMENTUM = 10
+WEIGHT_LEVEL = 15
+WEIGHT_RECOVERY = 15
+WEIGHT_VOLATILITY = 10
 
 
 # ============================================================
@@ -140,6 +164,7 @@ def candle_info(
             "lower_wick": 0.0,
             "upper_wick_ratio": 0.0,
             "lower_wick_ratio": 0.0,
+            "close_position": 0.50,
         }
 
     body_ratio = (
@@ -161,6 +186,10 @@ def candle_info(
         upper_wick_ratio = 0.0
         lower_wick_ratio = 0.0
 
+    close_position = (
+        close - low
+    ) / total_range
+
     return {
         "open": open_price,
         "close": close,
@@ -176,6 +205,7 @@ def candle_info(
         "lower_wick": lower_wick,
         "upper_wick_ratio": upper_wick_ratio,
         "lower_wick_ratio": lower_wick_ratio,
+        "close_position": close_position,
     }
 
 
@@ -232,48 +262,22 @@ def market_structure(
         len(data),
     ):
 
-        # --------------------------------------------
-        # HIGHER HIGHS
-        # --------------------------------------------
-
-        if highs[i] >= highs[i - 1]:
-
+        if highs[i] > highs[i - 1]:
             higher_highs += 1
 
-        # --------------------------------------------
-        # HIGHER LOWS
-        # --------------------------------------------
-
-        if lows[i] >= lows[i - 1]:
-
+        if lows[i] > lows[i - 1]:
             higher_lows += 1
 
-        # --------------------------------------------
-        # LOWER HIGHS
-        # --------------------------------------------
-
-        if highs[i] <= highs[i - 1]:
-
+        if highs[i] < highs[i - 1]:
             lower_highs += 1
 
-        # --------------------------------------------
-        # LOWER LOWS
-        # --------------------------------------------
-
-        if lows[i] <= lows[i - 1]:
-
+        if lows[i] < lows[i - 1]:
             lower_lows += 1
 
-        # --------------------------------------------
-        # CLOSES
-        # --------------------------------------------
-
         if closes[i] > closes[i - 1]:
-
             rising_closes += 1
 
         elif closes[i] < closes[i - 1]:
-
             falling_closes += 1
 
     bullish_score = (
@@ -287,9 +291,6 @@ def market_structure(
         + lower_lows
         + falling_closes
     )
-
-    # Máximo posible aproximado:
-    # 7 + 7 + 7 = 21
 
     if (
         bullish_score >= 12
@@ -309,7 +310,7 @@ def market_structure(
 
 
 # ============================================================
-# CONTAR VELAS EN UNA DIRECCIÓN
+# FUERZA DIRECCIONAL
 # ============================================================
 
 def directional_candle_score(
@@ -317,13 +318,11 @@ def directional_candle_score(
     direction: str,
 ) -> int:
 
-    score = 2
+    score = 0
 
     for _, candle in candles.iterrows():
 
-        info = candle_info(
-            candle
-        )
+        info = candle_info(candle)
 
         if (
             info["body_ratio"]
@@ -336,20 +335,20 @@ def directional_candle_score(
             and info["bull"]
         ):
 
-            score += 3
+            score += 1
 
         elif (
             direction == "BEARISH"
             and info["bear"]
         ):
 
-            score += 3
+            score += 1
 
     return score
 
 
 # ============================================================
-# IMPULSO
+# MOMENTUM
 # ============================================================
 
 def momentum_score(
@@ -358,10 +357,9 @@ def momentum_score(
 ) -> int:
 
     if len(candles) < 2:
-
         return 0
 
-    score = 2
+    score = 0
 
     closes = candles[
         "close"
@@ -391,7 +389,7 @@ def momentum_score(
                 and closes[i] > closes[i - 1]
             ):
 
-                score += 3
+                score += 1
 
         elif direction == "BEARISH":
 
@@ -400,18 +398,18 @@ def momentum_score(
                 and closes[i] < closes[i - 1]
             ):
 
-                score += 3
+                score += 1
 
     return score
 
 
 # ============================================================
-# SOPORTE Y RESISTENCIA RECIENTE
+# NIVELES RECIENTES
 # ============================================================
 
 def recent_levels(
     df: pd.DataFrame,
-    lookback: int = 10,
+    lookback: int = LEVEL_LOOKBACK,
 ) -> Dict[str, float]:
 
     if len(df) < 2:
@@ -454,7 +452,7 @@ def recent_levels(
 
 
 # ============================================================
-# PROXIMIDAD A UN NIVEL
+# PROXIMIDAD A NIVEL
 # ============================================================
 
 def is_near(
@@ -465,7 +463,6 @@ def is_near(
 ) -> bool:
 
     if market_range <= 0:
-
         return False
 
     tolerance = (
@@ -480,754 +477,220 @@ def is_near(
 
 
 # ============================================================
-# DETECTAR CONTINUIDAD
+# ANÁLISIS DE LA VELA FINAL
 # ============================================================
 
-def detect_continuity(
+def analyze_final_candle(
     df: pd.DataFrame,
-    direction: str,
 ) -> Dict[str, Any]:
 
     result = {
-        "detected": False,
-        "signal": None,
-        "score": 0,
-        "reason": "",
+        "bullish_score": 0,
+        "bearish_score": 0,
+        "bullish_reason": [],
+        "bearish_reason": [],
     }
 
-    if len(df) < 6:
-
+    if df.empty:
         return result
 
-    candles = df.tail(5)
-
-    directional = (
-        directional_candle_score(
-            candles,
-            direction,
-        )
-    )
-
-    momentum = momentum_score(
-        candles,
-        direction,
-    )
-
-    last_info = candle_info(
+    info = candle_info(
         df.iloc[-1]
     )
 
-    score = 2
-
-    score += min(
-        directional * 12,
-        36,
-    )
-
-    score += min(
-        momentum * 10,
-        30,
-    )
+    # ========================================================
+    # DOJI
+    # ========================================================
 
     if (
-        direction == "BULLISH"
-        and last_info["bull"]
+        info["body_ratio"]
+        <= MAX_DOJI_RATIO
     ):
+        return result
 
-        score += 22
+    # ========================================================
+    # CUERPO
+    # ========================================================
 
-        if (
-            last_info["body_ratio"]
-            >= 0.60
-        ):
+    if info["body_ratio"] >= 0.30:
 
-            score += 12
+        if info["bull"]:
+            result["bullish_score"] += 5
+            result["bullish_reason"].append(
+                "cuerpo alcista válido"
+            )
 
-    elif (
-        direction == "BEARISH"
-        and last_info["bear"]
-    ):
+        elif info["bear"]:
 
-        score += 22
+            result["bearish_score"] += 5
+            result["bearish_reason"].append(
+                "cuerpo bajista válido"
+            )
 
-        if (
-            last_info["body_ratio"]
-            >= 0.60
-        ):
+    if info["body_ratio"] >= 0.50:
 
-            score += 12
+        if info["bull"]:
+
+            result["bullish_score"] += 5
+            result["bullish_reason"].append(
+                "cuerpo alcista fuerte"
+            )
+
+        elif info["bear"]:
+
+            result["bearish_score"] += 5
+            result["bearish_reason"].append(
+                "cuerpo bajista fuerte"
+            )
+
+    # ========================================================
+    # POSICIÓN DEL CIERRE
+    # ========================================================
+
+    if info["bull"]:
+
+        if info["close_position"] >= 0.70:
+
+            result["bullish_score"] += 5
+            result["bullish_reason"].append(
+                "cierre en zona superior"
+            )
+
+    elif info["bear"]:
+
+        if info["close_position"] <= 0.30:
+
+            result["bearish_score"] += 5
+            result["bearish_reason"].append(
+                "cierre en zona inferior"
+            )
+
+    # ========================================================
+    # MECHAS
+    # ========================================================
 
     if (
-        directional >= 4
-        and momentum >= 3
+        info["lower_wick_ratio"]
+        >= REVERSAL_WICK_RATIO
     ):
 
-        result["detected"] = True
-        result["score"] = min(
-            score,
-            100,
+        result["bullish_score"] += 5
+        result["bullish_reason"].append(
+            "rechazo de precios bajos"
         )
 
-        if direction == "BULLISH":
+    if (
+        info["upper_wick_ratio"]
+        >= REVERSAL_WICK_RATIO
+    ):
 
-            result["signal"] = "call"
-
-        else:
-
-            result["signal"] = "put"
-
-        result["reason"] = (
-            "Continuidad confirmada"
+        result["bearish_score"] += 5
+        result["bearish_reason"].append(
+            "rechazo de precios altos"
         )
 
     return result
 
 
 # ============================================================
-# DETECTAR RECHAZO
+# ANÁLISIS DE NIVELES
 # ============================================================
 
-def detect_rejection(
+def analyze_levels(
     df: pd.DataFrame,
 ) -> Dict[str, Any]:
 
     result = {
-        "detected": False,
-        "signal": None,
-        "score": 0,
-        "reason": "",
+        "bullish_score": 0,
+        "bearish_score": 0,
+        "bullish_reason": [],
+        "bearish_reason": [],
+        "support": 0.0,
+        "resistance": 0.0,
     }
 
-    if len(df) < 10:
-
-        return result
-
-    last = df.iloc[-1]
-
-    info = candle_info(
-        last
-    )
-
-    if info["body"] <= 0:
-
+    if len(df) < 5:
         return result
 
     levels = recent_levels(
         df,
-        10,
+        LEVEL_LOOKBACK,
     )
 
-    last_close = float(
-        last["close"]
-    )
+    support = levels["support"]
+    resistance = levels["resistance"]
+    market_range = levels["range"]
 
-    support = levels[
-        "support"
-    ]
+    result["support"] = support
+    result["resistance"] = resistance
 
-    resistance = levels[
-        "resistance"
-    ]
-
-    market_range = levels[
-        "range"
-    ]
-
-    if (
-        info["lower_wick_ratio"]
-        >= REJECTION_WICK_RATIO
-        and info["bull"]
-        and is_near(
-            last_close,
-            support,
-            market_range,
-        )
-    ):
-
-        score = 72
-
-        if (
-            info["body_ratio"]
-            >= 0.40
-        ):
-
-            score += 17
-
-        if (
-            info["lower_wick_ratio"]
-            >= 2.0
-        ):
-
-            score += 12
-
-        result.update(
-            {
-                "detected": True,
-                "signal": "call",
-                "score": min(
-                    score,
-                    100,
-                ),
-                "reason": (
-                    "Rechazo alcista "
-                    "en soporte"
-                ),
-            }
-        )
-
-        return result
-
-    if (
-        info["upper_wick_ratio"]
-        >= REJECTION_WICK_RATIO
-        and info["bear"]
-        and is_near(
-            last_close,
-            resistance,
-            market_range,
-        )
-    ):
-
-        score = 72
-
-        if (
-            info["body_ratio"]
-            >= 0.40
-        ):
-
-            score += 17
-
-        if (
-            info["upper_wick_ratio"]
-            >= 2.0
-        ):
-
-            score += 12
-
-        result.update(
-            {
-                "detected": True,
-                "signal": "put",
-                "score": min(
-                    score,
-                    100,
-                ),
-                "reason": (
-                    "Rechazo bajista "
-                    "en resistencia"
-                ),
-            }
-        )
-
-    return result
-
-
-# ============================================================
-# DETECTAR REVERSIÓN
-# ============================================================
-
-def detect_reversal(
-    df: pd.DataFrame,
-) -> Dict[str, Any]:
-
-    result = {
-        "detected": False,
-        "signal": None,
-        "score": 0,
-        "reason": "",
-    }
-
-    if len(df) < 6:
-
+    if market_range <= 0:
         return result
 
     last = df.iloc[-1]
+    info = candle_info(last)
 
-    info = candle_info(
-        last
-    )
+    # ========================================================
+    # SOPORTE
+    # ========================================================
 
-    previous = df.iloc[
-        -4:-1
-    ]
-
-    previous_bears = (
-        directional_candle_score(
-            previous,
-            "BEARISH",
-        )
-    )
-
-    previous_bulls = (
-        directional_candle_score(
-            previous,
-            "BULLISH",
-        )
-    )
-
-    if (
-        previous_bears >= 2
-        and info["bull"]
-        and info["lower_wick_ratio"]
-        >= REVERSAL_WICK_RATIO
+    if is_near(
+        info["low"],
+        support,
+        market_range,
+        0.15,
     ):
 
-        score = 62
-
-        score += min(
-            previous_bears * 8,
-            24,
+        result["bullish_score"] += 8
+        result["bullish_reason"].append(
+            "precio reaccionando en soporte"
         )
 
-        if (
-            info["body_ratio"]
-            >= 0.35
-        ):
+    if is_near(
+        info["close"],
+        support,
+        market_range,
+        0.15,
+    ) and info["bull"]:
 
-            score += 10
-
-        result.update(
-            {
-                "detected": True,
-                "signal": "call",
-                "score": min(
-                    score,
-                    100,
-                ),
-                "reason": (
-                    "Reversión alcista "
-                    "confirmada"
-                ),
-            }
+        result["bullish_score"] += 7
+        result["bullish_reason"].append(
+            "cierre alcista cerca de soporte"
         )
 
-        return result
+    # ========================================================
+    # RESISTENCIA
+    # ========================================================
 
-    if (
-        previous_bulls >= 2
-        and info["bear"]
-        and info["upper_wick_ratio"]
-        >= REVERSAL_WICK_RATIO
+    if is_near(
+        info["high"],
+        resistance,
+        market_range,
+        0.15,
     ):
 
-        score = 62
-
-        score += min(
-            previous_bulls * 8,
-            24,
+        result["bearish_score"] += 8
+        result["bearish_reason"].append(
+            "precio reaccionando en resistencia"
         )
 
-        if (
-            info["body_ratio"]
-            >= 0.35
-        ):
+    if is_near(
+        info["close"],
+        resistance,
+        market_range,
+        0.15,
+    ) and info["bear"]:
 
-            score += 12
-
-        result.update(
-            {
-                "detected": True,
-                "signal": "put",
-                "score": min(
-                    score,
-                    100,
-                ),
-                "reason": (
-                    "Reversión bajista "
-                    "confirmada"
-                ),
-            }
+        result["bearish_score"] += 7
+        result["bearish_reason"].append(
+            "cierre bajista cerca de resistencia"
         )
 
     return result
 
 
 # ============================================================
-# DETECTAR PULLBACK
-# ============================================================
-
-def detect_pullback(
-    df: pd.DataFrame,
-    direction: str,
-) -> Dict[str, Any]:
-
-    result = {
-        "detected": False,
-        "signal": None,
-        "score": 0,
-        "reason": "",
-    }
-
-    if len(df) < 8:
-
-        return result
-
-    last = df.iloc[-1]
-
-    last_info = candle_info(
-        last
-    )
-
-    previous = df.iloc[
-        -5:-1
-    ]
-
-    if direction == "BULLISH":
-
-        bearish_pullback = (
-            directional_candle_score(
-                previous.tail(3),
-                "BEARISH",
-            )
-        )
-
-        bullish_before = (
-            directional_candle_score(
-                df.iloc[-8:-4],
-                "BULLISH",
-            )
-        )
-
-        if (
-            bullish_before >= 2
-            and bearish_pullback >= 1
-            and last_info["bull"]
-            and last_info["body_ratio"]
-            >= MIN_BODY_RATIO
-        ):
-
-            score = 62
-
-            score += min(
-                bullish_before * 7,
-                14,
-            )
-
-            score += min(
-                bearish_pullback * 6,
-                12,
-            )
-
-            score += 17
-
-            result.update(
-                {
-                    "detected": True,
-                    "signal": "call",
-                    "score": min(
-                        score,
-                        100,
-                    ),
-                    "reason": (
-                        "Pullback alcista "
-                        "y continuación"
-                    ),
-                }
-            )
-
-            return result
-
-    elif direction == "BEARISH":
-
-        bullish_pullback = (
-            directional_candle_score(
-                previous.tail(3),
-                "BULLISH",
-            )
-        )
-
-        bearish_before = (
-            directional_candle_score(
-                df.iloc[-8:-4],
-                "BEARISH",
-            )
-        )
-
-        if (
-            bearish_before >= 2
-            and bullish_pullback >= 1
-            and last_info["bear"]
-            and last_info["body_ratio"]
-            >= MIN_BODY_RATIO
-        ):
-
-            score = 60
-
-            score += min(
-                bearish_before * 7,
-                14,
-            )
-
-            score += min(
-                bullish_pullback * 6,
-                12,
-            )
-
-            score += 17
-
-            result.update(
-                {
-                    "detected": True,
-                    "signal": "put",
-                    "score": min(
-                        score,
-                        100,
-                    ),
-                    "reason": (
-                        "Pullback bajista "
-                        "y continuación"
-                    ),
-                }
-            )
-
-    return result
-
-
-# ============================================================
-# DETECTAR CONSOLIDACIÓN
-# ============================================================
-
-def detect_consolidation(
-    df: pd.DataFrame,
-) -> Dict[str, Any]:
-
-    result = {
-        "detected": False,
-        "signal": None,
-        "score": 0,
-        "reason": "",
-    }
-
-    if len(df) < 12:
-
-        return result
-
-    zone = df.iloc[
-        -7:-1
-    ]
-
-    last = df.iloc[-1]
-
-    last_info = candle_info(
-        last
-    )
-
-    zone_high = float(
-        zone["high"].max()
-    )
-
-    zone_low = float(
-        zone["low"].min()
-    )
-
-    zone_range = (
-        zone_high
-        - zone_low
-    )
-
-    previous_market = df.iloc[
-        -12:-7
-    ]
-
-    previous_high = float(
-        previous_market["high"].max()
-    )
-
-    previous_low = float(
-        previous_market["low"].min()
-    )
-
-    previous_range = (
-        previous_high
-        - previous_low
-    )
-
-    if previous_range <= 0:
-
-        return result
-
-    if (
-        zone_range
-        > previous_range
-        * CONSOLIDATION_MAX_RATIO
-    ):
-
-        return result
-
-    last_close = float(
-        last["close"]
-    )
-
-    if (
-        last_close > zone_high
-        and last_info["bull"]
-        and last_info["body_ratio"]
-        >= 0.40
-    ):
-
-        score = 79
-
-        if (
-            last_info["body_ratio"]
-            >= 0.60
-        ):
-
-            score += 12
-
-        result.update(
-            {
-                "detected": True,
-                "signal": "call",
-                "score": min(
-                    score,
-                    100,
-                ),
-                "reason": (
-                    "Ruptura alcista "
-                    "de consolidación"
-                ),
-            }
-        )
-
-        return result
-
-    if (
-        last_close < zone_low
-        and last_info["bear"]
-        and last_info["body_ratio"]
-        >= 0.40
-    ):
-
-        score = 75
-
-        if (
-            last_info["body_ratio"]
-            >= 0.60
-        ):
-
-            score += 10
-
-        result.update(
-            {
-                "detected": True,
-                "signal": "put",
-                "score": min(
-                    score,
-                    100,
-                ),
-                "reason": (
-                    "Ruptura bajista "
-                    "de consolidación"
-                ),
-            }
-        )
-
-    return result
-
-
-# ============================================================
-# EVITAR AGOTAMIENTO
-# ============================================================
-
-def exhaustion_check(
-    df: pd.DataFrame,
-    direction: str,
-) -> bool:
-
-    if len(df) < 5:
-
-        return False
-
-    last_four = df.tail(4)
-
-    same_direction = 0
-
-    for _, candle in last_four.iterrows():
-
-        info = candle_info(
-            candle
-        )
-
-        if (
-            direction == "BULLISH"
-            and info["bull"]
-            and info["body_ratio"]
-            >= 0.60
-        ):
-
-            same_direction += 1
-
-        elif (
-            direction == "BEARISH"
-            and info["bear"]
-            and info["body_ratio"]
-            >= 0.60
-        ):
-
-            same_direction += 1
-
-    return (
-        same_direction >= 4
-    )
-
-
-# ============================================================
-# SELECCIONAR MEJOR PATRÓN
-# ============================================================
-
-def select_best_pattern(
-    patterns: List[Dict[str, Any]],
-) -> Optional[Dict[str, Any]]:
-
-    valid_patterns = []
-
-    for pattern in patterns:
-
-        if not pattern.get(
-            "detected",
-            False,
-        ):
-            continue
-
-        signal = pattern.get(
-            "signal"
-        )
-
-        score = pattern.get(
-            "score",
-            0,
-        )
-
-        if signal not in (
-            "call",
-            "put",
-        ):
-            continue
-
-        if score <= 0:
-            continue
-
-        valid_patterns.append(
-            pattern
-        )
-
-    if not valid_patterns:
-
-        return None
-
-    valid_patterns.sort(
-        key=lambda x: x.get(
-            "score",
-            0,
-        ),
-        reverse=True,
-    )
-
-    return valid_patterns[0]
-
-
-# ============================================================
-# DETECTAR RECUPERACIÓN
+# RECUPERACIÓN / REVERSIÓN
 # ============================================================
 
 def detect_recovery(
@@ -1238,15 +701,15 @@ def detect_recovery(
         "detected": False,
         "signal": None,
         "score": 0,
+        "bullish_score": 0,
+        "bearish_score": 0,
         "reason": "",
+        "bullish_reason": [],
+        "bearish_reason": [],
     }
 
     if len(df) < 8:
         return result
-
-    # --------------------------------------------------------
-    # MOVIMIENTO PREVIO
-    # --------------------------------------------------------
 
     previous = df.iloc[:-1].tail(8)
 
@@ -1319,9 +782,7 @@ def detect_recovery(
         last
     )
 
-    last_close = last_info[
-        "close"
-    ]
+    last_close = last_info["close"]
 
     # ========================================================
     # RECUPERACIÓN ALCISTA
@@ -1329,44 +790,53 @@ def detect_recovery(
 
     bullish_score = 0
 
-    # Presión bajista previa.
     if (
         bearish_pressure
         > bullish_pressure
     ):
 
-        bullish_score += 25
+        bullish_score += 20
+        result["bullish_reason"].append(
+            "presión bajista previa"
+        )
 
-    # Desplazamiento bajista previo.
     if (
         bearish_movement
         > bullish_movement
     ):
 
         bullish_score += 15
+        result["bullish_reason"].append(
+            "desplazamiento bajista previo"
+        )
 
-    # Recuperación desde el mínimo.
     recovery_up = (
         last_close
         - previous_low
     ) / previous_range
 
     if recovery_up >= 0.25:
-        bullish_score += 10
+
+        bullish_score += 5
 
     if recovery_up >= 0.40:
-        bullish_score += 10
+
+        bullish_score += 5
 
     if recovery_up >= 0.55:
-        bullish_score += 10
 
-    # La última vela debe mostrar
-    # recuperación alcista.
+        bullish_score += 5
+        result["bullish_reason"].append(
+            "recuperación profunda desde mínimos"
+        )
+
     if last_info["bull"]:
 
-        bullish_score += 15
+        bullish_score += 10
+        result["bullish_reason"].append(
+            "última vela alcista"
+        )
 
-    # Cuerpo suficiente.
     if (
         last_info["body_ratio"]
         >= 0.30
@@ -1380,26 +850,26 @@ def detect_recovery(
     ):
 
         bullish_score += 5
+        result["bullish_reason"].append(
+            "cuerpo de recuperación fuerte"
+        )
 
-    # Rechazo de precios bajos.
     if (
         last_info["lower_wick"]
         > last_info["upper_wick"]
     ):
 
         bullish_score += 5
+        result["bullish_reason"].append(
+            "rechazo de mínimos"
+        )
 
-    # Cierre en zona superior.
-    if last_info["range"] > 0:
+    if (
+        last_info["close_position"]
+        >= 0.65
+    ):
 
-        close_position = (
-            last_close
-            - last_info["low"]
-        ) / last_info["range"]
-
-        if close_position >= 0.65:
-
-            bullish_score += 5
+        bullish_score += 5
 
     # ========================================================
     # RECUPERACIÓN BAJISTA
@@ -1407,44 +877,53 @@ def detect_recovery(
 
     bearish_score = 0
 
-    # Presión alcista previa.
     if (
         bullish_pressure
         > bearish_pressure
     ):
 
-        bearish_score += 25
+        bearish_score += 20
+        result["bearish_reason"].append(
+            "presión alcista previa"
+        )
 
-    # Desplazamiento alcista previo.
     if (
         bullish_movement
         > bearish_movement
     ):
 
         bearish_score += 15
+        result["bearish_reason"].append(
+            "desplazamiento alcista previo"
+        )
 
-    # Recuperación desde el máximo.
     recovery_down = (
         previous_high
         - last_close
     ) / previous_range
 
     if recovery_down >= 0.25:
-        bearish_score += 10
+
+        bearish_score += 5
 
     if recovery_down >= 0.40:
-        bearish_score += 10
+
+        bearish_score += 5
 
     if recovery_down >= 0.55:
-        bearish_score += 10
 
-    # La última vela debe mostrar
-    # recuperación bajista.
+        bearish_score += 5
+        result["bearish_reason"].append(
+            "recuperación profunda desde máximos"
+        )
+
     if last_info["bear"]:
 
-        bearish_score += 15
+        bearish_score += 10
+        result["bearish_reason"].append(
+            "última vela bajista"
+        )
 
-    # Cuerpo suficiente.
     if (
         last_info["body_ratio"]
         >= 0.30
@@ -1458,78 +937,725 @@ def detect_recovery(
     ):
 
         bearish_score += 5
+        result["bearish_reason"].append(
+            "cuerpo de recuperación fuerte"
+        )
 
-    # Rechazo de precios altos.
     if (
         last_info["upper_wick"]
         > last_info["lower_wick"]
     ):
 
         bearish_score += 5
+        result["bearish_reason"].append(
+            "rechazo de máximos"
+        )
 
-    # Cierre en zona inferior.
-    if last_info["range"] > 0:
+    if (
+        last_info["close_position"]
+        <= 0.35
+    ):
 
-        close_position = (
-            last_close
-            - last_info["low"]
-        ) / last_info["range"]
+        bearish_score += 5
 
-        if close_position <= 0.35:
+    result["bullish_score"] = min(
+        bullish_score,
+        100,
+    )
 
-            bearish_score += 5
+    result["bearish_score"] = min(
+        bearish_score,
+        100,
+    )
 
     # ========================================================
-    # SELECCIONAR RECUPERACIÓN DOMINANTE
+    # RESULTADO
     # ========================================================
 
     if (
-        bullish_score
-        >= MIN_SCORE_TO_TRADE
-        and bullish_score
-        > bearish_score
+        bullish_score >= 50
+        and bullish_score > bearish_score
     ):
 
-        result.update(
-            {
-                "detected": True,
-                "signal": "call",
-                "score": min(
-                    bullish_score,
-                    100,
-                ),
-                "reason": (
-                    "Recuperación alcista "
-                    "detectada"
-                ),
-            }
+        result["detected"] = True
+        result["signal"] = "call"
+        result["score"] = min(
+            bullish_score,
+            100,
+        )
+        result["reason"] = (
+            "Recuperación alcista"
         )
 
         return result
 
     if (
-        bearish_score
-        >= MIN_SCORE_TO_TRADE
+        bearish_score >= 50
+        and bearish_score > bullish_score
+    ):
+
+        result["detected"] = True
+        result["signal"] = "put"
+        result["score"] = min(
+            bearish_score,
+            100,
+        )
+        result["reason"] = (
+            "Recuperación bajista"
+        )
+
+    return result
+
+
+# ============================================================
+# VOLATILIDAD
+# ============================================================
+
+def volatility_analysis(
+    df: pd.DataFrame,
+) -> Dict[str, Any]:
+
+    result = {
+        "bullish_score": 0,
+        "bearish_score": 0,
+        "score": 0,
+        "range_ratio": 0.0,
+        "reason": "",
+    }
+
+    if len(df) < VOLATILITY_LOOKBACK + 1:
+        return result
+
+    ranges = (
+        df["high"]
+        - df["low"]
+    )
+
+    previous = ranges.iloc[
+        -VOLATILITY_LOOKBACK - 1:-1
+    ]
+
+    last_range = float(
+        ranges.iloc[-1]
+    )
+
+    average_range = float(
+        previous.mean()
+    )
+
+    if average_range <= 0:
+        return result
+
+    ratio = (
+        last_range
+        / average_range
+    )
+
+    result["range_ratio"] = ratio
+
+    # Una vela demasiado pequeña no ofrece
+    # suficiente desplazamiento.
+    if ratio < 0.50:
+
+        result["score"] = 0
+        result["reason"] = (
+            "volatilidad demasiado baja"
+        )
+
+        return result
+
+    # Volatilidad saludable.
+    if 0.70 <= ratio <= 1.80:
+
+        result["score"] = 10
+        result["reason"] = (
+            "volatilidad saludable"
+        )
+
+    # Vela demasiado grande.
+    elif ratio > 2.50:
+
+        result["score"] = 3
+        result["reason"] = (
+            "volatilidad elevada"
+        )
+
+    else:
+
+        result["score"] = 7
+        result["reason"] = (
+            "volatilidad aceptable"
+        )
+
+    return result
+
+
+# ============================================================
+# AGOTAMIENTO
+# ============================================================
+
+def exhaustion_check(
+    df: pd.DataFrame,
+    direction: str,
+) -> bool:
+
+    if len(df) < EXHAUSTION_LOOKBACK:
+        return False
+
+    last_four = df.tail(
+        EXHAUSTION_LOOKBACK
+    )
+
+    same_direction = 0
+
+    for _, candle in last_four.iterrows():
+
+        info = candle_info(
+            candle
+        )
+
+        if (
+            direction == "BULLISH"
+            and info["bull"]
+            and info["body_ratio"] >= 0.60
+        ):
+
+            same_direction += 1
+
+        elif (
+            direction == "BEARISH"
+            and info["bear"]
+            and info["body_ratio"] >= 0.60
+        ):
+
+            same_direction += 1
+
+    return same_direction >= 4
+
+
+# ============================================================
+# CONTEXTO ESTRUCTURAL
+# ============================================================
+
+def structure_confluence(
+    df: pd.DataFrame,
+    direction: str,
+) -> Dict[str, Any]:
+
+    result = {
+        "score": 0,
+        "reason": "",
+    }
+
+    structure = market_structure(
+        df
+    )
+
+    # Para una recuperación/reversión,
+    # una estructura contraria puede ser favorable.
+    if direction == "BULLISH":
+
+        if structure == "BEARISH":
+
+            result["score"] = 15
+            result["reason"] = (
+                "estructura bajista previa "
+                "compatible con reversión alcista"
+            )
+
+        elif structure == "NEUTRAL":
+
+            result["score"] = 8
+            result["reason"] = (
+                "estructura neutral"
+            )
+
+        elif structure == "BULLISH":
+
+            result["score"] = 5
+            result["reason"] = (
+                "estructura alcista"
+            )
+
+    elif direction == "BEARISH":
+
+        if structure == "BULLISH":
+
+            result["score"] = 15
+            result["reason"] = (
+                "estructura alcista previa "
+                "compatible con reversión bajista"
+            )
+
+        elif structure == "NEUTRAL":
+
+            result["score"] = 8
+            result["reason"] = (
+                "estructura neutral"
+            )
+
+        elif structure == "BEARISH":
+
+            result["score"] = 5
+            result["reason"] = (
+                "estructura bajista"
+            )
+
+    return result
+
+
+# ============================================================
+# MOMENTUM DE RECUPERACIÓN
+# ============================================================
+
+def recovery_momentum(
+    df: pd.DataFrame,
+    direction: str,
+) -> Dict[str, Any]:
+
+    result = {
+        "score": 0,
+        "reason": "",
+    }
+
+    if len(df) < 5:
+        return result
+
+    candles = df.tail(5)
+
+    score = momentum_score(
+        candles,
+        direction,
+    )
+
+    if score >= 3:
+
+        result["score"] = 10
+        result["reason"] = (
+            "momentum confirmado"
+        )
+
+    elif score >= 2:
+
+        result["score"] = 7
+        result["reason"] = (
+            "momentum aceptable"
+        )
+
+    elif score >= 1:
+
+        result["score"] = 3
+        result["reason"] = (
+            "momentum débil"
+        )
+
+    return result
+
+
+# ============================================================
+# PATRÓN DE RECHAZO
+# ============================================================
+
+def rejection_confluence(
+    df: pd.DataFrame,
+    direction: str,
+) -> Dict[str, Any]:
+
+    result = {
+        "score": 0,
+        "reason": "",
+    }
+
+    if df.empty:
+        return result
+
+    info = candle_info(
+        df.iloc[-1]
+    )
+
+    if direction == "BULLISH":
+
+        if (
+            info["lower_wick_ratio"]
+            >= 2.0
+        ):
+
+            result["score"] = 15
+            result["reason"] = (
+                "rechazo alcista fuerte"
+            )
+
+        elif (
+            info["lower_wick_ratio"]
+            >= REJECTION_WICK_RATIO
+        ):
+
+            result["score"] = 10
+            result["reason"] = (
+                "rechazo alcista"
+            )
+
+    elif direction == "BEARISH":
+
+        if (
+            info["upper_wick_ratio"]
+            >= 2.0
+        ):
+
+            result["score"] = 15
+            result["reason"] = (
+                "rechazo bajista fuerte"
+            )
+
+        elif (
+            info["upper_wick_ratio"]
+            >= REJECTION_WICK_RATIO
+        ):
+
+            result["score"] = 10
+            result["reason"] = (
+                "rechazo bajista"
+            )
+
+    return result
+
+
+# ============================================================
+# EVALUAR DIRECCIÓN
+# ============================================================
+
+def evaluate_direction(
+    df: pd.DataFrame,
+    direction: str,
+    recovery_score: int,
+) -> Dict[str, Any]:
+
+    structure_result = structure_confluence(
+        df,
+        direction,
+    )
+
+    candle_result = analyze_final_candle(
+        df
+    )
+
+    level_result = analyze_levels(
+        df
+    )
+
+    momentum_result = recovery_momentum(
+        df,
+        direction,
+    )
+
+    rejection_result = rejection_confluence(
+        df,
+        direction,
+    )
+
+    volatility_result = volatility_analysis(
+        df
+    )
+
+    # ========================================================
+    # SCORE BASE
+    # ========================================================
+
+    score = 0
+
+    reasons = []
+
+    # --------------------------------------------------------
+    # RECUPERACIÓN
+    # --------------------------------------------------------
+
+    recovery_component = min(
+        recovery_score,
+        WEIGHT_RECOVERY,
+    )
+
+    score += recovery_component
+
+    if recovery_component >= 10:
+
+        reasons.append(
+            "recuperación confirmada"
+        )
+
+    # --------------------------------------------------------
+    # ESTRUCTURA
+    # --------------------------------------------------------
+
+    structure_component = min(
+        structure_result["score"],
+        WEIGHT_STRUCTURE,
+    )
+
+    score += structure_component
+
+    if structure_result["reason"]:
+
+        reasons.append(
+            structure_result["reason"]
+        )
+
+    # --------------------------------------------------------
+    # VELA
+    # --------------------------------------------------------
+
+    if direction == "BULLISH":
+
+        candle_component = min(
+            candle_result["bullish_score"],
+            WEIGHT_CANDLE,
+        )
+
+        candle_reasons = (
+            candle_result[
+                "bullish_reason"
+            ]
+        )
+
+    else:
+
+        candle_component = min(
+            candle_result["bearish_score"],
+            WEIGHT_CANDLE,
+        )
+
+        candle_reasons = (
+            candle_result[
+                "bearish_reason"
+            ]
+        )
+
+    score += candle_component
+
+    reasons.extend(
+        candle_reasons
+    )
+
+    # --------------------------------------------------------
+    # NIVELES
+    # --------------------------------------------------------
+
+    if direction == "BULLISH":
+
+        level_component = min(
+            level_result["bullish_score"],
+            WEIGHT_LEVEL,
+        )
+
+        level_reasons = (
+            level_result[
+                "bullish_reason"
+            ]
+        )
+
+    else:
+
+        level_component = min(
+            level_result["bearish_score"],
+            WEIGHT_LEVEL,
+        )
+
+        level_reasons = (
+            level_result[
+                "bearish_reason"
+            ]
+        )
+
+    score += level_component
+
+    reasons.extend(
+        level_reasons
+    )
+
+    # --------------------------------------------------------
+    # RECHAZO
+    # --------------------------------------------------------
+
+    rejection_component = min(
+        rejection_result["score"],
+        WEIGHT_REJECTION,
+    )
+
+    score += rejection_component
+
+    if rejection_result["reason"]:
+
+        reasons.append(
+            rejection_result["reason"]
+        )
+
+    # --------------------------------------------------------
+    # MOMENTUM
+    # --------------------------------------------------------
+
+    momentum_component = min(
+        momentum_result["score"],
+        WEIGHT_MOMENTUM,
+    )
+
+    score += momentum_component
+
+    if momentum_result["reason"]:
+
+        reasons.append(
+            momentum_result["reason"]
+        )
+
+    # --------------------------------------------------------
+    # VOLATILIDAD
+    # --------------------------------------------------------
+
+    volatility_component = min(
+        volatility_result["score"],
+        WEIGHT_VOLATILITY,
+    )
+
+    score += volatility_component
+
+    if volatility_result["reason"]:
+
+        reasons.append(
+            volatility_result["reason"]
+        )
+
+    # ========================================================
+    # AGOTAMIENTO
+    # ========================================================
+
+    exhausted = exhaustion_check(
+        df,
+        direction,
+    )
+
+    if exhausted:
+
+        score -= 20
+
+        reasons.append(
+            "penalización por agotamiento"
+        )
+
+    # ========================================================
+    # VELA INDECISA
+    # ========================================================
+
+    if not df.empty:
+
+        last_info = candle_info(
+            df.iloc[-1]
+        )
+
+        if (
+            last_info["body_ratio"]
+            <= MAX_DOJI_RATIO
+        ):
+
+            score -= 25
+
+            reasons.append(
+                "penalización por vela indecisa"
+            )
+
+    score = max(
+        0,
+        min(
+            int(score),
+            100,
+        ),
+    )
+
+    return {
+        "direction": direction,
+        "signal": (
+            "call"
+            if direction == "BULLISH"
+            else "put"
+        ),
+        "score": score,
+        "structure_score": structure_component,
+        "recovery_score": recovery_component,
+        "candle_score": candle_component,
+        "level_score": level_component,
+        "rejection_score": rejection_component,
+        "momentum_score": momentum_component,
+        "volatility_score": volatility_component,
+        "exhaustion": exhausted,
+        "reasons": reasons,
+    }
+
+
+# ============================================================
+# SELECCIONAR MEJOR DIRECCIÓN
+# ============================================================
+
+def select_best_direction(
+    bullish: Dict[str, Any],
+    bearish: Dict[str, Any],
+) -> Optional[Dict[str, Any]]:
+
+    bullish_score = int(
+        bullish.get("score", 0)
+    )
+
+    bearish_score = int(
+        bearish.get("score", 0)
+    )
+
+    # Ninguna alcanza el mínimo.
+    if (
+        bullish_score < MIN_SCORE_TO_TRADE
+        and bearish_score < MIN_SCORE_TO_TRADE
+    ):
+
+        return None
+
+    # CALL dominante.
+    if (
+        bullish_score >= MIN_SCORE_TO_TRADE
+        and bullish_score
+        > bearish_score
+    ):
+
+        advantage = (
+            bullish_score
+            - bearish_score
+        )
+
+        if (
+            advantage
+            < MIN_DIRECTION_ADVANTAGE
+        ):
+
+            return None
+
+        return bullish
+
+    # PUT dominante.
+    if (
+        bearish_score >= MIN_SCORE_TO_TRADE
         and bearish_score
         > bullish_score
     ):
 
-        result.update(
-            {
-                "detected": True,
-                "signal": "put",
-                "score": min(
-                    bearish_score,
-                    100,
-                ),
-                "reason": (
-                    "Recuperación bajista "
-                    "detectada"
-                ),
-            }
+        advantage = (
+            bearish_score
+            - bullish_score
         )
 
-    return result
+        if (
+            advantage
+            < MIN_DIRECTION_ADVANTAGE
+        ):
+
+            return None
+
+        return bearish
+
+    return None
 
 
 # ============================================================
@@ -1542,10 +1668,6 @@ def analyze_market(
     pair: Optional[str] = None,
 ) -> Dict[str, Any]:
 
-    # --------------------------------------------------------
-    # RESULTADO BASE
-    # --------------------------------------------------------
-
     result = {
         "valid": False,
         "signal": None,
@@ -1554,11 +1676,18 @@ def analyze_market(
         "pair": pair,
         "pattern": None,
         "reason": "",
+        "structure": "NEUTRAL",
+        "support": 0.0,
+        "resistance": 0.0,
+        "bullish_score": 0,
+        "bearish_score": 0,
+        "confidence": 0,
+        "analysis": {},
     }
 
-    # --------------------------------------------------------
+    # ========================================================
     # VALIDAR PAR
-    # --------------------------------------------------------
+    # ========================================================
 
     if not pair:
 
@@ -1568,9 +1697,9 @@ def analyze_market(
 
         return result
 
-    # --------------------------------------------------------
-    # PREPARAR HISTORIAL
-    # --------------------------------------------------------
+    # ========================================================
+    # HISTORIAL
+    # ========================================================
 
     hist = safe_dataframe(
         previous_m1
@@ -1584,10 +1713,9 @@ def analyze_market(
 
         return result
 
-    # --------------------------------------------------------
-    # ASEGURAR QUE LA ÚLTIMA VELA
-    # SEA LA VELA QUE ESTAMOS ANALIZANDO
-    # --------------------------------------------------------
+    # ========================================================
+    # AGREGAR VELA ACTUAL
+    # ========================================================
 
     if candle_1m is not None:
 
@@ -1603,18 +1731,23 @@ def analyze_market(
 
             if not current.empty:
 
-                current_last = current.iloc[-1]
+                current_last = (
+                    current.iloc[-1]
+                )
 
-                hist_last = hist.iloc[-1]
+                hist_last = (
+                    hist.iloc[-1]
+                )
 
-                if (
-                    float(
-                        current_last["close"]
-                    )
-                    != float(
-                        hist_last["close"]
-                    )
-                ):
+                current_close = float(
+                    current_last["close"]
+                )
+
+                hist_close = float(
+                    hist_last["close"]
+                )
+
+                if current_close != hist_close:
 
                     hist = pd.concat(
                         [
@@ -1627,84 +1760,160 @@ def analyze_market(
         except Exception:
             pass
 
-    # --------------------------------------------------------
+    # ========================================================
     # ESTRUCTURA
-    # --------------------------------------------------------
+    # ========================================================
 
-    direction = market_structure(
+    structure = market_structure(
         hist
     )
 
-    result[
-        "direction"
-    ] = direction
+    result["structure"] = structure
 
-    # --------------------------------------------------------
-    # ÚNICA LÓGICA DE ENTRADA
+    # ========================================================
     # RECUPERACIÓN
-    # --------------------------------------------------------
+    # ========================================================
 
     recovery = detect_recovery(
         hist
     )
 
-    if not recovery.get(
-        "detected",
-        False,
-    ):
-
-        result["reason"] = (
-            "No se detectó recuperación"
-        )
-
-        return result
-
-    # --------------------------------------------------------
-    # SCORE DE RECUPERACIÓN
-    # --------------------------------------------------------
-
-    score = int(
+    recovery_bullish = int(
         recovery.get(
-            "score",
+            "bullish_score",
             0,
         )
     )
 
-    signal = recovery.get(
-        "signal"
+    recovery_bearish = int(
+        recovery.get(
+            "bearish_score",
+            0,
+        )
     )
 
-    # --------------------------------------------------------
-    # VALIDACIÓN DEL SCORE
-    # --------------------------------------------------------
+    # ========================================================
+    # EVALUAR CALL
+    # ========================================================
 
-    if score < MIN_SCORE_TO_TRADE:
+    bullish = evaluate_direction(
+        hist,
+        "BULLISH",
+        recovery_bullish,
+    )
 
-        result["score"] = score
+    # ========================================================
+    # EVALUAR PUT
+    # ========================================================
+
+    bearish = evaluate_direction(
+        hist,
+        "BEARISH",
+        recovery_bearish,
+    )
+
+    result["bullish_score"] = bullish[
+        "score"
+    ]
+
+    result["bearish_score"] = bearish[
+        "score"
+    ]
+
+    # ========================================================
+    # NIVELES
+    # ========================================================
+
+    levels = recent_levels(
+        hist,
+        LEVEL_LOOKBACK,
+    )
+
+    result["support"] = levels[
+        "support"
+    ]
+
+    result["resistance"] = levels[
+        "resistance"
+    ]
+
+    # ========================================================
+    # SELECCIONAR MEJOR DIRECCIÓN
+    # ========================================================
+
+    best = select_best_direction(
+        bullish,
+        bearish,
+    )
+
+    if best is None:
+
+        difference = abs(
+            bullish["score"]
+            - bearish["score"]
+        )
+
+        result["score"] = max(
+            bullish["score"],
+            bearish["score"],
+        )
 
         result["reason"] = (
-            f"Recuperación insuficiente: "
-            f"{score}/{MIN_SCORE_TO_TRADE}"
+            "Sin confluencia suficiente "
+            f"(CALL {bullish['score']} / "
+            f"PUT {bearish['score']} / "
+            f"diferencia {difference})"
         )
+
+        result["analysis"] = {
+            "bullish": bullish,
+            "bearish": bearish,
+            "recovery": recovery,
+        }
 
         return result
 
-    # --------------------------------------------------------
+    # ========================================================
     # RESULTADO FINAL
-    # --------------------------------------------------------
+    # ========================================================
 
     result["valid"] = True
 
-    result["signal"] = signal
+    result["signal"] = best[
+        "signal"
+    ]
 
-    result["score"] = score
+    result["score"] = best[
+        "score"
+    ]
 
-    result["pattern"] = "RECOVERY"
+    result["confidence"] = best[
+        "score"
+    ]
 
-    result["reason"] = recovery.get(
-        "reason",
-        "Recuperación detectada",
+    result["direction"] = best[
+        "direction"
+    ]
+
+    result["pattern"] = (
+        "CONFLUENCIA_RECOVERY"
     )
+
+    result["reason"] = (
+        f"{best['signal'].upper()} "
+        f"confirmada con "
+        f"{best['score']}/100: "
+        + " + ".join(
+            best["reasons"][:6]
+        )
+    )
+
+    result["analysis"] = {
+        "bullish": bullish,
+        "bearish": bearish,
+        "recovery": recovery,
+        "levels": levels,
+    }
 
     return result
 
@@ -1750,5 +1959,5 @@ def signal(
 if __name__ == "__main__":
 
     print(
-        "Estrategia cargada correctamente"
+        "Estrategia M1 de CONFLUENCIA cargada correctamente"
     )
