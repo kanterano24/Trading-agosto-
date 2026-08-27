@@ -10,7 +10,11 @@ import pandas as pd
 import requests
 
 from iqoptionapi.stable_api import IQ_Option
-from strategy import analyze_market
+
+from strategy import (
+    analyze_live_candle,
+    analyze_market,
+)
 
 
 # ============================================================
@@ -40,7 +44,7 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 
 # ============================================================
-# CONFIG MERCADO
+# MERCADO
 # ============================================================
 
 PAIRS = [
@@ -53,41 +57,37 @@ PAIRS = [
 
 TIMEFRAME = 60
 
-# Cantidad de velas para análisis
 CANDLE_COUNT = 60
 
-# Expiración en minutos según IQ Option API
 EXPIRATION = 4
 
-# Analizar cerca del cierre / inicio de nueva vela
+# Frecuencia del análisis en vivo.
 POLL_INTERVAL = 0.50
 
 
 # ============================================================
-# CONFIG OPERATIVA
+# OPERATIVA
 # ============================================================
 
-# Una sola operación abierta simultáneamente.
 MAX_OPEN_TRADES = 1
 
-# Evita volver a operar la misma vela.
 LAST_TRADED_CANDLE: Dict[str, int] = {}
 
-# Tiempo máximo para esperar resultados después del vencimiento.
 RESULT_CHECK_DELAY = 5
 
 
 # ============================================================
-# GESTIÓN DE CAPITAL
+# CAPITAL
 # ============================================================
 
 BASE_AMOUNT = 100.0
+
 CURRENT_AMOUNT = BASE_AMOUNT
 
-# Máximo absoluto permitido.
 MAX_AMOUNT = 200.0
 
 WIN_STREAK = 0
+
 LOSS_STREAK = 0
 
 MODE = "compound"
@@ -107,9 +107,22 @@ OPEN_TRADES: Dict[int, Dict[str, Any]] = {}
 
 ACTIVE_API_PAIR: Dict[str, str] = {}
 
+STREAMS_STARTED = False
+
 
 # ============================================================
-# ANTI-SPAM TELEGRAM
+# ESTADO DE VELAS EN VIVO
+# ============================================================
+
+LIVE_M1_STATE: Dict[str, Dict[str, Any]] = {}
+
+LAST_CLOSED_M1: Dict[str, int] = {}
+
+LAST_LIVE_LOG_SECOND: Dict[str, int] = {}
+
+
+# ============================================================
+# TELEGRAM ANTI-SPAM
 # ============================================================
 
 LAST_MSG: Dict[str, float] = {}
@@ -117,13 +130,18 @@ LAST_MSG: Dict[str, float] = {}
 COOLDOWN = 10
 
 
-def can_send(key: str) -> bool:
+def can_send(
+    key: str,
+) -> bool:
 
     now = time.time()
 
     if key in LAST_MSG:
 
-        elapsed = now - LAST_MSG[key]
+        elapsed = (
+            now
+            - LAST_MSG[key]
+        )
 
         if elapsed < COOLDOWN:
             return False
@@ -143,7 +161,10 @@ def telegram_send(
     force: bool = False,
 ) -> bool:
 
-    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+    if (
+        not TELEGRAM_TOKEN
+        or not TELEGRAM_CHAT_ID
+    ):
         return False
 
     if not force and not can_send(key):
@@ -152,7 +173,10 @@ def telegram_send(
     try:
 
         response = requests.post(
-            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+            (
+                "https://api.telegram.org/"
+                f"bot{TELEGRAM_TOKEN}/sendMessage"
+            ),
             data={
                 "chat_id": TELEGRAM_CHAT_ID,
                 "text": msg,
@@ -173,10 +197,12 @@ def telegram_send(
 
 
 # ============================================================
-# GESTIÓN DE MONTO
+# CAPITAL
 # ============================================================
 
-def update_amount(profit: float) -> None:
+def update_amount(
+    profit: float,
+) -> None:
 
     global CURRENT_AMOUNT
     global WIN_STREAK
@@ -195,7 +221,8 @@ def update_amount(profit: float) -> None:
             )
 
             CURRENT_AMOUNT = min(
-                BASE_AMOUNT * multiplier,
+                BASE_AMOUNT
+                * multiplier,
                 MAX_AMOUNT,
             )
 
@@ -216,7 +243,7 @@ def update_amount(profit: float) -> None:
 
 
 # ============================================================
-# TELEGRAM COMMANDS
+# TELEGRAM WORKER
 # ============================================================
 
 def telegram_worker() -> None:
@@ -229,7 +256,9 @@ def telegram_worker() -> None:
         try:
 
             if not TELEGRAM_TOKEN:
+
                 time.sleep(2)
+
                 continue
 
             params = {}
@@ -237,26 +266,36 @@ def telegram_worker() -> None:
             if LAST_UPDATE_ID is not None:
 
                 params["offset"] = (
-                    LAST_UPDATE_ID + 1
+                    LAST_UPDATE_ID
+                    + 1
                 )
 
             response = requests.get(
-                f"https://api.telegram.org/bot"
-                f"{TELEGRAM_TOKEN}/getUpdates",
+                (
+                    "https://api.telegram.org/"
+                    f"bot{TELEGRAM_TOKEN}/getUpdates"
+                ),
                 params=params,
                 timeout=10,
             )
 
             data = response.json()
 
-            for update in data.get("result", []):
+            for update in data.get(
+                "result",
+                [],
+            ):
 
                 LAST_UPDATE_ID = (
-                    update["update_id"]
+                    update[
+                        "update_id"
+                    ]
                 )
 
                 message = (
-                    update.get("message")
+                    update.get(
+                        "message"
+                    )
                     or {}
                 )
 
@@ -295,15 +334,21 @@ def telegram_worker() -> None:
                 # START
                 # ------------------------------------------------
 
-                if command.startswith("/start"):
+                if command.startswith(
+                    "/start"
+                ):
 
                     BOT_RUNNING = True
 
                     telegram_send(
                         "🟢 BOT ACTIVADO\n\n"
-                        f"📊 Pares: {', '.join(PAIRS)}\n"
-                        f"💵 Monto: ${CURRENT_AMOUNT:.2f}\n"
-                        f"⏱ Expiración: {EXPIRATION}m",
+                        f"📊 Pares: "
+                        f"{', '.join(PAIRS)}\n"
+                        f"💵 Monto: "
+                        f"${CURRENT_AMOUNT:.2f}\n"
+                        f"⏱ Expiración: "
+                        f"{EXPIRATION}m\n"
+                        "📡 Análisis M1 en vivo",
                         "start",
                         force=True,
                     )
@@ -312,7 +357,9 @@ def telegram_worker() -> None:
                 # STOP
                 # ------------------------------------------------
 
-                elif command.startswith("/stop"):
+                elif command.startswith(
+                    "/stop"
+                ):
 
                     BOT_RUNNING = False
 
@@ -326,7 +373,9 @@ def telegram_worker() -> None:
                 # STATUS
                 # ------------------------------------------------
 
-                elif command.startswith("/status"):
+                elif command.startswith(
+                    "/status"
+                ):
 
                     telegram_send(
                         "🤖 ESTADO DEL BOT\n\n"
@@ -341,7 +390,9 @@ def telegram_worker() -> None:
                         f"📂 Operaciones abiertas: "
                         f"{len(OPEN_TRADES)}\n"
                         f"⏱ Expiración: "
-                        f"{EXPIRATION}m",
+                        f"{EXPIRATION}m\n"
+                        f"📡 Streams activos: "
+                        f"{len(LIVE_M1_STATE)}",
                         "status",
                         force=True,
                     )
@@ -357,14 +408,17 @@ def telegram_worker() -> None:
 
 
 # ============================================================
-# CONEXIÓN IQ OPTION
+# CONEXIÓN
 # ============================================================
 
 def connect() -> bool:
 
     global IQ
 
-    if not IQ_EMAIL or not IQ_PASSWORD:
+    if (
+        not IQ_EMAIL
+        or not IQ_PASSWORD
+    ):
 
         logging.error(
             "Faltan IQ_EMAIL o IQ_PASSWORD"
@@ -392,14 +446,11 @@ def connect() -> bool:
                 reason,
             )
 
-            # NO ENVIAR MENSAJE AUTOMÁTICO A TELEGRAM
             return False
 
         logging.info(
             "Conectado a IQ Option"
         )
-
-        # NO ENVIAR MENSAJE AUTOMÁTICO A TELEGRAM
 
         return True
 
@@ -420,6 +471,7 @@ def connect() -> bool:
 def ensure_connection() -> bool:
 
     global IQ
+    global STREAMS_STARTED
 
     try:
 
@@ -432,6 +484,8 @@ def ensure_connection() -> bool:
     except Exception:
         pass
 
+    STREAMS_STARTED = False
+
     logging.warning(
         "Reconectando a IQ Option..."
     )
@@ -440,7 +494,7 @@ def ensure_connection() -> bool:
 
 
 # ============================================================
-# RESOLVER PAR
+# CANDIDATOS DE PAR
 # ============================================================
 
 def get_pair_candidates(
@@ -449,38 +503,59 @@ def get_pair_candidates(
 
     candidates = []
 
-    # Primero OTC.
-    candidates.append(
-        f"{logical_pair}-OTC"
+    normalized = (
+        logical_pair
+        .upper()
+        .strip()
     )
 
-    # Después mercado normal.
-    candidates.append(
-        logical_pair
-    )
+    if normalized.endswith(
+        "-OTC"
+    ):
+
+        candidates.append(
+            normalized
+        )
+
+        candidates.append(
+            normalized[:-4]
+        )
+
+    else:
+
+        candidates.append(
+            f"{normalized}-OTC"
+        )
+
+        candidates.append(
+            normalized
+        )
 
     return candidates
 
 
 # ============================================================
-# OBTENER VELAS
+# OBTENER VELAS HISTÓRICAS
 # ============================================================
 
 def get_pair_candles(
     logical_pair: str,
-) -> Tuple[Optional[str], Optional[pd.DataFrame]]:
+) -> Tuple[
+    Optional[str],
+    Optional[pd.DataFrame],
+]:
 
     if IQ is None:
         return None, None
 
     candidates = []
 
-    # Si ya conocemos el activo que funciona,
-    # lo intentamos primero.
     if logical_pair in ACTIVE_API_PAIR:
 
         candidates.append(
-            ACTIVE_API_PAIR[logical_pair]
+            ACTIVE_API_PAIR[
+                logical_pair
+            ]
         )
 
     for pair in get_pair_candidates(
@@ -503,7 +578,6 @@ def get_pair_candles(
             )
 
             if not candles:
-
                 continue
 
             df = pd.DataFrame(
@@ -511,7 +585,6 @@ def get_pair_candles(
             )
 
             if df.empty:
-
                 continue
 
             required = {
@@ -530,7 +603,10 @@ def get_pair_candles(
                 logical_pair
             ] = api_pair
 
-            return api_pair, df
+            return (
+                api_pair,
+                df,
+            )
 
         except Exception as e:
 
@@ -544,31 +620,34 @@ def get_pair_candles(
 
 
 # ============================================================
-# OBTENER SOLO VELAS CERRADAS
+# OBTENER SOLO CERRADAS
 # ============================================================
 
 def get_closed_candles(
     df: pd.DataFrame,
 ) -> pd.DataFrame:
 
-    if df is None or df.empty:
+    if (
+        df is None
+        or df.empty
+    ):
 
         return pd.DataFrame()
 
     data = df.copy()
 
-    # Algunas versiones usan "from"
-    # como timestamp de apertura.
     if "from" in data.columns:
 
         now = time.time()
 
+        timestamp = pd.to_numeric(
+            data["from"],
+            errors="coerce",
+        )
+
         closed = data[
             (
-                pd.to_numeric(
-                    data["from"],
-                    errors="coerce",
-                )
+                timestamp
                 + TIMEFRAME
             )
             <= now
@@ -578,7 +657,6 @@ def get_closed_candles(
 
             data = closed
 
-    # Eliminamos velas inválidas.
     data = data.dropna(
         subset=[
             "open",
@@ -596,112 +674,611 @@ def get_closed_candles(
 
 
 # ============================================================
-# ANALIZAR UN PAR
+# CONVERTIR STREAM A VELA
 # ============================================================
 
-def analyze_pair(
-    logical_pair: str,
+def normalize_stream_candle(
+    raw: Any,
 ) -> Optional[Dict[str, Any]]:
+
+    if not isinstance(
+        raw,
+        dict,
+    ):
+        return None
+
+    def number(
+        *keys,
+    ):
+
+        for key in keys:
+
+            value = raw.get(
+                key
+            )
+
+            if value is None:
+                continue
+
+            try:
+
+                return float(value)
+
+            except Exception:
+                continue
+
+        return None
+
+    open_price = number(
+        "open",
+    )
+
+    close = number(
+        "close",
+    )
+
+    high = number(
+        "high",
+        "max",
+    )
+
+    low = number(
+        "low",
+        "min",
+    )
+
+    if (
+        open_price is None
+        or close is None
+        or high is None
+        or low is None
+    ):
+
+        return None
+
+    result = {
+        "open": open_price,
+        "close": close,
+        "high": high,
+        "low": low,
+    }
+
+    for key in (
+        "from",
+        "to",
+        "at",
+        "id",
+    ):
+
+        if key in raw:
+
+            result[key] = raw[key]
+
+    return result
+
+
+# ============================================================
+# INICIAR STREAMS
+# ============================================================
+
+def start_streams() -> bool:
+
+    global STREAMS_STARTED
+
+    if IQ is None:
+        return False
+
+    success = 0
+
+    for logical_pair in PAIRS:
+
+        api_pair = ACTIVE_API_PAIR.get(
+            logical_pair
+        )
+
+        if not api_pair:
+
+            api_pair, _ = (
+                get_pair_candles(
+                    logical_pair
+                )
+            )
+
+        if not api_pair:
+            continue
+
+        try:
+
+            IQ.start_candles_stream(
+                api_pair,
+                TIMEFRAME,
+                CANDLE_COUNT,
+            )
+
+            success += 1
+
+            logging.info(
+                "Stream M1 iniciado: %s",
+                api_pair,
+            )
+
+        except Exception as e:
+
+            logging.error(
+                "Error iniciando stream %s: %s",
+                api_pair,
+                e,
+            )
+
+    STREAMS_STARTED = (
+        success > 0
+    )
+
+    return STREAMS_STARTED
+
+
+# ============================================================
+# OBTENER VELA M1 EN VIVO
+# ============================================================
+
+def get_live_candle(
+    logical_pair: str,
+) -> Tuple[
+    Optional[str],
+    Optional[Dict[str, Any]],
+]:
+
+    if IQ is None:
+        return None, None
+
+    api_pair = ACTIVE_API_PAIR.get(
+        logical_pair
+    )
+
+    if not api_pair:
+
+        api_pair, _ = (
+            get_pair_candles(
+                logical_pair
+            )
+        )
+
+    if not api_pair:
+        return None, None
+
+    try:
+
+        candles = (
+            IQ.get_realtime_candles(
+                api_pair,
+                TIMEFRAME,
+            )
+        )
+
+        if not candles:
+            return api_pair, None
+
+        # Las versiones habituales
+        # devuelven un diccionario:
+        #
+        # timestamp -> candle
+        #
+        # Seleccionamos la vela más reciente.
+
+        if isinstance(
+            candles,
+            dict,
+        ):
+
+            latest_key = max(
+                candles.keys(),
+                key=lambda x: float(x),
+            )
+
+            raw = candles[
+                latest_key
+            ]
+
+        else:
+
+            return api_pair, None
+
+        normalized = (
+            normalize_stream_candle(
+                raw
+            )
+        )
+
+        return (
+            api_pair,
+            normalized,
+        )
+
+    except Exception as e:
+
+        logging.debug(
+            "Error stream %s: %s",
+            api_pair,
+            e,
+        )
+
+        return api_pair, None
+
+
+# ============================================================
+# TIMESTAMP DE VELA
+# ============================================================
+
+def candle_timestamp(
+    candle: Dict[str, Any],
+) -> int:
+
+    for key in (
+        "from",
+        "at",
+    ):
+
+        value = candle.get(
+            key
+        )
+
+        if value is not None:
+
+            try:
+
+                return int(
+                    float(value)
+                )
+
+            except Exception:
+                pass
+
+    return int(
+        time.time()
+        // TIMEFRAME
+    ) * TIMEFRAME
+
+
+# ============================================================
+# HISTORIAL PARA ANÁLISIS
+# ============================================================
+
+def get_history_for_analysis(
+    logical_pair: str,
+) -> Optional[pd.DataFrame]:
 
     api_pair, df = get_pair_candles(
         logical_pair
     )
 
-    if api_pair is None:
-
+    if (
+        api_pair is None
+        or df is None
+        or df.empty
+    ):
         return None
 
-    if df is None or df.empty:
-
-        return None
-
-    hist = get_closed_candles(
+    closed = get_closed_candles(
         df
     )
 
-    if len(hist) < 10:
-
+    if len(closed) < 22:
         return None
 
-    last_candle = hist.iloc[-1]
+    return closed.tail(
+        CANDLE_COUNT
+    ).reset_index(
+        drop=True
+    )
 
-    candle_timestamp = 0
 
-    if "from" in hist.columns:
+# ============================================================
+# ANALIZAR M1 EN VIVO
+# ============================================================
+
+def analyze_live_pair(
+    logical_pair: str,
+) -> Optional[Dict[str, Any]]:
+
+    api_pair, live_candle = (
+        get_live_candle(
+            logical_pair
+        )
+    )
+
+    if (
+        api_pair is None
+        or live_candle is None
+    ):
+        return None
+
+    history = (
+        get_history_for_analysis(
+            logical_pair
+        )
+    )
+
+    if history is None:
+        return None
+
+    ts = candle_timestamp(
+        live_candle
+    )
+
+    elapsed = (
+        time.time()
+        - ts
+    )
+
+    elapsed = max(
+        0.0,
+        min(
+            elapsed,
+            60.0,
+        ),
+    )
+
+    analysis = analyze_live_candle(
+        candle_1m=live_candle,
+        previous_m1=history,
+        pair=logical_pair,
+        elapsed_seconds=elapsed,
+    )
+
+    analysis[
+        "logical_pair"
+    ] = logical_pair
+
+    analysis[
+        "api_pair"
+    ] = api_pair
+
+    analysis[
+        "candle_timestamp"
+    ] = ts
+
+    return analysis
+
+
+# ============================================================
+# ANALIZAR TODOS LOS PARES EN VIVO
+# ============================================================
+
+def analyze_all_pairs_live() -> Dict[
+    str,
+    Dict[str, Any],
+]:
+
+    results = {}
+
+    for logical_pair in PAIRS:
 
         try:
 
-            candle_timestamp = int(
-                float(
-                    last_candle["from"]
+            analysis = (
+                analyze_live_pair(
+                    logical_pair
                 )
             )
 
-        except Exception:
-            candle_timestamp = int(
-                time.time() // 60
+            if analysis is not None:
+
+                results[
+                    logical_pair
+                ] = analysis
+
+                LIVE_M1_STATE[
+                    logical_pair
+                ] = analysis
+
+        except Exception as e:
+
+            logging.debug(
+                "Error análisis vivo %s: %s",
+                logical_pair,
+                e,
             )
 
-    else:
+    return results
 
-        candle_timestamp = int(
-            time.time() // 60
+
+# ============================================================
+# REGISTRAR CAMBIO DE VELA
+# ============================================================
+
+def detect_new_minute(
+    analysis: Dict[str, Any],
+) -> bool:
+
+    logical_pair = analysis[
+        "logical_pair"
+    ]
+
+    ts = int(
+        analysis[
+            "candle_timestamp"
+        ]
+    )
+
+    previous_ts = (
+        LAST_CLOSED_M1.get(
+            logical_pair
+        )
+    )
+
+    if previous_ts is None:
+
+        LAST_CLOSED_M1[
+            logical_pair
+        ] = ts
+
+        return False
+
+    if ts > previous_ts:
+
+        LAST_CLOSED_M1[
+            logical_pair
+        ] = ts
+
+        return True
+
+    return False
+
+
+# ============================================================
+# OBTENER LA VELA QUE ACABA DE CERRAR
+# ============================================================
+
+def get_closed_candle_after_boundary(
+    logical_pair: str,
+    closed_timestamp: int,
+) -> Optional[
+    Tuple[
+        str,
+        pd.Series,
+        pd.DataFrame,
+    ]
+]:
+
+    api_pair, df = get_pair_candles(
+        logical_pair
+    )
+
+    if (
+        api_pair is None
+        or df is None
+        or df.empty
+    ):
+        return None
+
+    closed = get_closed_candles(
+        df
+    )
+
+    if closed.empty:
+        return None
+
+    selected = None
+
+    if "from" in closed.columns:
+
+        timestamps = pd.to_numeric(
+            closed["from"],
+            errors="coerce",
         )
 
-    # Evitar operar dos veces la misma vela.
-    if LAST_TRADED_CANDLE.get(
-        logical_pair
-    ) == candle_timestamp:
+        matches = closed[
+            timestamps
+            == float(
+                closed_timestamp
+            )
+        ]
 
+        if not matches.empty:
+
+            selected = matches.iloc[
+                -1
+            ]
+
+    if selected is None:
+
+        selected = closed.iloc[
+            -1
+        ]
+
+    return (
+        api_pair,
+        selected,
+        closed,
+    )
+
+
+# ============================================================
+# ANALIZAR VELA CERRADA
+# ============================================================
+
+def analyze_closed_pair(
+    logical_pair: str,
+    closed_timestamp: int,
+) -> Optional[
+    Dict[str, Any]
+]:
+
+    data = (
+        get_closed_candle_after_boundary(
+            logical_pair,
+            closed_timestamp,
+        )
+    )
+
+    if data is None:
+        return None
+
+    api_pair, candle, history = data
+
+    if len(history) < 22:
         return None
 
     try:
 
         result = analyze_market(
-            candle_1m=last_candle,
-            previous_m1=hist,
+            candle_1m=candle,
+            previous_m1=history,
             pair=logical_pair,
         )
 
     except Exception as e:
 
         logging.error(
-            "Error estrategia %s: %s",
+            "Error estrategia cerrada %s: %s",
             logical_pair,
             e,
         )
 
         return None
 
-    result["logical_pair"] = logical_pair
-    result["api_pair"] = api_pair
-    result["candle_timestamp"] = (
-        candle_timestamp
-    )
+    result[
+        "logical_pair"
+    ] = logical_pair
+
+    result[
+        "api_pair"
+    ] = api_pair
+
+    result[
+        "candle_timestamp"
+    ] = closed_timestamp
 
     return result
 
 
 # ============================================================
-# BUSCAR MEJOR OPORTUNIDAD
+# BUSCAR MEJOR OPERACIÓN DESPUÉS DEL CIERRE
 # ============================================================
 
-def find_best_trade() -> Optional[Dict[str, Any]]:
+def find_best_trade(
+    closed_timestamp: int,
+) -> Optional[
+    Dict[str, Any]
+]:
 
     candidates = []
 
     for logical_pair in PAIRS:
 
-        result = analyze_pair(
-            logical_pair
+        result = (
+            analyze_closed_pair(
+                logical_pair,
+                closed_timestamp,
+            )
         )
 
         if not result:
-
             continue
 
-        if not result.get("valid"):
-
+        if not result.get(
+            "valid"
+        ):
             continue
 
         signal = result.get(
@@ -737,13 +1314,14 @@ def find_best_trade() -> Optional[Dict[str, Any]]:
         )
 
     if not candidates:
-
         return None
 
-    # Mejor score primero.
     candidates.sort(
-        key=lambda x: (
-            int(x.get("score", 0)),
+        key=lambda x: int(
+            x.get(
+                "score",
+                0,
+            )
         ),
         reverse=True,
     )
@@ -752,7 +1330,7 @@ def find_best_trade() -> Optional[Dict[str, Any]]:
 
 
 # ============================================================
-# COMPRAR
+# EJECUTAR
 # ============================================================
 
 def execute_trade(
@@ -760,10 +1338,12 @@ def execute_trade(
 ) -> bool:
 
     if IQ is None:
-
         return False
 
-    if len(OPEN_TRADES) >= MAX_OPEN_TRADES:
+    if (
+        len(OPEN_TRADES)
+        >= MAX_OPEN_TRADES
+    ):
 
         logging.info(
             "Máximo de operaciones abiertas"
@@ -797,6 +1377,17 @@ def execute_trade(
         "candle_timestamp"
     ]
 
+    if LAST_TRADED_CANDLE.get(
+        logical_pair
+    ) == candle_timestamp:
+
+        logging.info(
+            "La vela ya fue operada: %s",
+            logical_pair,
+        )
+
+        return False
+
     amount = min(
         float(CURRENT_AMOUNT),
         float(MAX_AMOUNT),
@@ -805,18 +1396,23 @@ def execute_trade(
     try:
 
         # ----------------------------------------------------
-        # CONFIRMACIÓN VALIDADA
+        # CONFIRMACIÓN
         # ----------------------------------------------------
 
         telegram_send(
             "✅ CONFIRMACIÓN COMPLETA\n\n"
             f"📊 Par: {api_pair}\n"
-            f"🎯 Dirección: {signal.upper()}\n"
+            f"🎯 Dirección: "
+            f"{signal.upper()}\n"
             f"🧠 Patrón: {pattern}\n"
             f"⭐ Score: {score}/100\n"
             "🔎 Condiciones confirmadas\n"
             "🚀 Preparando ejecución...",
-            f"confirmation_{candle_timestamp}",
+            (
+                f"confirmation_"
+                f"{logical_pair}_"
+                f"{candle_timestamp}"
+            ),
             force=True,
         )
 
@@ -843,15 +1439,16 @@ def execute_trade(
 
             return False
 
-        # Marcamos la vela como operada.
         LAST_TRADED_CANDLE[
             logical_pair
         ] = candle_timestamp
 
-        # Expiración aproximada.
         expiry_timestamp = (
             int(time.time())
-            + (EXPIRATION * 60)
+            + (
+                EXPIRATION
+                * 60
+            )
         )
 
         OPEN_TRADES[
@@ -864,21 +1461,26 @@ def execute_trade(
             "score": score,
             "amount": amount,
             "expiry": expiry_timestamp,
-            "created": int(time.time()),
+            "created": int(
+                time.time()
+            ),
         }
 
         # ----------------------------------------------------
-        # EJECUCIÓN CONFIRMADA
+        # EJECUCIÓN
         # ----------------------------------------------------
 
         telegram_send(
             "🚀 OPERACIÓN EJECUTADA\n\n"
             f"📊 Par: {api_pair}\n"
-            f"🎯 Señal: {signal.upper()}\n"
+            f"🎯 Señal: "
+            f"{signal.upper()}\n"
             f"🧠 Patrón: {pattern}\n"
             f"⭐ Score: {score}/100\n"
-            f"💵 Monto: ${amount:.2f}\n"
-            f"⏱ Expiración: {EXPIRATION}m",
+            f"💵 Monto: "
+            f"${amount:.2f}\n"
+            f"⏱ Expiración: "
+            f"{EXPIRATION}m",
             f"trade_{order_id}",
             force=True,
         )
@@ -896,13 +1498,12 @@ def execute_trade(
 
 
 # ============================================================
-# REVISAR RESULTADOS
+# RESULTADOS
 # ============================================================
 
 def check_results() -> None:
 
     if IQ is None:
-
         return
 
     now = int(
@@ -913,7 +1514,6 @@ def check_results() -> None:
         OPEN_TRADES.items()
     ):
 
-        # Esperar hasta la expiración.
         if now < (
             trade["expiry"]
             + RESULT_CHECK_DELAY
@@ -927,7 +1527,6 @@ def check_results() -> None:
             )
 
             if result is None:
-
                 continue
 
             profit = float(
@@ -939,20 +1538,13 @@ def check_results() -> None:
             )
 
             if profit > 0:
-
                 outcome = "WIN 🟢"
 
             elif profit < 0:
-
                 outcome = "LOSS 🔴"
 
             else:
-
                 outcome = "DRAW 🟡"
-
-            # ------------------------------------------------
-            # RESULTADO
-            # ------------------------------------------------
 
             telegram_send(
                 "📊 RESULTADO\n\n"
@@ -960,9 +1552,12 @@ def check_results() -> None:
                 f"🎯 {trade['signal'].upper()}\n"
                 f"🧠 {trade['pattern']}\n"
                 f"🏁 {outcome}\n"
-                f"💰 Resultado: ${profit:.2f}\n\n"
-                f"📈 WIN STREAK: {WIN_STREAK}\n"
-                f"📉 LOSS STREAK: {LOSS_STREAK}\n"
+                f"💰 Resultado: "
+                f"${profit:.2f}\n\n"
+                f"📈 WIN STREAK: "
+                f"{WIN_STREAK}\n"
+                f"📉 LOSS STREAK: "
+                f"{LOSS_STREAK}\n"
                 f"💵 Próximo monto: "
                 f"${CURRENT_AMOUNT:.2f}",
                 f"result_{order_id}",
@@ -989,23 +1584,13 @@ def check_results() -> None:
 
 
 # ============================================================
-# ESPERAR NUEVA VELA
-# ============================================================
-
-def current_minute_timestamp() -> int:
-
-    return int(
-        time.time() // TIMEFRAME
-    )
-
-
-# ============================================================
 # MAIN
 # ============================================================
 
 def main() -> None:
 
     global BOT_RUNNING
+    global STREAMS_STARTED
 
     if not connect():
 
@@ -1019,25 +1604,22 @@ def main() -> None:
     # TELEGRAM
     # --------------------------------------------------------
 
-    if TELEGRAM_TOKEN and TELEGRAM_CHAT_ID:
+    if (
+        TELEGRAM_TOKEN
+        and TELEGRAM_CHAT_ID
+    ):
 
         threading.Thread(
             target=telegram_worker,
             daemon=True,
         ).start()
 
-    # --------------------------------------------------------
-    # SIN MENSAJE AUTOMÁTICO "BOT LISTO"
-    # --------------------------------------------------------
-
-    last_processed_minute = None
-
     logging.info(
         "Bot iniciado"
     )
 
     # --------------------------------------------------------
-    # LOOP PRINCIPAL
+    # ESPERAR ACTIVACIÓN
     # --------------------------------------------------------
 
     while True:
@@ -1050,8 +1632,6 @@ def main() -> None:
 
                 continue
 
-            # Revisar resultados incluso
-            # cuando el bot está detenido.
             check_results()
 
             if not BOT_RUNNING:
@@ -1060,77 +1640,228 @@ def main() -> None:
 
                 continue
 
-            # Solo buscamos una oportunidad
-            # una vez por nueva vela.
-            minute_id = (
-                current_minute_timestamp()
+            # ------------------------------------------------
+            # INICIAR STREAMS
+            # ------------------------------------------------
+
+            if not STREAMS_STARTED:
+
+                start_streams()
+
+                time.sleep(2)
+
+                continue
+
+            # ------------------------------------------------
+            # ANALIZAR TODAS LAS M1 EN VIVO
+            # ------------------------------------------------
+
+            live_results = (
+                analyze_all_pairs_live()
             )
 
-            if minute_id == (
-                last_processed_minute
+            # ------------------------------------------------
+            # DETECTAR CAMBIO DE VELA
+            # ------------------------------------------------
+
+            new_candles = []
+
+            for logical_pair, analysis in (
+                live_results.items()
             ):
 
-                time.sleep(
-                    POLL_INTERVAL
-                )
+                if detect_new_minute(
+                    analysis
+                ):
 
-                continue
+                    new_candles.append(
+                        (
+                            logical_pair,
+                            int(
+                                analysis[
+                                    "candle_timestamp"
+                                ]
+                            ),
+                        )
+                    )
 
-            # Esperamos unos segundos para
-            # asegurarnos de que IQ haya
-            # cerrado y publicado la vela.
-            time.sleep(2)
-
-            last_processed_minute = (
-                minute_id
-            )
-
-            logging.info(
-                "Nueva vela detectada. "
-                "Analizando %s pares...",
-                len(PAIRS),
-            )
-
-            # ------------------------------------------------
-            # BUSCAR MEJOR TRADE
-            # ------------------------------------------------
-
-            best_trade = (
-                find_best_trade()
-            )
-
-            if not best_trade:
-
-                # SOLO LOG LOCAL.
+                # ------------------------------------------------
+                # LOG DE ANÁLISIS EN VIVO
+                #
+                # Solo mostramos cada 10 segundos
+                # para no llenar los logs.
                 # NO TELEGRAM.
-                logging.info(
-                    "No hay oportunidad válida"
+                # ------------------------------------------------
+
+                elapsed = float(
+                    analysis.get(
+                        "elapsed_seconds",
+                        0,
+                    )
                 )
 
-                continue
+                second_bucket = int(
+                    elapsed
+                    // 10
+                )
+
+                previous_bucket = (
+                    LAST_LIVE_LOG_SECOND.get(
+                        logical_pair
+                    )
+                )
+
+                if (
+                    previous_bucket
+                    != second_bucket
+                ):
+
+                    LAST_LIVE_LOG_SECOND[
+                        logical_pair
+                    ] = second_bucket
+
+                    logging.info(
+                        (
+                            "LIVE | %s | "
+                            "%.0fs | "
+                            "O=%.5f "
+                            "H=%.5f "
+                            "L=%.5f "
+                            "C=%.5f | "
+                            "DIR=%s | "
+                            "CALL=%s | "
+                            "PUT=%s"
+                        ),
+                        logical_pair,
+                        elapsed,
+                        analysis.get(
+                            "open",
+                            0,
+                        ),
+                        analysis.get(
+                            "high",
+                            0,
+                        ),
+                        analysis.get(
+                            "low",
+                            0,
+                        ),
+                        analysis.get(
+                            "close",
+                            0,
+                        ),
+                        analysis.get(
+                            "direction",
+                            "NEUTRAL",
+                        ),
+                        analysis.get(
+                            "bullish_score",
+                            0,
+                        ),
+                        analysis.get(
+                            "bearish_score",
+                            0,
+                        ),
+                    )
 
             # ------------------------------------------------
-            # EJECUTAR SOLO EL MEJOR
+            # CUANDO CAMBIA LA M1:
+            #
+            # La vela anterior ya terminó.
+            #
+            # AHORA se analiza la vela cerrada.
             # ------------------------------------------------
 
-            logging.info(
-                "MEJOR OPORTUNIDAD | %s | %s | %s | score=%s",
-                best_trade[
-                    "api_pair"
-                ],
-                best_trade[
-                    "signal"
-                ],
-                best_trade.get(
-                    "pattern"
-                ),
-                best_trade[
-                    "score"
-                ],
-            )
+            for (
+                logical_pair,
+                closed_timestamp,
+            ) in new_candles:
 
-            execute_trade(
-                best_trade
+                logging.info(
+                    (
+                        "CIERRE M1 | %s | "
+                        "timestamp=%s | "
+                        "calculando confirmación..."
+                    ),
+                    logical_pair,
+                    closed_timestamp
+                    - TIMEFRAME,
+                )
+
+            # ------------------------------------------------
+            # BUSCAR MEJOR OPORTUNIDAD
+            #
+            # Una sola vez por vela global.
+            # ------------------------------------------------
+
+            if new_candles:
+
+                closed_timestamp = (
+                    new_candles[0][1]
+                    - TIMEFRAME
+                )
+
+                # Esperamos brevemente para que
+                # la API publique definitivamente
+                # la vela cerrada.
+                time.sleep(
+                    0.25
+                )
+
+                best_trade = (
+                    find_best_trade(
+                        closed_timestamp
+                    )
+                )
+
+                if best_trade:
+
+                    logging.info(
+                        (
+                            "MEJOR OPORTUNIDAD | "
+                            "%s | %s | "
+                            "score=%s | "
+                            "pattern=%s"
+                        ),
+                        best_trade[
+                            "api_pair"
+                        ],
+                        best_trade[
+                            "signal"
+                        ],
+                        best_trade[
+                            "score"
+                        ],
+                        best_trade.get(
+                            "pattern"
+                        ),
+                    )
+
+                    # ------------------------------------------------
+                    # EJECUCIÓN
+                    #
+                    # Estamos al inicio de N+1.
+                    # ------------------------------------------------
+
+                    execute_trade(
+                        best_trade
+                    )
+
+                else:
+
+                    logging.info(
+                        "No hay oportunidad válida "
+                        "en el cierre de la M1."
+                    )
+
+            # ------------------------------------------------
+            # RESULTADOS
+            # ------------------------------------------------
+
+            check_results()
+
+            time.sleep(
+                POLL_INTERVAL
             )
 
         except KeyboardInterrupt:
@@ -1149,6 +1880,10 @@ def main() -> None:
                 "Error en loop principal: %s",
                 e,
             )
+
+            # Si el stream falla, se vuelve
+            # a inicializar.
+            STREAMS_STARTED = False
 
             time.sleep(2)
 
