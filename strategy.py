@@ -36,6 +36,8 @@ VOLATILITY_LOOKBACK = 10
 
 EXHAUSTION_LOOKBACK = 4
 
+FIVE_SECOND_CANDLES = 12
+
 
 # ============================================================
 # PESOS
@@ -197,6 +199,276 @@ def get_candle_infos(
         result.append(
             candle_info(candle)
         )
+
+    return result
+
+
+# ============================================================
+# ANÁLISIS DE LAS 12 VELAS DE 5 SEGUNDOS
+# ============================================================
+
+def analyze_5s_sequence(
+    candles_5s: Optional[pd.DataFrame],
+) -> Dict[str, Any]:
+
+    result = {
+        "valid": False,
+        "count": 0,
+        "bullish_score": 0,
+        "bearish_score": 0,
+        "bullish_pressure": 0,
+        "bearish_pressure": 0,
+        "direction": "NEUTRAL",
+        "open": 0.0,
+        "close": 0.0,
+        "high": 0.0,
+        "low": 0.0,
+        "range": 0.0,
+        "body": 0.0,
+        "body_ratio": 0.0,
+        "close_position": 0.50,
+        "reasons": [],
+    }
+
+    data = safe_dataframe(
+        candles_5s
+    )
+
+    if data.empty:
+        return result
+
+    if len(data) < FIVE_SECOND_CANDLES:
+        return result
+
+    data = data.tail(
+        FIVE_SECOND_CANDLES
+    ).reset_index(
+        drop=True
+    )
+
+    infos = get_candle_infos(
+        data
+    )
+
+    bullish = 0
+    bearish = 0
+
+    bullish_pressure = 0
+    bearish_pressure = 0
+
+    for info in infos:
+
+        if info["bull"]:
+            bullish += 1
+
+            if info["body_ratio"] >= 0.30:
+                bullish_pressure += 1
+
+        elif info["bear"]:
+            bearish += 1
+
+            if info["body_ratio"] >= 0.30:
+                bearish_pressure += 1
+
+    first_open = float(
+        data.iloc[0]["open"]
+    )
+
+    last_close = float(
+        data.iloc[-1]["close"]
+    )
+
+    sequence_high = float(
+        data["high"].max()
+    )
+
+    sequence_low = float(
+        data["low"].min()
+    )
+
+    sequence_range = (
+        sequence_high
+        - sequence_low
+    )
+
+    sequence_body = abs(
+        last_close
+        - first_open
+    )
+
+    if sequence_range > 0:
+
+        sequence_body_ratio = (
+            sequence_body
+            / sequence_range
+        )
+
+        close_position = (
+            last_close
+            - sequence_low
+        ) / sequence_range
+
+    else:
+
+        sequence_body_ratio = 0.0
+        close_position = 0.50
+
+    bullish_score = 0
+    bearish_score = 0
+    reasons = []
+
+    # --------------------------------------------------------
+    # DIRECCIÓN DEL RECORRIDO COMPLETO
+    # --------------------------------------------------------
+
+    if last_close > first_open:
+
+        bullish_score += 15
+
+        reasons.append(
+            "recorrido 5s alcista"
+        )
+
+    elif last_close < first_open:
+
+        bearish_score += 15
+
+        reasons.append(
+            "recorrido 5s bajista"
+        )
+
+    # --------------------------------------------------------
+    # MAYORÍA DE MICROVELAS
+    # --------------------------------------------------------
+
+    if bullish >= 7:
+
+        bullish_score += 15
+
+        reasons.append(
+            "mayoría de velas 5s alcistas"
+        )
+
+    if bearish >= 7:
+
+        bearish_score += 15
+
+        reasons.append(
+            "mayoría de velas 5s bajistas"
+        )
+
+    # --------------------------------------------------------
+    # PRESIÓN
+    # --------------------------------------------------------
+
+    if bullish_pressure >= 6:
+
+        bullish_score += 10
+
+        reasons.append(
+            "presión alcista en 5s"
+        )
+
+    if bearish_pressure >= 6:
+
+        bearish_score += 10
+
+        reasons.append(
+            "presión bajista en 5s"
+        )
+
+    # --------------------------------------------------------
+    # CIERRE DEL RECORRIDO
+    # --------------------------------------------------------
+
+    if close_position >= 0.70:
+
+        bullish_score += 10
+
+        reasons.append(
+            "5s termina en zona superior"
+        )
+
+    elif close_position <= 0.30:
+
+        bearish_score += 10
+
+        reasons.append(
+            "5s termina en zona inferior"
+        )
+
+    # --------------------------------------------------------
+    # CUERPO DEL RECORRIDO
+    # --------------------------------------------------------
+
+    if sequence_body_ratio >= 0.50:
+
+        if last_close > first_open:
+
+            bullish_score += 10
+
+        elif last_close < first_open:
+
+            bearish_score += 10
+
+    elif sequence_body_ratio >= 0.30:
+
+        if last_close > first_open:
+
+            bullish_score += 5
+
+        elif last_close < first_open:
+
+            bearish_score += 5
+
+    bullish_score = min(
+        bullish_score,
+        50,
+    )
+
+    bearish_score = min(
+        bearish_score,
+        50,
+    )
+
+    if (
+        bullish_score > bearish_score
+        and bullish_score >= 20
+    ):
+
+        direction = "BULLISH"
+
+    elif (
+        bearish_score > bullish_score
+        and bearish_score >= 20
+    ):
+
+        direction = "BEARISH"
+
+    else:
+
+        direction = "NEUTRAL"
+
+    result.update(
+        {
+            "valid": True,
+            "count": len(data),
+            "bullish_score": bullish_score,
+            "bearish_score": bearish_score,
+            "bullish_pressure": bullish_pressure,
+            "bearish_pressure": bearish_pressure,
+            "direction": direction,
+            "open": first_open,
+            "close": last_close,
+            "high": sequence_high,
+            "low": sequence_low,
+            "range": sequence_range,
+            "body": sequence_body,
+            "body_ratio": sequence_body_ratio,
+            "close_position": close_position,
+            "reasons": reasons,
+        }
+    )
 
     return result
 
@@ -724,10 +996,6 @@ def detect_recovery(
 
     last_close = last_info["close"]
 
-    # ========================================================
-    # RECUPERACIÓN ALCISTA
-    # ========================================================
-
     bullish_score = 0
 
     if bearish_pressure > bullish_pressure:
@@ -797,10 +1065,6 @@ def detect_recovery(
 
     if last_info["close_position"] >= 0.65:
         bullish_score += 5
-
-    # ========================================================
-    # RECUPERACIÓN BAJISTA
-    # ========================================================
 
     bearish_score = 0
 
@@ -1239,6 +1503,7 @@ def evaluate_direction(
     df: pd.DataFrame,
     direction: str,
     recovery_score: int,
+    micro_score: int = 0,
 ) -> Dict[str, Any]:
 
     structure_result = structure_confluence(
@@ -1396,6 +1661,35 @@ def evaluate_direction(
             volatility_result["reason"]
         )
 
+    # --------------------------------------------------------
+    # CONFLUENCIA DE LAS 12 VELAS DE 5 SEGUNDOS
+    #
+    # No reemplaza el análisis M1.
+    # Se incorpora como confirmación adicional.
+    # --------------------------------------------------------
+
+    micro_component = min(
+        max(
+            int(micro_score),
+            0,
+        ),
+        15,
+    )
+
+    score += micro_component
+
+    if micro_component >= 10:
+
+        reasons.append(
+            "recorrido 5s confirma dirección"
+        )
+
+    elif micro_component >= 5:
+
+        reasons.append(
+            "recorrido 5s favorable"
+        )
+
     exhausted = exhaustion_check(
         df,
         direction,
@@ -1449,6 +1743,7 @@ def evaluate_direction(
         "rejection_score": rejection_component,
         "momentum_score": momentum_component,
         "volatility_score": volatility_component,
+        "micro_score": micro_component,
         "exhaustion": exhausted,
         "reasons": reasons,
     }
@@ -1519,6 +1814,7 @@ def analyze_live_candle(
     previous_m1: Optional[pd.DataFrame] = None,
     pair: Optional[str] = None,
     elapsed_seconds: Optional[float] = None,
+    candles_5s: Optional[pd.DataFrame] = None,
 ) -> Dict[str, Any]:
 
     result = {
@@ -1545,6 +1841,7 @@ def analyze_live_candle(
         "bearish_score": 0,
         "bullish_pressure": 0,
         "bearish_pressure": 0,
+        "micro_analysis": {},
         "analysis": {},
     }
 
@@ -1600,6 +1897,12 @@ def analyze_live_candle(
             }
         )
 
+        micro = analyze_5s_sequence(
+            candles_5s
+        )
+
+        result["micro_analysis"] = micro
+
         hist = safe_dataframe(
             previous_m1
         )
@@ -1624,6 +1927,34 @@ def analyze_live_candle(
                 structure_df
             )
 
+            micro_bullish = int(
+                micro.get(
+                    "bullish_score",
+                    0,
+                )
+            )
+
+            micro_bearish = int(
+                micro.get(
+                    "bearish_score",
+                    0,
+                )
+            )
+
+            bullish_micro_component = int(
+                round(
+                    micro_bullish
+                    * 0.30
+                )
+            )
+
+            bearish_micro_component = int(
+                round(
+                    micro_bearish
+                    * 0.30
+                )
+            )
+
             bullish = evaluate_direction(
                 structure_df,
                 "BULLISH",
@@ -1633,6 +1964,7 @@ def analyze_live_candle(
                         0,
                     )
                 ),
+                bullish_micro_component,
             )
 
             bearish = evaluate_direction(
@@ -1644,6 +1976,7 @@ def analyze_live_candle(
                         0,
                     )
                 ),
+                bearish_micro_component,
             )
 
             result["bullish_score"] = int(
@@ -1687,6 +2020,7 @@ def analyze_live_candle(
                 "bullish": bullish,
                 "bearish": bearish,
                 "recovery": recovery,
+                "micro": micro,
             }
 
         return result
@@ -1703,6 +2037,7 @@ def analyze_market(
     candle_1m,
     previous_m1=None,
     pair: Optional[str] = None,
+    candles_5s: Optional[pd.DataFrame] = None,
 ) -> Dict[str, Any]:
 
     result = {
@@ -1719,6 +2054,7 @@ def analyze_market(
         "bullish_score": 0,
         "bearish_score": 0,
         "confidence": 0,
+        "micro_analysis": {},
         "analysis": {},
     }
 
@@ -1742,48 +2078,55 @@ def analyze_market(
 
         return result
 
+    current = None
+
     if candle_1m is not None:
 
         try:
 
-            current = pd.DataFrame(
+            current_df = pd.DataFrame(
                 [candle_1m]
             )
 
-            current = safe_dataframe(
-                current
+            current_df = safe_dataframe(
+                current_df
             )
 
-            if not current.empty:
+            if not current_df.empty:
 
-                current_last = (
-                    current.iloc[-1]
-                )
-
-                hist_last = (
-                    hist.iloc[-1]
-                )
-
-                current_close = float(
-                    current_last["close"]
-                )
-
-                hist_close = float(
-                    hist_last["close"]
-                )
-
-                if current_close != hist_close:
-
-                    hist = pd.concat(
-                        [
-                            hist,
-                            current,
-                        ],
-                        ignore_index=True,
-                    )
+                current = current_df.iloc[-1]
 
         except Exception:
-            pass
+            current = None
+
+    # --------------------------------------------------------
+    # IMPORTANTE:
+    #
+    # Para la decisión final utilizamos la vela cerrada N.
+    # Si ya está incluida en history, no la duplicamos.
+    # --------------------------------------------------------
+
+    if current is not None:
+
+        current_close = float(
+            current["close"]
+        )
+
+        hist_last_close = float(
+            hist.iloc[-1]["close"]
+        )
+
+        if current_close != hist_last_close:
+
+            hist = pd.concat(
+                [
+                    hist,
+                    pd.DataFrame(
+                        [current]
+                    ),
+                ],
+                ignore_index=True,
+            )
 
     structure = market_structure(
         hist
@@ -1809,16 +2152,56 @@ def analyze_market(
         )
     )
 
+    # --------------------------------------------------------
+    # ANÁLISIS DE LAS 12 VELAS DE 5 SEGUNDOS
+    # --------------------------------------------------------
+
+    micro = analyze_5s_sequence(
+        candles_5s
+    )
+
+    result["micro_analysis"] = micro
+
+    micro_bullish = int(
+        micro.get(
+            "bullish_score",
+            0,
+        )
+    )
+
+    micro_bearish = int(
+        micro.get(
+            "bearish_score",
+            0,
+        )
+    )
+
+    bullish_micro_component = int(
+        round(
+            micro_bullish
+            * 0.30
+        )
+    )
+
+    bearish_micro_component = int(
+        round(
+            micro_bearish
+            * 0.30
+        )
+    )
+
     bullish = evaluate_direction(
         hist,
         "BULLISH",
         recovery_bullish,
+        bullish_micro_component,
     )
 
     bearish = evaluate_direction(
         hist,
         "BEARISH",
         recovery_bearish,
+        bearish_micro_component,
     )
 
     result["bullish_score"] = bullish[
@@ -1871,6 +2254,7 @@ def analyze_market(
             "bearish": bearish,
             "recovery": recovery,
             "levels": levels,
+            "micro": micro,
         }
 
         return result
@@ -1894,7 +2278,7 @@ def analyze_market(
     ]
 
     result["pattern"] = (
-        "CONFLUENCIA_RECOVERY"
+        "CONFLUENCIA_M1_12X5S"
     )
 
     result["reason"] = (
@@ -1911,6 +2295,7 @@ def analyze_market(
         "bearish": bearish,
         "recovery": recovery,
         "levels": levels,
+        "micro": micro,
     }
 
     return result
@@ -1924,12 +2309,14 @@ def get_signal(
     candle_1m,
     previous_m1=None,
     pair: Optional[str] = None,
+    candles_5s: Optional[pd.DataFrame] = None,
 ):
 
     result = analyze_market(
         candle_1m=candle_1m,
         previous_m1=previous_m1,
         pair=pair,
+        candles_5s=candles_5s,
     )
 
     return result.get(
@@ -1941,12 +2328,14 @@ def signal(
     candle_1m,
     previous_m1=None,
     pair: Optional[str] = None,
+    candles_5s: Optional[pd.DataFrame] = None,
 ):
 
     return get_signal(
         candle_1m=candle_1m,
         previous_m1=previous_m1,
         pair=pair,
+        candles_5s=candles_5s,
     )
 
 
@@ -1957,5 +2346,5 @@ def signal(
 if __name__ == "__main__":
 
     print(
-        "Estrategia M1 de CONFLUENCIA + ANÁLISIS EN VIVO cargada correctamente"
+        "Estrategia M1 + recorrido de 12 velas de 5 segundos cargada correctamente"
     )
