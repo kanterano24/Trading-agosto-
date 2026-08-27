@@ -392,23 +392,14 @@ def connect() -> bool:
                 reason,
             )
 
-            telegram_send(
-                "🔴 Error conectando a IQ Option",
-                "connect_error",
-                force=True,
-            )
-
+            # NO ENVIAR MENSAJE AUTOMÁTICO A TELEGRAM
             return False
 
         logging.info(
             "Conectado a IQ Option"
         )
 
-        telegram_send(
-            "🟢 Conectado a IQ Option",
-            "connect",
-            force=True,
-        )
+        # NO ENVIAR MENSAJE AUTOMÁTICO A TELEGRAM
 
         return True
 
@@ -813,6 +804,22 @@ def execute_trade(
 
     try:
 
+        # ----------------------------------------------------
+        # CONFIRMACIÓN VALIDADA
+        # ----------------------------------------------------
+
+        telegram_send(
+            "✅ CONFIRMACIÓN COMPLETA\n\n"
+            f"📊 Par: {api_pair}\n"
+            f"🎯 Dirección: {signal.upper()}\n"
+            f"🧠 Patrón: {pattern}\n"
+            f"⭐ Score: {score}/100\n"
+            "🔎 Condiciones confirmadas\n"
+            "🚀 Preparando ejecución...",
+            f"confirmation_{candle_timestamp}",
+            force=True,
+        )
+
         logging.info(
             "COMPRA | %s | %s | score=%s",
             api_pair,
@@ -860,8 +867,12 @@ def execute_trade(
             "created": int(time.time()),
         }
 
+        # ----------------------------------------------------
+        # EJECUCIÓN CONFIRMADA
+        # ----------------------------------------------------
+
         telegram_send(
-            "🚀 NUEVA OPERACIÓN\n\n"
+            "🚀 OPERACIÓN EJECUTADA\n\n"
             f"📊 Par: {api_pair}\n"
             f"🎯 Señal: {signal.upper()}\n"
             f"🧠 Patrón: {pattern}\n"
@@ -939,6 +950,10 @@ def check_results() -> None:
 
                 outcome = "DRAW 🟡"
 
+            # ------------------------------------------------
+            # RESULTADO
+            # ------------------------------------------------
+
             telegram_send(
                 "📊 RESULTADO\n\n"
                 f"📈 {trade['api_pair']}\n"
@@ -1012,25 +1027,8 @@ def main() -> None:
         ).start()
 
     # --------------------------------------------------------
-    # MENSAJE INICIAL
+    # SIN MENSAJE AUTOMÁTICO "BOT LISTO"
     # --------------------------------------------------------
-
-    telegram_send(
-        "🤖 BOT LISTO\n\n"
-        "📊 Analizando pares:\n"
-        f"{', '.join(PAIRS)}\n\n"
-        "🧠 Estrategias:\n"
-        "• Reversión\n"
-        "• Continuidad\n"
-        "• Rechazo\n"
-        "• Pullback\n"
-        "• Consolidación\n\n"
-        f"💵 Base: ${BASE_AMOUNT:.2f}\n"
-        f"🛑 Máximo: ${MAX_AMOUNT:.2f}\n"
-        f"⏱ Expiración: {EXPIRATION}m",
-        "ready",
-        force=True,
-    )
 
     last_processed_minute = None
 
@@ -1103,6 +1101,8 @@ def main() -> None:
 
             if not best_trade:
 
+                # SOLO LOG LOCAL.
+                # NO TELEGRAM.
                 logging.info(
                     "No hay oportunidad válida"
                 )
