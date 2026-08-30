@@ -8,1783 +8,682 @@ from typing import Any, Dict, Optional, Tuple
 
 import pandas as pd
 import requests
-
 from iqoptionapi.stable_api import IQ_Option
 
-from strategy import (
-    analyze_live_candle,
-    analyze_market,
-)
-
+from strategy import analyze_market
 
 # ============================================================
-# LOGGING
+# BOT OTC - DIVERGENCIA RSI ESTRUCTURAL / SNIPER 5 MINUTOS
 # ============================================================
+# Flujo:
+# 1) Descubre los OTC BINARY abiertos en IQ Option.
+# 2) Analiza cada M1 cerrada.
+# 3) La estrategia busca pivotes + divergencia RSI estructural.
+# 4) Si existe divergencia, Telegram recibe el análisis.
+# 5) Solo cuando N cierra y todas las condiciones se confirman,
+#    se arma la entrada.
+# 6) Al comenzar N+1 se ejecuta inmediatamente.
+# 7) La operación usa EXPIRATION=5 minutos y la dirección de la señal.
+# 8) N+1 NO participa en el análisis de la señal.
+# ============================================================
+
+IQ_EMAIL = os.getenv("IQ_EMAIL")
+IQ_PASSWORD = os.getenv("IQ_PASSWORD")
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+
+TIMEFRAME = 60
+EXPIRATION = 5
+AMOUNT = float(os.getenv("AMOUNT", "10"))
+CANDLE_COUNT = 60
+
+MAX_OTC_PAIRS = int(os.getenv("MAX_OTC_PAIRS", "50"))
+PAIR_REFRESH_SECONDS = 60.0
+SNIPER_POLL = 0.02
+REALTIME_MAXDICT = 100
+TRADE_COOLDOWN = 60.0
+
+BOT_RUNNING = False
+IQ: Optional[IQ_Option] = None
+PAIRS: list[str] = []
+LAST_PAIR_REFRESH = 0.0
+
+LIVE_STATE: Dict[str, Dict[str, Any]] = {}
+PENDING_ENTRY: Dict[str, Dict[str, Any]] = {}
+LAST_TRADE_TIME: Dict[str, float] = {}
+LAST_TRADE_CANDLE: Dict[str, int] = {}
+LAST_DIVERGENCE_NOTICE: Dict[str, int] = {}
+STREAM_STARTED: Dict[str, bool] = {}
+
+STATE_LOCK = threading.RLock()
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(message)s",
 )
-
-
-# ============================================================
-# CONFIG IQ OPTION
-# ============================================================
-
-IQ_EMAIL = os.getenv("IQ_EMAIL")
-IQ_PASSWORD = os.getenv("IQ_PASSWORD")
-
-
-# ============================================================
-# CONFIG TELEGRAM
-# ============================================================
-
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-
-
-# ============================================================
-# MERCADO
-# ============================================================
-
-PAIRS = [
-    "EURUSD-OTC",
-    "EURJPY-OTC",
-    "EURGBP-OTC",
-    "GBPUSD-OTC",
-    "USDCHF-OTC",
-]
-
-TIMEFRAME = 60
-
-FIVE_SECOND_TIMEFRAME = 5
-
-CANDLE_COUNT = 60
-
-FIVE_SECOND_COUNT = 12
-
-# ============================================================
-# EXPIRACIÓN
-# ============================================================
-
-EXPIRATION = 1
-
-
-# ============================================================
-# FRECUENCIA
-# ============================================================
-
-POLL_INTERVAL = 0.50
-
-
-# ============================================================
-# OPERATIVA
-# ============================================================
-
-MAX_OPEN_TRADES = 1
-
-LAST_TRADED_CANDLE: Dict[str, int] = {}
-
-RESULT_CHECK_DELAY = 5
-
-
-# ============================================================
-# CAPITAL
-# ============================================================
-
-BASE_AMOUNT = 100.0
-
-CURRENT_AMOUNT = BASE_AMOUNT
-
-MAX_AMOUNT = 200.0
-
-WIN_STREAK = 0
-
-LOSS_STREAK = 0
-
-MODE = "compound"
-
-
-# ============================================================
-# ESTADO GLOBAL
-# ============================================================
-
-BOT_RUNNING = False
-
-IQ: Optional[IQ_Option] = None
-
-LAST_UPDATE_ID: Optional[int] = None
-
-OPEN_TRADES: Dict[int, Dict[str, Any]] = {}
-
-ACTIVE_API_PAIR: Dict[str, str] = {}
-
-STREAMS_STARTED = False
-
-
-# ============================================================
-# ESTADO DE VELAS
-# ============================================================
-
-LIVE_M1_STATE: Dict[str, Dict[str, Any]] = {}
-
-LAST_CLOSED_M1: Dict[str, int] = {}
-
-LAST_LIVE_LOG_SECOND: Dict[str, int] = {}
-
-
-# ============================================================
-# TELEGRAM ANTI-SPAM
-# ============================================================
-
-LAST_MSG: Dict[str, float] = {}
-
-COOLDOWN = 10
-
-
-def can_send(
-    key: str,
-) -> bool:
-
-    now = time.time()
-
-    if key in LAST_MSG:
-
-        elapsed = (
-            now
-            - LAST_MSG[key]
-        )
-
-        if elapsed < COOLDOWN:
-            return False
-
-    LAST_MSG[key] = now
-
-    return True
+logger = logging.getLogger(__name__)
 
 
 # ============================================================
 # TELEGRAM
 # ============================================================
 
-def telegram_send(
-    msg: str,
-    key: str = "msg",
-    force: bool = False,
-) -> bool:
-
-    if (
-        not TELEGRAM_TOKEN
-        or not TELEGRAM_CHAT_ID
-    ):
+def _telegram_post(endpoint: str, data: Dict[str, Any], timeout: float = 3.0) -> bool:
+    if not TELEGRAM_TOKEN:
         return False
-
-    if not force and not can_send(key):
-        return False
-
     try:
-
         response = requests.post(
-            (
-                "https://api.telegram.org/"
-                f"bot{TELEGRAM_TOKEN}/sendMessage"
-            ),
-            data={
-                "chat_id": TELEGRAM_CHAT_ID,
-                "text": msg,
-            },
-            timeout=5,
+            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/{endpoint}",
+            data=data,
+            timeout=timeout,
         )
-
-        return response.ok
-
-    except Exception as e:
-
-        logging.error(
-            "Error Telegram: %s",
-            e,
-        )
-
+        return response.status_code == 200
+    except Exception as exc:
+        logger.warning("Telegram %s: %s", endpoint, exc)
         return False
 
 
-# ============================================================
-# CAPITAL
-# ============================================================
+def telegram_send(message: str) -> None:
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        return
 
-def update_amount(
-    profit: float,
-) -> None:
+    def worker() -> None:
+        _telegram_post(
+            "sendMessage",
+            {"chat_id": TELEGRAM_CHAT_ID, "text": message},
+            timeout=3.0,
+        )
 
-    global CURRENT_AMOUNT
-    global WIN_STREAK
-    global LOSS_STREAK
-
-    if profit > 0:
-
-        WIN_STREAK += 1
-        LOSS_STREAK = 0
-
-        if MODE == "compound":
-
-            multiplier = (
-                1
-                + WIN_STREAK * 0.25
-            )
-
-            CURRENT_AMOUNT = min(
-                BASE_AMOUNT
-                * multiplier,
-                MAX_AMOUNT,
-            )
-
-        else:
-
-            CURRENT_AMOUNT = BASE_AMOUNT
-
-    elif profit < 0:
-
-        LOSS_STREAK += 1
-        WIN_STREAK = 0
-
-        CURRENT_AMOUNT = BASE_AMOUNT
-
-    else:
-
-        CURRENT_AMOUNT = BASE_AMOUNT
+    threading.Thread(target=worker, daemon=True).start()
 
 
-# ============================================================
-# TELEGRAM WORKER
-# ============================================================
-
-def telegram_worker() -> None:
-
-    global LAST_UPDATE_ID
+def telegram_command_loop() -> None:
     global BOT_RUNNING
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        return
+
+    last_update_id: Optional[int] = None
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates"
 
     while True:
-
         try:
+            params: Dict[str, Any] = {"timeout": 1}
+            if last_update_id is not None:
+                params["offset"] = last_update_id + 1
 
-            if not TELEGRAM_TOKEN:
-
-                time.sleep(2)
-
+            response = requests.get(url, params=params, timeout=3)
+            data = response.json()
+            if not data.get("ok"):
+                time.sleep(0.5)
                 continue
 
-            params = {}
+            for update in data.get("result", []):
+                uid = update.get("update_id")
+                if uid is not None:
+                    last_update_id = int(uid)
 
-            if LAST_UPDATE_ID is not None:
-
-                params["offset"] = (
-                    LAST_UPDATE_ID
-                    + 1
-                )
-
-            response = requests.get(
-                (
-                    "https://api.telegram.org/"
-                    f"bot{TELEGRAM_TOKEN}/getUpdates"
-                ),
-                params=params,
-                timeout=10,
-            )
-
-            data = response.json()
-
-            for update in data.get(
-                "result",
-                [],
-            ):
-
-                LAST_UPDATE_ID = (
-                    update[
-                        "update_id"
-                    ]
-                )
-
-                message = (
-                    update.get(
-                        "message"
-                    )
-                    or {}
-                )
-
-                text = message.get(
-                    "text",
-                    "",
-                )
-
-                chat_id = str(
-                    message.get(
-                        "chat",
-                        {},
-                    ).get(
-                        "id",
-                        "",
-                    )
-                )
-
-                if not isinstance(
-                    text,
-                    str,
-                ):
+                message = update.get("message") or {}
+                text = str(message.get("text", "")).strip().lower()
+                chat_id = str((message.get("chat") or {}).get("id", ""))
+                if chat_id != str(TELEGRAM_CHAT_ID):
                     continue
 
-                if str(chat_id) != str(
-                    TELEGRAM_CHAT_ID
-                ):
-                    continue
-
-                command = (
-                    text.lower()
-                    .strip()
-                )
-
-                if command.startswith(
-                    "/start"
-                ):
-
+                if text == "/start":
                     BOT_RUNNING = True
-
                     telegram_send(
                         "🟢 BOT ACTIVADO\n\n"
-                        f"📊 Pares: "
-                        f"{', '.join(PAIRS)}\n"
-                        f"💵 Monto: "
-                        f"${CURRENT_AMOUNT:.2f}\n"
-                        f"⏱ Expiración: "
-                        f"{EXPIRATION}m\n"
-                        "📡 M1 + 12 velas de 5s\n"
-                        "🎯 Entrada automática en N+1",
-                        "start",
-                        force=True,
+                        "⚡ SNIPER OTC\n"
+                        "🧠 VELA DE DESCANSO + DIVERGENCIA RSI ESTRUCTURAL\n\n"
+                        f"OTC analizados: hasta {MAX_OTC_PAIRS}\n"
+                        "⏱ Análisis: M1\n"
+                        "🎯 Entrada: N+1 inmediata\n"
+                        "⏳ Expiración: 5 minutos\n"
+                        f"💵 Importe: {AMOUNT:g}"
                     )
-
-                elif command.startswith(
-                    "/stop"
-                ):
-
+                elif text == "/stop":
                     BOT_RUNNING = False
-
+                    telegram_send("🔴 BOT DETENIDO\n\nNo se abrirán nuevas operaciones.")
+                elif text == "/status":
+                    status = "🟢 ACTIVO" if BOT_RUNNING else "🔴 DETENIDO"
                     telegram_send(
-                        "🔴 BOT DETENIDO",
-                        "stop",
-                        force=True,
+                        "📊 ESTADO\n\n"
+                        f"Estado: {status}\n"
+                        "Modo: SNIPER\n"
+                        "Mercado: BINARY OTC\n"
+                        "Estrategia: DESCANSO + DIVERGENCIA RSI\n"
+                        "Temporalidad: 1 minuto\n"
+                        "Entrada: N+1\n"
+                        "Expiración: 5 minutos\n"
+                        f"Importe: {AMOUNT:g}\n"
+                        f"Pares OTC: {len(PAIRS)}"
                     )
-
-                elif command.startswith(
-                    "/status"
-                ):
-
-                    telegram_send(
-                        "🤖 ESTADO DEL BOT\n\n"
-                        f"Estado: "
-                        f"{'🟢 ACTIVO' if BOT_RUNNING else '🔴 DETENIDO'}\n\n"
-                        f"💵 Monto actual: "
-                        f"${CURRENT_AMOUNT:.2f}\n"
-                        f"📈 Wins seguidos: "
-                        f"{WIN_STREAK}\n"
-                        f"📉 Losses seguidos: "
-                        f"{LOSS_STREAK}\n"
-                        f"📂 Operaciones abiertas: "
-                        f"{len(OPEN_TRADES)}\n"
-                        f"⏱ Expiración: "
-                        f"{EXPIRATION}m\n"
-                        f"📡 Streams activos: "
-                        f"{len(LIVE_M1_STATE)}",
-                        "status",
-                        force=True,
-                    )
-
-        except Exception as e:
-
-            logging.error(
-                "Error Telegram worker: %s",
-                e,
-            )
-
-        time.sleep(1)
+        except Exception as exc:
+            logger.warning("Telegram commands: %s", exc)
+            time.sleep(1)
 
 
 # ============================================================
-# CONEXIÓN
+# DESCUBRIMIENTO OTC BINARY
 # ============================================================
 
-def connect() -> bool:
-
-    global IQ
-
-    if (
-        not IQ_EMAIL
-        or not IQ_PASSWORD
-    ):
-
-        logging.error(
-            "Faltan IQ_EMAIL o IQ_PASSWORD"
-        )
-
-        return False
-
+def _is_otc_pair(value: Any) -> bool:
     try:
-
-        logging.info(
-            "Conectando a IQ Option..."
-        )
-
-        IQ = IQ_Option(
-            IQ_EMAIL,
-            IQ_PASSWORD,
-        )
-
-        check, reason = IQ.connect()
-
-        if not check:
-
-            logging.error(
-                "No se pudo conectar: %s",
-                reason,
-            )
-
-            return False
-
-        logging.info(
-            "Conectado a IQ Option"
-        )
-
-        return True
-
-    except Exception as e:
-
-        logging.exception(
-            "Error conexión IQ: %s",
-            e,
-        )
-
+        name = str(value).strip().upper()
+    except Exception:
         return False
+    return name.endswith("-OTC") or name.endswith("_OTC") or "OTC" in name
 
 
-# ============================================================
-# VERIFICAR CONEXIÓN
-# ============================================================
-
-def ensure_connection() -> bool:
-
-    global IQ
-    global STREAMS_STARTED
-
+def _binary_open_pairs_from_open_time() -> list[str]:
+    if IQ is None:
+        return []
     try:
+        data = IQ.get_all_open_time()
+        binary = data.get("binary", {}) if isinstance(data, dict) else {}
+        if not isinstance(binary, dict):
+            return []
 
-        if IQ is not None:
+        result: list[str] = []
+        for asset, info in binary.items():
+            if not _is_otc_pair(asset) or not isinstance(info, dict):
+                continue
+            is_open = bool(
+                info.get("open")
+                or info.get("enabled")
+                or (isinstance(info.get("binary"), dict) and info["binary"].get("open"))
+            )
+            if is_open:
+                result.append(str(asset))
+        return sorted(set(result))
+    except Exception as exc:
+        logger.warning("OTC discovery error: %s", exc)
+        return []
 
-            if IQ.check_connect():
 
-                return True
+def _binary_assets_from_init_v2() -> list[str]:
+    if IQ is None or not hasattr(IQ, "get_all_init_v2"):
+        return []
+    try:
+        data = IQ.get_all_init_v2()
+    except Exception:
+        return []
 
+    found: set[str] = set()
+
+    def walk(obj: Any) -> None:
+        if isinstance(obj, dict):
+            for key in ("name", "symbol", "asset", "active", "pair"):
+                value = obj.get(key)
+                if isinstance(value, str) and _is_otc_pair(value):
+                    suspended = bool(obj.get("is_suspended") or obj.get("suspended"))
+                    enabled = obj.get("enabled", True)
+                    if not suspended and enabled is not False:
+                        found.add(value)
+            for key, value in obj.items():
+                if isinstance(key, str) and _is_otc_pair(key) and isinstance(value, dict):
+                    suspended = bool(value.get("is_suspended") or value.get("suspended"))
+                    enabled = value.get("enabled", True)
+                    opened = value.get("open", True)
+                    if not suspended and enabled is not False and opened is not False:
+                        found.add(key)
+                walk(value)
+        elif isinstance(obj, (list, tuple)):
+            for item in obj:
+                walk(item)
+
+    walk(data)
+    return sorted(found)
+
+
+def discover_binary_otc_pairs() -> list[str]:
+    pairs = _binary_open_pairs_from_open_time()
+    if not pairs:
+        pairs = _binary_assets_from_init_v2()
+    return sorted(set(p for p in pairs if _is_otc_pair(p)))
+
+
+def refresh_binary_otc_pairs(force: bool = False) -> list[str]:
+    global PAIRS, LAST_PAIR_REFRESH
+    now = time.time()
+    if not force and now - LAST_PAIR_REFRESH < PAIR_REFRESH_SECONDS:
+        return list(PAIRS)
+
+    discovered = discover_binary_otc_pairs()
+    selected = discovered[:MAX_OTC_PAIRS]
+    previous = set(PAIRS)
+    current = set(selected)
+
+    with STATE_LOCK:
+        PAIRS = list(selected)
+        LAST_PAIR_REFRESH = now
+        for pair in previous - current:
+            PENDING_ENTRY.pop(pair, None)
+            LIVE_STATE.pop(pair, None)
+            LAST_TRADE_CANDLE.pop(pair, None)
+            LAST_DIVERGENCE_NOTICE.pop(pair, None)
+            STREAM_STARTED.pop(pair, None)
+
+    if set(selected) != previous:
+        msg = (
+            "🔄 UNIVERSO OTC ACTUALIZADO\n\n"
+            f"Pares disponibles: {len(selected)}/{MAX_OTC_PAIRS}\n"
+            f"{', '.join(selected) if selected else 'NINGUNO'}"
+        )
+        logger.info(msg.replace("\n", " | "))
+        telegram_send(msg)
+
+    start_realtime_streams()
+    return list(PAIRS)
+
+
+# ============================================================
+# IQ OPTION / STREAM
+# ============================================================
+
+def get_iq_server_timestamp() -> float:
+    if IQ is None:
+        return time.time()
+    try:
+        value = float(IQ.get_server_timestamp())
+        if value > 0:
+            return value
     except Exception:
         pass
+    return time.time()
 
-    STREAMS_STARTED = False
 
-    logging.warning(
-        "Reconectando a IQ Option..."
+def floor_candle_timestamp(timestamp: float) -> int:
+    return int(timestamp // TIMEFRAME) * TIMEFRAME
+
+
+def connect_iq() -> bool:
+    global IQ
+    if not IQ_EMAIL or not IQ_PASSWORD:
+        raise ValueError("Faltan IQ_EMAIL/IQ_PASSWORD")
+
+    logger.info("Conectando a IQ Option...")
+    IQ = IQ_Option(IQ_EMAIL, IQ_PASSWORD)
+    connected, reason = IQ.connect()
+    if not connected:
+        raise ConnectionError(f"No se pudo conectar a IQ Option: {reason}")
+
+    refresh_binary_otc_pairs(force=True)
+    start_realtime_streams()
+    server_ts = get_iq_server_timestamp()
+    logger.info("IQ conectado | server=%.3f", server_ts)
+    telegram_send(
+        "🟢 IQ OPTION CONECTADO\n\n"
+        "⚡ MODO SNIPER\n"
+        "🧠 DESCANSO + DIVERGENCIA RSI ESTRUCTURAL\n"
+        "⏱ M1 cerrada → N+1 inmediata\n"
+        "⏳ Expiración: 5 minutos"
     )
-
-    return connect()
-
-
-# ============================================================
-# CANDIDATOS DE PAR
-# ============================================================
-
-def get_pair_candidates(
-    logical_pair: str,
-):
-
-    candidates = []
-
-    normalized = (
-        logical_pair
-        .upper()
-        .strip()
-    )
-
-    if normalized.endswith(
-        "-OTC"
-    ):
-
-        candidates.append(
-            normalized
-        )
-
-        candidates.append(
-            normalized[:-4]
-        )
-
-    else:
-
-        candidates.append(
-            f"{normalized}-OTC"
-        )
-
-        candidates.append(
-            normalized
-        )
-
-    return candidates
+    return True
 
 
-# ============================================================
-# OBTENER VELAS HISTÓRICAS M1
-# ============================================================
-
-def get_pair_candles(
-    logical_pair: str,
-) -> Tuple[
-    Optional[str],
-    Optional[pd.DataFrame],
-]:
-
-    if IQ is None:
-        return None, None
-
-    candidates = []
-
-    if logical_pair in ACTIVE_API_PAIR:
-
-        candidates.append(
-            ACTIVE_API_PAIR[
-                logical_pair
-            ]
-        )
-
-    for pair in get_pair_candidates(
-        logical_pair
-    ):
-
-        if pair not in candidates:
-
-            candidates.append(pair)
-
-    for api_pair in candidates:
-
-        try:
-
-            candles = IQ.get_candles(
-                api_pair,
-                TIMEFRAME,
-                CANDLE_COUNT,
-                time.time(),
-            )
-
-            if not candles:
-                continue
-
-            df = pd.DataFrame(
-                candles
-            )
-
-            if df.empty:
-                continue
-
-            required = {
-                "open",
-                "close",
-                "high",
-                "low",
-            }
-
-            if not required.issubset(
-                df.columns
-            ):
-                continue
-
-            ACTIVE_API_PAIR[
-                logical_pair
-            ] = api_pair
-
-            return (
-                api_pair,
-                df,
-            )
-
-        except Exception as e:
-
-            logging.debug(
-                "No disponible %s: %s",
-                api_pair,
-                e,
-            )
-
-    return None, None
-
-
-# ============================================================
-# OBTENER 12 VELAS DE 5 SEGUNDOS DE N
-# ============================================================
-
-def get_5s_candles_for_minute(
-    logical_pair: str,
-    minute_timestamp: int,
-) -> Optional[pd.DataFrame]:
-
-    if IQ is None:
-        return None
-
-    api_pair = ACTIVE_API_PAIR.get(
-        logical_pair
-    )
-
-    if not api_pair:
-
-        api_pair, _ = (
-            get_pair_candles(
-                logical_pair
-            )
-        )
-
-    if not api_pair:
-        return None
-
-    start_timestamp = int(
-        minute_timestamp
-    )
-
-    end_timestamp = (
-        start_timestamp
-        + TIMEFRAME
-    )
-
+def ensure_connection() -> bool:
+    global IQ
     try:
-
-        candles = IQ.get_candles(
-            api_pair,
-            FIVE_SECOND_TIMEFRAME,
-            FIVE_SECOND_COUNT,
-            end_timestamp,
-        )
-
-        if not candles:
-            return None
-
-        df = pd.DataFrame(
-            candles
-        )
-
-        if df.empty:
-            return None
-
-        required = {
-            "open",
-            "close",
-            "high",
-            "low",
-        }
-
-        if not required.issubset(
-            df.columns
-        ):
-            return None
-
-        if "from" not in df.columns:
-            return None
-
-        timestamps = pd.to_numeric(
-            df["from"],
-            errors="coerce",
-        )
-
-        data = df[
-            (
-                timestamps
-                >= start_timestamp
-            )
-            & (
-                timestamps
-                < end_timestamp
-            )
-        ].copy()
-
-        data = data.sort_values(
-            "from"
-        )
-
-        data = data.drop_duplicates(
-            subset=["from"],
-            keep="last",
-        )
-
-        data.reset_index(
-            drop=True,
-            inplace=True,
-        )
-
-        if len(data) < FIVE_SECOND_COUNT:
-
-            logging.warning(
-                (
-                    "5s incompletas | %s | "
-                    "M1=%s | recibidas=%s/12"
-                ),
-                logical_pair,
-                minute_timestamp,
-                len(data),
-            )
-
-            return None
-
-        return data.tail(
-            FIVE_SECOND_COUNT
-        ).reset_index(
-            drop=True
-        )
-
-    except Exception as e:
-
-        logging.debug(
-            "Error obteniendo 5s %s: %s",
-            api_pair,
-            e,
-        )
-
-        return None
-
-
-# ============================================================
-# OBTENER SOLO CERRADAS
-# ============================================================
-
-def get_closed_candles(
-    df: pd.DataFrame,
-) -> pd.DataFrame:
-
-    if (
-        df is None
-        or df.empty
-    ):
-
-        return pd.DataFrame()
-
-    data = df.copy()
-
-    if "from" in data.columns:
-
-        now = time.time()
-
-        timestamp = pd.to_numeric(
-            data["from"],
-            errors="coerce",
-        )
-
-        closed = data[
-            (
-                timestamp
-                + TIMEFRAME
-            )
-            <= now
-        ]
-
-        if not closed.empty:
-
-            data = closed
-
-    data = data.dropna(
-        subset=[
-            "open",
-            "close",
-            "high",
-            "low",
-        ]
-    )
-
-    data = data.reset_index(
-        drop=True
-    )
-
-    return data
-
-
-# ============================================================
-# CONVERTIR STREAM A VELA
-# ============================================================
-
-def normalize_stream_candle(
-    raw: Any,
-) -> Optional[Dict[str, Any]]:
-
-    if not isinstance(
-        raw,
-        dict,
-    ):
-        return None
-
-    def number(
-        *keys,
-    ):
-
-        for key in keys:
-
-            value = raw.get(
-                key
-            )
-
-            if value is None:
-                continue
-
-            try:
-
-                return float(value)
-
-            except Exception:
-                continue
-
-        return None
-
-    open_price = number(
-        "open",
-    )
-
-    close = number(
-        "close",
-    )
-
-    high = number(
-        "high",
-        "max",
-    )
-
-    low = number(
-        "low",
-        "min",
-    )
-
-    if (
-        open_price is None
-        or close is None
-        or high is None
-        or low is None
-    ):
-
-        return None
-
-    result = {
-        "open": open_price,
-        "close": close,
-        "high": high,
-        "low": low,
-    }
-
-    for key in (
-        "from",
-        "to",
-        "at",
-        "id",
-    ):
-
-        if key in raw:
-
-            result[key] = raw[key]
-
-    return result
-
-
-# ============================================================
-# INICIAR STREAMS
-# ============================================================
-
-def start_streams() -> bool:
-
-    global STREAMS_STARTED
-
-    if IQ is None:
-        return False
-
-    success = 0
-
-    for logical_pair in PAIRS:
-
-        api_pair = ACTIVE_API_PAIR.get(
-            logical_pair
-        )
-
-        if not api_pair:
-
-            api_pair, _ = (
-                get_pair_candles(
-                    logical_pair
-                )
-            )
-
-        if not api_pair:
-            continue
-
-        try:
-
-            # ------------------------------------------------
-            # STREAM M1
-            # ------------------------------------------------
-
-            IQ.start_candles_stream(
-                api_pair,
-                TIMEFRAME,
-                CANDLE_COUNT,
-            )
-
-            # ------------------------------------------------
-            # STREAM 5 SEGUNDOS
-            # ------------------------------------------------
-
-            IQ.start_candles_stream(
-                api_pair,
-                FIVE_SECOND_TIMEFRAME,
-                FIVE_SECOND_COUNT,
-            )
-
-            success += 1
-
-            logging.info(
-                "Streams M1 + 5s iniciados: %s",
-                api_pair,
-            )
-
-        except Exception as e:
-
-            logging.error(
-                "Error iniciando streams %s: %s",
-                api_pair,
-                e,
-            )
-
-    STREAMS_STARTED = (
-        success > 0
-    )
-
-    return STREAMS_STARTED
-
-
-# ============================================================
-# OBTENER VELA M1 EN VIVO
-# ============================================================
-
-def get_live_candle(
-    logical_pair: str,
-) -> Tuple[
-    Optional[str],
-    Optional[Dict[str, Any]],
-]:
-
-    if IQ is None:
-        return None, None
-
-    api_pair = ACTIVE_API_PAIR.get(
-        logical_pair
-    )
-
-    if not api_pair:
-
-        api_pair, _ = (
-            get_pair_candles(
-                logical_pair
-            )
-        )
-
-    if not api_pair:
-        return None, None
-
-    try:
-
-        candles = (
-            IQ.get_realtime_candles(
-                api_pair,
-                TIMEFRAME,
-            )
-        )
-
-        if not candles:
-            return api_pair, None
-
-        if isinstance(
-            candles,
-            dict,
-        ):
-
-            latest_key = max(
-                candles.keys(),
-                key=lambda x: float(x),
-            )
-
-            raw = candles[
-                latest_key
-            ]
-
-        else:
-
-            return api_pair, None
-
-        normalized = (
-            normalize_stream_candle(
-                raw
-            )
-        )
-
-        return (
-            api_pair,
-            normalized,
-        )
-
-    except Exception as e:
-
-        logging.debug(
-            "Error stream %s: %s",
-            api_pair,
-            e,
-        )
-
-        return api_pair, None
-
-
-# ============================================================
-# TIMESTAMP DE VELA
-# ============================================================
-
-def candle_timestamp(
-    candle: Dict[str, Any],
-) -> int:
-
-    for key in (
-        "from",
-        "at",
-    ):
-
-        value = candle.get(
-            key
-        )
-
-        if value is not None:
-
-            try:
-
-                return int(
-                    float(value)
-                )
-
-            except Exception:
-                pass
-
-    return int(
-        time.time()
-        // TIMEFRAME
-    ) * TIMEFRAME
-
-
-# ============================================================
-# HISTORIAL PARA ANÁLISIS
-# ============================================================
-
-def get_history_for_analysis(
-    logical_pair: str,
-) -> Optional[pd.DataFrame]:
-
-    api_pair, df = get_pair_candles(
-        logical_pair
-    )
-
-    if (
-        api_pair is None
-        or df is None
-        or df.empty
-    ):
-        return None
-
-    closed = get_closed_candles(
-        df
-    )
-
-    if len(closed) < 22:
-        return None
-
-    return closed.tail(
-        CANDLE_COUNT
-    ).reset_index(
-        drop=True
-    )
-
-
-# ============================================================
-# ANALIZAR M1 EN VIVO
-# ============================================================
-
-def analyze_live_pair(
-    logical_pair: str,
-) -> Optional[Dict[str, Any]]:
-
-    api_pair, live_candle = (
-        get_live_candle(
-            logical_pair
-        )
-    )
-
-    if (
-        api_pair is None
-        or live_candle is None
-    ):
-        return None
-
-    history = (
-        get_history_for_analysis(
-            logical_pair
-        )
-    )
-
-    if history is None:
-        return None
-
-    ts = candle_timestamp(
-        live_candle
-    )
-
-    elapsed = (
-        time.time()
-        - ts
-    )
-
-    elapsed = max(
-        0.0,
-        min(
-            elapsed,
-            60.0,
-        ),
-    )
-
-    analysis = analyze_live_candle(
-        candle_1m=live_candle,
-        previous_m1=history,
-        pair=logical_pair,
-        elapsed_seconds=elapsed,
-    )
-
-    analysis[
-        "logical_pair"
-    ] = logical_pair
-
-    analysis[
-        "api_pair"
-    ] = api_pair
-
-    analysis[
-        "candle_timestamp"
-    ] = ts
-
-    return analysis
-
-
-# ============================================================
-# ANALIZAR TODOS LOS PARES EN VIVO
-# ============================================================
-
-def analyze_all_pairs_live() -> Dict[
-    str,
-    Dict[str, Any],
-]:
-
-    results = {}
-
-    for logical_pair in PAIRS:
-
-        try:
-
-            analysis = (
-                analyze_live_pair(
-                    logical_pair
-                )
-            )
-
-            if analysis is not None:
-
-                results[
-                    logical_pair
-                ] = analysis
-
-                LIVE_M1_STATE[
-                    logical_pair
-                ] = analysis
-
-        except Exception as e:
-
-            logging.debug(
-                "Error análisis vivo %s: %s",
-                logical_pair,
-                e,
-            )
-
-    return results
-
-
-# ============================================================
-# REGISTRAR CAMBIO DE VELA
-# ============================================================
-
-def detect_new_minute(
-    analysis: Dict[str, Any],
-) -> bool:
-
-    logical_pair = analysis[
-        "logical_pair"
-    ]
-
-    ts = int(
-        analysis[
-            "candle_timestamp"
-        ]
-    )
-
-    previous_ts = (
-        LAST_CLOSED_M1.get(
-            logical_pair
-        )
-    )
-
-    if previous_ts is None:
-
-        LAST_CLOSED_M1[
-            logical_pair
-        ] = ts
-
-        return False
-
-    if ts > previous_ts:
-
-        LAST_CLOSED_M1[
-            logical_pair
-        ] = ts
-
-        return True
-
-    return False
-
-
-# ============================================================
-# OBTENER VELA CERRADA
-# ============================================================
-
-def get_closed_candle_after_boundary(
-    logical_pair: str,
-    closed_timestamp: int,
-) -> Optional[
-    Tuple[
-        str,
-        pd.Series,
-        pd.DataFrame,
-    ]
-]:
-
-    api_pair, df = get_pair_candles(
-        logical_pair
-    )
-
-    if (
-        api_pair is None
-        or df is None
-        or df.empty
-    ):
-        return None
-
-    closed = get_closed_candles(
-        df
-    )
-
-    if closed.empty:
-        return None
-
-    selected = None
-
-    if "from" in closed.columns:
-
-        timestamps = pd.to_numeric(
-            closed["from"],
-            errors="coerce",
-        )
-
-        matches = closed[
-            timestamps
-            == float(
-                closed_timestamp
-            )
-        ]
-
-        if not matches.empty:
-
-            selected = matches.iloc[
-                -1
-            ]
-
-    if selected is None:
-
-        selected = closed.iloc[
-            -1
-        ]
-
-    return (
-        api_pair,
-        selected,
-        closed,
-    )
-
-
-# ============================================================
-# ANALIZAR VELA CERRADA + 12 VELAS DE 5 SEGUNDOS
-# ============================================================
-
-def analyze_closed_pair(
-    logical_pair: str,
-    closed_timestamp: int,
-) -> Optional[
-    Dict[str, Any]
-]:
-
-    data = (
-        get_closed_candle_after_boundary(
-            logical_pair,
-            closed_timestamp,
-        )
-    )
-
-    if data is None:
-        return None
-
-    api_pair, candle, history = data
-
-    if len(history) < 22:
-        return None
-
-    # --------------------------------------------------------
-    # OBTENER EXACTAMENTE LAS 12 VELAS DE 5s
-    # PERTENECIENTES A LA M1 CERRADA
-    # --------------------------------------------------------
-
-    candles_5s = (
-        get_5s_candles_for_minute(
-            logical_pair,
-            closed_timestamp,
-        )
-    )
-
-    if candles_5s is None:
-
-        logging.warning(
-            (
-                "Sin 12 velas 5s completas | "
-                "%s | M1=%s | "
-                "NO se genera operación"
-            ),
-            logical_pair,
-            closed_timestamp,
-        )
-
-        return None
-
-    if len(candles_5s) != FIVE_SECOND_COUNT:
-
-        logging.warning(
-            (
-                "Cantidad 5s incorrecta | "
-                "%s | %s/12"
-            ),
-            logical_pair,
-            len(candles_5s),
-        )
-
-        return None
-
-    try:
-
-        result = analyze_market(
-            candle_1m=candle,
-            previous_m1=history,
-            pair=logical_pair,
-            candles_5s=candles_5s,
-        )
-
-    except Exception as e:
-
-        logging.error(
-            "Error estrategia cerrada %s: %s",
-            logical_pair,
-            e,
-        )
-
-        return None
-
-    result[
-        "logical_pair"
-    ] = logical_pair
-
-    result[
-        "api_pair"
-    ] = api_pair
-
-    result[
-        "candle_timestamp"
-    ] = closed_timestamp
-
-    result[
-        "five_second_count"
-    ] = len(candles_5s)
-
-    return result
-
-
-# ============================================================
-# BUSCAR TODAS LAS OPERACIONES VÁLIDAS
-# ============================================================
-
-def find_valid_trades(
-    closed_timestamp: int,
-) -> list:
-
-    candidates = []
-
-    for logical_pair in PAIRS:
-
-        result = (
-            analyze_closed_pair(
-                logical_pair,
-                closed_timestamp,
-            )
-        )
-
-        if not result:
-            continue
-
-        if not result.get(
-            "valid"
-        ):
-            continue
-
-        signal = result.get(
-            "signal"
-        )
-
-        if signal not in (
-            "call",
-            "put",
-        ):
-            continue
-
-        score = int(
-            result.get(
-                "score",
-                0,
-            )
-        )
-
-        candidates.append(
-            result
-        )
-
-        micro = result.get(
-            "micro_analysis",
-            {},
-        )
-
-        logging.info(
-            (
-                "%s | %s | "
-                "score=%s | "
-                "5s=%s | "
-                "pattern=%s"
-            ),
-            logical_pair,
-            signal,
-            score,
-            micro.get(
-                "direction",
-                "NEUTRAL",
-            ),
-            result.get(
-                "pattern",
-                "UNKNOWN",
-            ),
-        )
-
-    candidates.sort(
-        key=lambda x: int(
-            x.get(
-                "score",
-                0,
-            )
-        ),
-        reverse=True,
-    )
-
-    return candidates
-
-
-# ============================================================
-# COMPATIBILIDAD CON find_best_trade
-# ============================================================
-
-def find_best_trade(
-    closed_timestamp: int,
-) -> Optional[
-    Dict[str, Any]
-]:
-
-    trades = find_valid_trades(
-        closed_timestamp
-    )
-
-    if not trades:
-        return None
-
-    return trades[0]
-
-
-# ============================================================
-# EJECUTAR
-# ============================================================
-
-def execute_trade(
-    trade: Dict[str, Any],
-) -> bool:
-
-    if IQ is None:
-        return False
-
-    if (
-        len(OPEN_TRADES)
-        >= MAX_OPEN_TRADES
-    ):
-
-        logging.info(
-            "Máximo de operaciones abiertas"
-        )
-
-        return False
-
-    logical_pair = trade[
-        "logical_pair"
-    ]
-
-    api_pair = trade[
-        "api_pair"
-    ]
-
-    signal = trade[
-        "signal"
-    ]
-
-    score = trade.get(
-        "score",
-        0,
-    )
-
-    pattern = trade.get(
-        "pattern",
-        "UNKNOWN",
-    )
-
-    candle_timestamp = trade[
-        "candle_timestamp"
-    ]
-
-    if LAST_TRADED_CANDLE.get(
-        logical_pair
-    ) == candle_timestamp:
-
-        logging.info(
-            "La vela ya fue operada: %s",
-            logical_pair,
-        )
-
-        return False
-
-    amount = min(
-        float(CURRENT_AMOUNT),
-        float(MAX_AMOUNT),
-    )
-
-    try:
-
-        telegram_send(
-            "✅ CONFIRMACIÓN COMPLETA\n\n"
-            f"📊 Par: {api_pair}\n"
-            f"🎯 Dirección: "
-            f"{signal.upper()}\n"
-            f"🧠 Patrón: {pattern}\n"
-            f"⭐ Score: {score}/100\n"
-            "📡 12 velas de 5s analizadas\n"
-            "🚀 Preparando ejecución en N+1...",
-            (
-                f"confirmation_"
-                f"{logical_pair}_"
-                f"{candle_timestamp}"
-            ),
-            force=True,
-        )
-
-        logging.info(
-            "COMPRA | %s | %s | score=%s",
-            api_pair,
-            signal,
-            score,
-        )
-
-        ok, order_id = IQ.buy(
-            amount,
-            api_pair,
-            signal,
-            EXPIRATION,
-        )
-
-        if not ok:
-
-            logging.warning(
-                "Compra rechazada: %s",
-                api_pair,
-            )
-
+        if IQ is None:
+            return connect_iq()
+        if IQ.check_connect():
+            return True
+
+        logger.warning("Conexión perdida. Reconectando...")
+        connected, reason = IQ.connect()
+        if not connected:
+            logger.error("No se pudo reconectar: %s", reason)
             return False
 
-        LAST_TRADED_CANDLE[
-            logical_pair
-        ] = candle_timestamp
-
-        expiry_timestamp = (
-            int(time.time())
-            + (
-                EXPIRATION
-                * 60
-            )
-        )
-
-        OPEN_TRADES[
-            order_id
-        ] = {
-            "pair": logical_pair,
-            "api_pair": api_pair,
-            "signal": signal,
-            "pattern": pattern,
-            "score": score,
-            "amount": amount,
-            "expiry": expiry_timestamp,
-            "created": int(
-                time.time()
-            ),
-        }
-
-        telegram_send(
-            "🚀 OPERACIÓN EJECUTADA\n\n"
-            f"📊 Par: {api_pair}\n"
-            f"🎯 Señal: "
-            f"{signal.upper()}\n"
-            f"🧠 Patrón: {pattern}\n"
-            f"⭐ Score: {score}/100\n"
-            f"💵 Monto: "
-            f"${amount:.2f}\n"
-            f"⏱ Expiración: "
-            f"{EXPIRATION}m",
-            f"trade_{order_id}",
-            force=True,
-        )
-
+        STREAM_STARTED.clear()
+        refresh_binary_otc_pairs(force=True)
+        start_realtime_streams()
+        telegram_send("🟢 IQ OPTION RECONectado")
         return True
-
-    except Exception as e:
-
-        logging.exception(
-            "Error ejecutando operación: %s",
-            e,
-        )
-
+    except Exception as exc:
+        logger.error("Error conexión: %s", exc)
         return False
 
 
+def start_realtime_streams() -> None:
+    if IQ is None:
+        return
+    for pair in list(PAIRS):
+        try:
+            if STREAM_STARTED.get(pair):
+                continue
+            IQ.start_candles_stream(pair, TIMEFRAME, REALTIME_MAXDICT)
+            STREAM_STARTED[pair] = True
+            logger.info("%s | stream M1 iniciado", pair)
+        except Exception as exc:
+            STREAM_STARTED[pair] = False
+            logger.warning("%s | stream error: %s", pair, exc)
+
+
+def realtime_dataframe(pair: str) -> pd.DataFrame:
+    if IQ is None:
+        return pd.DataFrame()
+    try:
+        candles = IQ.get_realtime_candles(pair, TIMEFRAME)
+    except Exception:
+        return pd.DataFrame()
+    if not isinstance(candles, dict) or not candles:
+        return pd.DataFrame()
+
+    rows = []
+    for key, candle in candles.items():
+        if not isinstance(candle, dict):
+            continue
+        try:
+            ts = int(float(candle.get("from", key)))
+            rows.append({
+                "from": ts,
+                "open": float(candle["open"]),
+                "high": float(candle.get("max", candle.get("high"))),
+                "low": float(candle.get("min", candle.get("low"))),
+                "close": float(candle["close"]),
+            })
+        except Exception:
+            continue
+
+    if not rows:
+        return pd.DataFrame()
+    df = pd.DataFrame(rows).drop_duplicates("from", keep="last").sort_values("from")
+    return df.tail(CANDLE_COUNT).reset_index(drop=True)
+
+
+def get_closed_candles(pair: str) -> Optional[pd.DataFrame]:
+    if IQ is None:
+        return None
+    try:
+        candles = IQ.get_candles(pair, TIMEFRAME, CANDLE_COUNT, get_iq_server_timestamp())
+        if not candles:
+            return None
+        df = pd.DataFrame(candles).rename(columns={"max": "high", "min": "low"})
+        required = ["from", "open", "high", "low", "close"]
+        if not all(c in df.columns for c in required):
+            return None
+        for col in required:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+        df.dropna(subset=required, inplace=True)
+        df["from"] = df["from"].astype(int)
+        return df.drop_duplicates("from", keep="last").sort_values("from").tail(CANDLE_COUNT).reset_index(drop=True)
+    except Exception as exc:
+        logger.debug("%s | historial: %s", pair, exc)
+        return None
+
+
+def get_row_by_ts(df: pd.DataFrame, ts: int) -> Optional[pd.Series]:
+    if df is None or df.empty or "from" not in df.columns:
+        return None
+    rows = df[df["from"].astype(int) == int(ts)]
+    return rows.iloc[-1] if not rows.empty else None
+
+
+def candle_values(row: pd.Series) -> Dict[str, float]:
+    return {k: float(row[k]) for k in ("open", "high", "low", "close")}
+
+
 # ============================================================
-# RESULTADOS
+# ANÁLISIS Y TELEGRAM DE DIVERGENCIA
 # ============================================================
 
-def check_results() -> None:
+def divergence_message(pair: str, ts: int, result: Dict[str, Any]) -> str:
+    div = result.get("analysis", {}).get("divergence", {})
+    bull = bool(div.get("bullish"))
+    bear = bool(div.get("bearish"))
+    if bull:
+        side = "🟢 DIVERGENCIA ALCISTA"
+        p1 = div.get("previous_low")
+        p2 = div.get("current_low")
+        r1 = div.get("previous_low_rsi")
+        r2 = div.get("current_low_rsi")
+        score = div.get("bullish_score", 0)
+        details = f"Precio: {p2} < {p1}\nRSI: {r2:.2f} > {r1:.2f}"
+    else:
+        side = "🔴 DIVERGENCIA BAJISTA"
+        p1 = div.get("previous_high")
+        p2 = div.get("current_high")
+        r1 = div.get("previous_high_rsi")
+        r2 = div.get("current_high_rsi")
+        score = div.get("bearish_score", 0)
+        details = f"Precio: {p2} > {p1}\nRSI: {r2:.2f} < {r1:.2f}"
 
+    c = result.get("analysis", {}).get("candle", {})
+    cond = result.get("analysis", {}).get("conditions", {})
+    return (
+        f"{side}\n\n"
+        f"Par: {pair}\n"
+        f"Vela N: {ts}\n"
+        f"Score divergencia: {score}/100\n\n"
+        f"{details}\n\n"
+        f"RSI diferencia: {div.get('bull_rsi_difference', div.get('bear_rsi_difference', 0)):.2f}\n"
+        f"Apertura N: {c.get('open')}\n"
+        f"Máximo N: {c.get('high')}\n"
+        f"Mínimo N: {c.get('low')}\n"
+        f"Cierre N: {c.get('close')}\n"
+        f"Cuerpo: {c.get('body_percent', 0):.1f}%\n"
+        f"Posición cierre: {c.get('close_position', 0):.1f}%\n\n"
+        f"Vela anterior fuerte: {'✅' if cond.get('previous_strong') else '❌'}\n"
+        f"Vela descanso: {'✅' if cond.get('current_rest') else '❌'}\n"
+        f"Recuperación/rechazo: {'✅' if (cond.get('bull_recovery') or cond.get('bear_recovery')) else '❌'}\n"
+        f"Dominancia: {'✅' if (cond.get('bull_dominance') or cond.get('bear_dominance')) else '❌'}\n\n"
+        f"Resultado: {result.get('reason')}"
+    )
+
+
+def analyze_closed_candle(pair: str, expected_closed_ts: int) -> bool:
+    realtime = realtime_dataframe(pair)
+    closed_row = get_row_by_ts(realtime, expected_closed_ts)
+    df = realtime
+
+    if closed_row is None:
+        df = get_closed_candles(pair)
+        if df is not None:
+            closed_row = get_row_by_ts(df, expected_closed_ts)
+
+    if closed_row is None or df is None or len(df) < 25:
+        return False
+
+    df = df[df["from"].astype(int) <= expected_closed_ts].copy().reset_index(drop=True)
+    if len(df) < 22:
+        return False
+
+    result = analyze_market(
+        candle_1m=closed_row.to_dict(),
+        previous_m1=df.iloc[:-1].copy(),
+        pair=pair,
+    )
+
+    div = result.get("analysis", {}).get("divergence", {})
+    has_divergence = bool(div.get("bullish") or div.get("bearish"))
+
+    if has_divergence and LAST_DIVERGENCE_NOTICE.get(pair) != expected_closed_ts:
+        LAST_DIVERGENCE_NOTICE[pair] = expected_closed_ts
+        msg = divergence_message(pair, expected_closed_ts, result)
+        logger.info("%s", msg.replace("\n", " | "))
+        telegram_send(msg)
+
+    signal = result.get("signal")
+    score = int(result.get("score") or 0)
+    values = candle_values(closed_row)
+
+    logger.info(
+        "%s | N CERRADA | signal=%s | score=%s | %s",
+        pair, signal, score, result.get("reason"),
+    )
+
+    if signal not in ("call", "put"):
+        return True
+
+    execution_ts = int(expected_closed_ts + TIMEFRAME)
+    with STATE_LOCK:
+        PENDING_ENTRY[pair] = {
+            "signal": signal,
+            "score": score,
+            "continuity_ts": int(expected_closed_ts),
+            "execution_ts": execution_ts,
+            "open": values["open"],
+            "high": values["high"],
+            "low": values["low"],
+            "close": values["close"],
+            "reason": result.get("reason", ""),
+            "analysis": result.get("analysis", {}),
+            "created_at": time.time(),
+        }
+        LIVE_STATE[pair] = dict(PENDING_ENTRY[pair])
+
+    side = "CALL 🟢" if signal == "call" else "PUT 🔴"
+    telegram_send(
+        "🎯 SEÑAL COMPLETA — ENTRADA ARMADA\n\n"
+        f"Par: {pair}\n"
+        f"Dirección: {side}\n"
+        f"Score divergencia: {score}/100\n\n"
+        f"N cierre: {values['close']}\n"
+        f"N+1: {execution_ts}\n"
+        "🚫 N no se opera.\n"
+        "⚡ SNIPER: ejecutar al abrir N+1.\n"
+        "⏳ Expiración: 5 minutos\n\n"
+        f"{result.get('reason', '')}"
+    )
+    return True
+
+
+# ============================================================
+# SNIPER
+# ============================================================
+
+def cooldown_active(pair: str) -> bool:
+    return time.time() - LAST_TRADE_TIME.get(pair, 0.0) < TRADE_COOLDOWN
+
+
+def buy_binary(pair: str, signal: str) -> Tuple[bool, Optional[Any]]:
+    if IQ is None or signal not in ("call", "put"):
+        return False, None
+    try:
+        result = IQ.buy(AMOUNT, pair, signal, EXPIRATION)
+        if isinstance(result, tuple):
+            return (bool(result[0]), result[1] if len(result) > 1 else None)
+        if result not in (None, False, "error", -1):
+            return True, result
+        return False, result
+    except Exception as exc:
+        logger.error("%s | buy error: %s", pair, exc)
+        return False, None
+
+
+def execute_sniper(pair: str, pending: Dict[str, Any]) -> bool:
+    execution_ts = int(pending["execution_ts"])
+    signal = str(pending["signal"])
+
+    now = get_iq_server_timestamp()
+    current_ts = floor_candle_timestamp(now)
+    if current_ts < execution_ts:
+        return False
+    if current_ts > execution_ts:
+        with STATE_LOCK:
+            PENDING_ENTRY.pop(pair, None)
+        telegram_send(
+            "⚠️ SNIPER DESCARTADO\n\n"
+            f"Par: {pair}\n"
+            f"N+1 objetivo: {execution_ts}\n"
+            f"Minuto actual: {current_ts}\n"
+            "La señal no se trasladó a otra vela."
+        )
+        return False
+
+    if LAST_TRADE_CANDLE.get(pair) == execution_ts or cooldown_active(pair):
+        return False
+
+    # Verificación final del reloj justo antes de enviar.
+    now2 = get_iq_server_timestamp()
+    if floor_candle_timestamp(now2) != execution_ts:
+        return False
+
+    telegram_send(
+        "⚡ SNIPER EJECUTANDO\n\n"
+        f"Par: {pair}\n"
+        f"Dirección: {signal.upper()}\n"
+        f"N cierre: {pending['close']}\n"
+        f"N+1 timestamp: {execution_ts}\n"
+        f"Reloj IQ: {now2:.3f}\n"
+        "⏳ Expiración: 5 minutos"
+    )
+
+    sent_at = get_iq_server_timestamp()
+    ok, order_id = buy_binary(pair, signal)
+    if not ok:
+        with STATE_LOCK:
+            PENDING_ENTRY.pop(pair, None)
+        telegram_send(
+            "❌ ORDEN BINARY RECHAZADA\n\n"
+            f"Par: {pair}\n"
+            f"Dirección: {signal.upper()}\n"
+            f"N+1: {execution_ts}\n"
+            f"Reloj IQ: {sent_at:.3f}\n"
+            "La señal no se trasladará a otra vela."
+        )
+        return False
+
+    LAST_TRADE_TIME[pair] = time.time()
+    LAST_TRADE_CANDLE[pair] = execution_ts
+    with STATE_LOCK:
+        PENDING_ENTRY.pop(pair, None)
+
+    telegram_send(
+        "✅ SNIPER EJECUTADO\n\n"
+        f"Par: {pair}\n"
+        f"Dirección: {signal.upper()}\n"
+        f"N cierre: {pending['close']}\n"
+        f"N+1: {execution_ts}\n"
+        f"Reloj envío IQ: {sent_at:.3f}\n"
+        f"ID: {order_id}\n\n"
+        "⚡ Entrada inmediata N+1\n"
+        "⏳ Expiración: 5 minutos"
+    )
+    logger.info(
+        "%s | SNIPER EJECUTADO | %s | N=%s | N+1=%s | ID=%s",
+        pair, signal.upper(), pending["continuity_ts"], execution_ts, order_id,
+    )
+    return True
+
+
+# ============================================================
+# MOTOR POR PAR
+# ============================================================
+
+def process_pair(pair: str) -> None:
     if IQ is None:
         return
 
-    now = int(
-        time.time()
-    )
+    server_now = get_iq_server_timestamp()
+    current_ts = floor_candle_timestamp(server_now)
+    closed_ts = current_ts - TIMEFRAME
 
-    for order_id, trade in list(
-        OPEN_TRADES.items()
-    ):
+    state = LIVE_STATE.get(pair)
+    if state is None or int(state.get("timestamp", -1)) != closed_ts:
+        analyze_closed_candle(pair, closed_ts)
 
-        if now < (
-            trade["expiry"]
-            + RESULT_CHECK_DELAY
-        ):
-            continue
+    pending = PENDING_ENTRY.get(pair)
+    if pending is None:
+        return
+    if int(pending["execution_ts"]) != current_ts:
+        return
 
+    execute_sniper(pair, pending)
+
+
+def analyze_all_pairs() -> None:
+    if not BOT_RUNNING:
+        return
+    refresh_binary_otc_pairs()
+    for pair in list(PAIRS):
+        if not BOT_RUNNING:
+            return
         try:
-
-            result = IQ.check_win_v4(
-                order_id
-            )
-
-            if result is None:
-                continue
-
-            profit = float(
-                result
-            )
-
-            update_amount(
-                profit
-            )
-
-            if profit > 0:
-                outcome = "WIN 🟢"
-
-            elif profit < 0:
-                outcome = "LOSS 🔴"
-
-            else:
-                outcome = "DRAW 🟡"
-
-            telegram_send(
-                "📊 RESULTADO\n\n"
-                f"📈 {trade['api_pair']}\n"
-                f"🎯 {trade['signal'].upper()}\n"
-                f"🧠 {trade['pattern']}\n"
-                f"🏁 {outcome}\n"
-                f"💰 Resultado: "
-                f"${profit:.2f}\n\n"
-                f"📈 WIN STREAK: "
-                f"{WIN_STREAK}\n"
-                f"📉 LOSS STREAK: "
-                f"{LOSS_STREAK}\n"
-                f"💵 Próximo monto: "
-                f"${CURRENT_AMOUNT:.2f}",
-                f"result_{order_id}",
-                force=True,
-            )
-
-            logging.info(
-                "Resultado %s: %.2f",
-                order_id,
-                profit,
-            )
-
-            del OPEN_TRADES[
-                order_id
-            ]
-
-        except Exception as e:
-
-            logging.error(
-                "Error resultado %s: %s",
-                order_id,
-                e,
-            )
+            process_pair(pair)
+        except Exception:
+            logger.exception("Error procesando %s", pair)
 
 
 # ============================================================
@@ -1792,290 +691,67 @@ def check_results() -> None:
 # ============================================================
 
 def main() -> None:
-
     global BOT_RUNNING
-    global STREAMS_STARTED
 
-    if not connect():
+    logger.info("========================================")
+    logger.info("BOT BINARY OTC - DIVERGENCIA RSI")
+    logger.info("MODO SNIPER - EXPIRACION 5 MINUTOS")
+    logger.info("TIMEFRAME M1")
+    logger.info("MAX OTC: %d", MAX_OTC_PAIRS)
+    logger.info("AMOUNT: %s", AMOUNT)
+    logger.info("========================================")
 
-        logging.error(
-            "No fue posible iniciar"
-        )
-
+    required = {
+        "IQ_EMAIL": IQ_EMAIL,
+        "IQ_PASSWORD": IQ_PASSWORD,
+        "TELEGRAM_TOKEN": TELEGRAM_TOKEN,
+        "TELEGRAM_CHAT_ID": TELEGRAM_CHAT_ID,
+    }
+    missing = [k for k, v in required.items() if not v]
+    if missing:
+        logger.error("Faltan variables: %s", ", ".join(missing))
         return
 
-    if (
-        TELEGRAM_TOKEN
-        and TELEGRAM_CHAT_ID
-    ):
+    threading.Thread(target=telegram_command_loop, daemon=True).start()
 
-        threading.Thread(
-            target=telegram_worker,
-            daemon=True,
-        ).start()
+    try:
+        connect_iq()
+    except Exception as exc:
+        logger.exception("No se pudo iniciar IQ Option")
+        telegram_send(f"❌ ERROR DE CONEXIÓN\n\n{exc}")
+        return
 
-    logging.info(
-        "Bot iniciado"
+    BOT_RUNNING = False
+    telegram_send(
+        "🤖 BOT LISTO\n\n"
+        "🧠 DESCANSO + DIVERGENCIA RSI ESTRUCTURAL\n"
+        "🔎 Analiza todos los OTC BINARY disponibles dentro del límite configurado.\n"
+        "📌 La señal se decide al cierre de N.\n"
+        "🚫 N nunca se opera.\n"
+        "⚡ N+1 se ejecuta en modo SNIPER.\n"
+        "⏳ Expiración: 5 minutos.\n\n"
+        "Usa /start para activar."
     )
 
     while True:
-
         try:
-
-            if not ensure_connection():
-
-                time.sleep(3)
-
-                continue
-
-            check_results()
-
             if not BOT_RUNNING:
-
+                time.sleep(0.25)
+                continue
+            if not ensure_connection():
                 time.sleep(1)
-
                 continue
-
-            if not STREAMS_STARTED:
-
-                start_streams()
-
-                time.sleep(2)
-
-                continue
-
-            # ------------------------------------------------
-            # ANALIZAR TODAS LAS M1 EN VIVO
-            # ------------------------------------------------
-
-            live_results = (
-                analyze_all_pairs_live()
-            )
-
-            # ------------------------------------------------
-            # DETECTAR CAMBIO DE M1
-            # ------------------------------------------------
-
-            new_candles = []
-
-            for logical_pair, analysis in (
-                live_results.items()
-            ):
-
-                if detect_new_minute(
-                    analysis
-                ):
-
-                    new_candles.append(
-                        (
-                            logical_pair,
-                            int(
-                                analysis[
-                                    "candle_timestamp"
-                                ]
-                            ),
-                        )
-                    )
-
-                elapsed = float(
-                    analysis.get(
-                        "elapsed_seconds",
-                        0,
-                    )
-                )
-
-                second_bucket = int(
-                    elapsed
-                    // 10
-                )
-
-                previous_bucket = (
-                    LAST_LIVE_LOG_SECOND.get(
-                        logical_pair
-                    )
-                )
-
-                if (
-                    previous_bucket
-                    != second_bucket
-                ):
-
-                    LAST_LIVE_LOG_SECOND[
-                        logical_pair
-                    ] = second_bucket
-
-                    logging.info(
-                        (
-                            "LIVE | %s | "
-                            "%.0fs | "
-                            "O=%.5f "
-                            "H=%.5f "
-                            "L=%.5f "
-                            "C=%.5f | "
-                            "DIR=%s | "
-                            "CALL=%s | "
-                            "PUT=%s"
-                        ),
-                        logical_pair,
-                        elapsed,
-                        analysis.get(
-                            "open",
-                            0,
-                        ),
-                        analysis.get(
-                            "high",
-                            0,
-                        ),
-                        analysis.get(
-                            "low",
-                            0,
-                        ),
-                        analysis.get(
-                            "close",
-                            0,
-                        ),
-                        analysis.get(
-                            "direction",
-                            "NEUTRAL",
-                        ),
-                        analysis.get(
-                            "bullish_score",
-                            0,
-                        ),
-                        analysis.get(
-                            "bearish_score",
-                            0,
-                        ),
-                    )
-
-            # ------------------------------------------------
-            # PROCESAR CADA M1 QUE ACABA DE CERRAR
-            # ------------------------------------------------
-
-            for (
-                logical_pair,
-                live_timestamp,
-            ) in new_candles:
-
-                closed_timestamp = (
-                    live_timestamp
-                    - TIMEFRAME
-                )
-
-                logging.info(
-                    (
-                        "CIERRE M1 | %s | "
-                        "timestamp=%s | "
-                        "analizando 12 velas 5s..."
-                    ),
-                    logical_pair,
-                    closed_timestamp,
-                )
-
-                # ------------------------------------------------
-                # Pequeña espera para asegurar publicación
-                # de la M1 cerrada y las 5s.
-                # ------------------------------------------------
-
-                time.sleep(
-                    0.25
-                )
-
-                trades = (
-                    find_valid_trades(
-                        closed_timestamp
-                    )
-                )
-
-                if not trades:
-
-                    logging.info(
-                        (
-                            "No hay operación válida | "
-                            "%s | M1=%s"
-                        ),
-                        logical_pair,
-                        closed_timestamp,
-                    )
-
-                    continue
-
-                # ------------------------------------------------
-                # IMPORTANTE:
-                #
-                # Se mantiene MAX_OPEN_TRADES = 1.
-                # Por eso se ejecuta únicamente la mejor
-                # señal disponible cuando hay varias.
-                # ------------------------------------------------
-
-                best_trade = trades[0]
-
-                logging.info(
-                    (
-                        "MEJOR OPORTUNIDAD | "
-                        "%s | %s | "
-                        "score=%s | "
-                        "5s=%s"
-                    ),
-                    best_trade[
-                        "api_pair"
-                    ],
-                    best_trade[
-                        "signal"
-                    ],
-                    best_trade[
-                        "score"
-                    ],
-                    best_trade.get(
-                        "five_second_count",
-                        0,
-                    ),
-                )
-
-                # ------------------------------------------------
-                # EJECUCIÓN AL INICIO DE N+1
-                # ------------------------------------------------
-
-                execute_trade(
-                    best_trade
-                )
-
-            # ------------------------------------------------
-            # RESULTADOS
-            # ------------------------------------------------
-
-            check_results()
-
-            time.sleep(
-                POLL_INTERVAL
-            )
-
+            analyze_all_pairs()
+            time.sleep(SNIPER_POLL)
         except KeyboardInterrupt:
-
-            logging.info(
-                "Bot detenido manualmente"
-            )
-
             BOT_RUNNING = False
-
+            telegram_send("🔴 BOT DETENIDO MANUALMENTE")
             break
+        except Exception as exc:
+            logger.exception("Error principal")
+            telegram_send(f"⚠️ ERROR EN BOT\n\n{exc}")
+            time.sleep(1)
 
-        except Exception as e:
-
-            logging.exception(
-                "Error en loop principal: %s",
-                e,
-            )
-
-            STREAMS_STARTED = False
-
-            time.sleep(2)
-
-
-# ============================================================
-# START
-# ============================================================
 
 if __name__ == "__main__":
-
     main()
