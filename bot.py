@@ -10,6 +10,54 @@ import pandas as pd
 import requests
 from iqoptionapi.stable_api import IQ_Option
 
+
+# ============================================================
+# COMPATIBILIDAD IQOPTIONAPI - BINARY OTC
+# ============================================================
+# Algunas versiones de iqoptionapi lanzan durante connect() un
+# hilo interno llamado __get_digital_open. Ese hilo consulta
+# get_digital_underlying_list_data() y, cuando IQ Option devuelve
+# None, termina con:
+# TypeError: 'NoneType' object is not subscriptable
+#
+# Este bot SOLO utiliza BINARY OTC, por lo que no necesita ese
+# proceso DIGITAL. Se desactiva a nivel de clase ANTES de crear
+# la instancia IQ_Option, evitando que el hilo se inicie.
+_ORIGINAL_GET_DIGITAL_UNDERLYING = IQ_Option.get_digital_underlying_list_data
+
+
+def _safe_get_digital_underlying_list_data(self):
+    """Evita el TypeError cuando iqoptionapi devuelve None."""
+    try:
+        result = _ORIGINAL_GET_DIGITAL_UNDERLYING(self)
+        if not isinstance(result, dict):
+            return {"underlying": []}
+        underlying = result.get("underlying")
+        if not isinstance(underlying, list):
+            result["underlying"] = []
+        return result
+    except Exception:
+        return {"underlying": []}
+
+
+def _disabled_digital_open(self) -> None:
+    return None
+
+# Correccion robusta: si la libreria intenta consultar DIGITAL y la
+# respuesta es None, nunca se propaga None al codigo que hace
+# ["underlying"]. Ademas, el worker DIGITAL queda desactivado.
+setattr(
+    IQ_Option,
+    "get_digital_underlying_list_data",
+    _safe_get_digital_underlying_list_data,
+)
+setattr(
+    IQ_Option,
+    "_IQ_Option__get_digital_open",
+    _disabled_digital_open,
+)
+
+
 from strategy import analyze_market
 
 
@@ -484,10 +532,10 @@ def _binary_assets_from_init_v2() -> list[str]:
 
 def discover_binary_otc_pairs() -> list[str]:
 
-    pairs = _binary_open_pairs_from_open_time()
-
-    if not pairs:
-        pairs = _binary_assets_from_init_v2()
+    # No usar get_all_open_time(): en varias versiones de
+    # iqoptionapi esa función también consulta DIGITAL y puede
+    # provocar el mismo error de NoneType.
+    pairs = _binary_assets_from_init_v2()
 
     return sorted(
         set(
