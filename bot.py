@@ -20,11 +20,8 @@ from strategy import analyze_market
 # FLUJO:
 #
 # 1. Descubre todos los pares OTC Binary disponibles.
-#
 # 2. Cada par se analiza en M1.
-#
 # 3. Se espera el cierre completo de N.
-#
 # 4. Se analiza:
 #       - OHLC
 #       - cuerpo
@@ -39,14 +36,10 @@ from strategy import analyze_market
 #       - rechazo
 #       - recuperación
 #       - dominancia
-#
 # 5. Si existe señal confirmada:
-#
 #       N = análisis
 #       N+1 = ejecución
-#
 # 6. N+1 NO participa en la decisión.
-#
 # 7. Expiración = 5 minutos.
 # ============================================================
 
@@ -62,36 +55,32 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 TIMEFRAME = 60
-
 EXPIRATION = 5
 
 AMOUNT = float(
     os.getenv(
         "AMOUNT",
-        "10"
+        "10",
     )
 )
 
 CANDLE_COUNT = int(
     os.getenv(
         "CANDLE_COUNT",
-        "60"
+        "60",
     )
 )
 
 MAX_OTC_PAIRS = int(
     os.getenv(
         "MAX_OTC_PAIRS",
-        "50"
+        "50",
     )
 )
 
 PAIR_REFRESH_SECONDS = 60.0
-
 SNIPER_POLL = 0.02
-
 REALTIME_MAXDICT = 100
-
 TRADE_COOLDOWN = 60.0
 
 
@@ -107,35 +96,17 @@ PAIRS: list[str] = []
 
 LAST_PAIR_REFRESH = 0.0
 
-LIVE_STATE: Dict[
-    str,
-    Dict[str, Any]
-] = {}
+LIVE_STATE: Dict[str, Dict[str, Any]] = {}
 
-PENDING_ENTRY: Dict[
-    str,
-    Dict[str, Any]
-] = {}
+PENDING_ENTRY: Dict[str, Dict[str, Any]] = {}
 
-LAST_TRADE_TIME: Dict[
-    str,
-    float
-] = {}
+LAST_TRADE_TIME: Dict[str, float] = {}
 
-LAST_TRADE_CANDLE: Dict[
-    str,
-    int
-] = {}
+LAST_TRADE_CANDLE: Dict[str, int] = {}
 
-LAST_DIVERGENCE_NOTICE: Dict[
-    str,
-    int
-] = {}
+LAST_DIVERGENCE_NOTICE: Dict[str, int] = {}
 
-STREAM_STARTED: Dict[
-    str,
-    bool
-] = {}
+STREAM_STARTED: Dict[str, bool] = {}
 
 STATE_LOCK = threading.RLock()
 
@@ -170,7 +141,6 @@ def _telegram_post(
         return False
 
     try:
-
         response = requests.post(
             (
                 "https://api.telegram.org/"
@@ -181,24 +151,18 @@ def _telegram_post(
             timeout=timeout,
         )
 
-        return (
-            response.status_code == 200
-        )
+        return response.status_code == 200
 
     except Exception as exc:
-
         logger.warning(
             "Telegram %s: %s",
             endpoint,
             exc,
         )
-
         return False
 
 
-def telegram_send(
-    message: str,
-) -> None:
+def telegram_send(message: str) -> None:
 
     if (
         not TELEGRAM_TOKEN
@@ -207,14 +171,11 @@ def telegram_send(
         return
 
     def worker() -> None:
-
         _telegram_post(
             "sendMessage",
             {
-                "chat_id":
-                    TELEGRAM_CHAT_ID,
-                "text":
-                    message,
+                "chat_id": TELEGRAM_CHAT_ID,
+                "text": message,
             },
             timeout=3.0,
         )
@@ -243,15 +204,12 @@ def telegram_command_loop() -> None:
     )
 
     while True:
-
         try:
-
             params: Dict[str, Any] = {
-                "timeout": 1
+                "timeout": 1,
             }
 
             if last_update_id is not None:
-
                 params["offset"] = (
                     last_update_id + 1
                 )
@@ -265,23 +223,17 @@ def telegram_command_loop() -> None:
             data = response.json()
 
             if not data.get("ok"):
-
                 time.sleep(0.5)
                 continue
 
             for update in data.get(
                 "result",
-                []
+                [],
             ):
-
-                uid = update.get(
-                    "update_id"
-                )
+                uid = update.get("update_id")
 
                 if uid is not None:
-                    last_update_id = int(
-                        uid
-                    )
+                    last_update_id = int(uid)
 
                 message = (
                     update.get("message")
@@ -291,32 +243,27 @@ def telegram_command_loop() -> None:
                 text = str(
                     message.get(
                         "text",
-                        ""
+                        "",
                     )
                 ).strip().lower()
 
                 chat_id = str(
                     (
-                        message.get(
-                            "chat"
-                        )
+                        message.get("chat")
                         or {}
                     ).get(
                         "id",
-                        ""
+                        "",
                     )
                 )
 
                 if (
                     chat_id
-                    != str(
-                        TELEGRAM_CHAT_ID
-                    )
+                    != str(TELEGRAM_CHAT_ID)
                 ):
                     continue
 
                 if text == "/start":
-
                     BOT_RUNNING = True
 
                     telegram_send(
@@ -335,7 +282,6 @@ def telegram_command_loop() -> None:
                     )
 
                 elif text == "/stop":
-
                     BOT_RUNNING = False
 
                     telegram_send(
@@ -345,12 +291,10 @@ def telegram_command_loop() -> None:
                     )
 
                 elif text == "/status":
-
                     status = (
                         "🟢 ACTIVO"
                         if BOT_RUNNING
-                        else
-                        "🔴 DETENIDO"
+                        else "🔴 DETENIDO"
                     )
 
                     telegram_send(
@@ -369,12 +313,10 @@ def telegram_command_loop() -> None:
                     )
 
         except Exception as exc:
-
             logger.warning(
                 "Telegram commands: %s",
                 exc,
             )
-
             time.sleep(1)
 
 
@@ -382,16 +324,10 @@ def telegram_command_loop() -> None:
 # OTC
 # ============================================================
 
-def _is_otc_pair(
-    value: Any,
-) -> bool:
+def _is_otc_pair(value: Any) -> bool:
 
     try:
-
-        name = str(
-            value
-        ).strip().upper()
-
+        name = str(value).strip().upper()
     except Exception:
         return False
 
@@ -402,29 +338,21 @@ def _is_otc_pair(
     )
 
 
-def _binary_open_pairs_from_open_time(
-) -> list[str]:
+def _binary_open_pairs_from_open_time() -> list[str]:
 
     if IQ is None:
         return []
 
     try:
-
         data = IQ.get_all_open_time()
 
         binary = (
-            data.get(
-                "binary",
-                {}
-            )
+            data.get("binary", {})
             if isinstance(data, dict)
             else {}
         )
 
-        if not isinstance(
-            binary,
-            dict
-        ):
+        if not isinstance(binary, dict):
             return []
 
         result: list[str] = []
@@ -433,10 +361,7 @@ def _binary_open_pairs_from_open_time(
 
             if (
                 not _is_otc_pair(asset)
-                or not isinstance(
-                    info,
-                    dict
-                )
+                or not isinstance(info, dict)
             ):
                 continue
 
@@ -445,66 +370,47 @@ def _binary_open_pairs_from_open_time(
                 or info.get("enabled")
                 or (
                     isinstance(
-                        info.get(
-                            "binary"
-                        ),
-                        dict
+                        info.get("binary"),
+                        dict,
                     )
-                    and info[
-                        "binary"
-                    ].get(
-                        "open"
-                    )
+                    and info["binary"].get("open")
                 )
             )
 
             if is_open:
-                result.append(
-                    str(asset)
-                )
+                result.append(str(asset))
 
-        return sorted(
-            set(result)
-        )
+        return sorted(set(result))
 
     except Exception as exc:
-
         logger.warning(
             "OTC discovery error: %s",
             exc,
         )
-
         return []
 
 
-def _binary_assets_from_init_v2(
-) -> list[str]:
+def _binary_assets_from_init_v2() -> list[str]:
 
     if (
         IQ is None
         or not hasattr(
             IQ,
-            "get_all_init_v2"
+            "get_all_init_v2",
         )
     ):
         return []
 
     try:
         data = IQ.get_all_init_v2()
-
     except Exception:
         return []
 
     found: set[str] = set()
 
-    def walk(
-        obj: Any
-    ) -> None:
+    def walk(obj: Any) -> None:
 
-        if isinstance(
-            obj,
-            dict
-        ):
+        if isinstance(obj, dict):
 
             for key in (
                 "name",
@@ -513,74 +419,48 @@ def _binary_assets_from_init_v2(
                 "active",
                 "pair",
             ):
-
                 value = obj.get(key)
 
                 if (
-                    isinstance(
-                        value,
-                        str
-                    )
-                    and _is_otc_pair(
-                        value
-                    )
+                    isinstance(value, str)
+                    and _is_otc_pair(value)
                 ):
-
                     suspended = bool(
-                        obj.get(
-                            "is_suspended"
-                        )
-                        or obj.get(
-                            "suspended"
-                        )
+                        obj.get("is_suspended")
+                        or obj.get("suspended")
                     )
 
                     enabled = obj.get(
                         "enabled",
-                        True
+                        True,
                     )
 
                     if (
                         not suspended
                         and enabled is not False
                     ):
-                        found.add(
-                            value
-                        )
+                        found.add(value)
 
             for key, value in obj.items():
 
                 if (
-                    isinstance(
-                        key,
-                        str
-                    )
-                    and _is_otc_pair(
-                        key
-                    )
-                    and isinstance(
-                        value,
-                        dict
-                    )
+                    isinstance(key, str)
+                    and _is_otc_pair(key)
+                    and isinstance(value, dict)
                 ):
-
                     suspended = bool(
-                        value.get(
-                            "is_suspended"
-                        )
-                        or value.get(
-                            "suspended"
-                        )
+                        value.get("is_suspended")
+                        or value.get("suspended")
                     )
 
                     enabled = value.get(
                         "enabled",
-                        True
+                        True,
                     )
 
                     opened = value.get(
                         "open",
-                        True
+                        True,
                     )
 
                     if (
@@ -588,16 +468,11 @@ def _binary_assets_from_init_v2(
                         and enabled is not False
                         and opened is not False
                     ):
-                        found.add(
-                            key
-                        )
+                        found.add(key)
 
                 walk(value)
 
-        elif isinstance(
-            obj,
-            (list, tuple)
-        ):
+        elif isinstance(obj, (list, tuple)):
 
             for item in obj:
                 walk(item)
@@ -607,18 +482,12 @@ def _binary_assets_from_init_v2(
     return sorted(found)
 
 
-def discover_binary_otc_pairs(
-) -> list[str]:
+def discover_binary_otc_pairs() -> list[str]:
 
-    pairs = (
-        _binary_open_pairs_from_open_time()
-    )
+    pairs = _binary_open_pairs_from_open_time()
 
     if not pairs:
-
-        pairs = (
-            _binary_assets_from_init_v2()
-        )
+        pairs = _binary_assets_from_init_v2()
 
     return sorted(
         set(
@@ -645,13 +514,9 @@ def refresh_binary_otc_pairs(
     ):
         return list(PAIRS)
 
-    discovered = (
-        discover_binary_otc_pairs()
-    )
+    discovered = discover_binary_otc_pairs()
 
-    selected = discovered[
-        :MAX_OTC_PAIRS
-    ]
+    selected = discovered[:MAX_OTC_PAIRS]
 
     previous = set(PAIRS)
     current = set(selected)
@@ -662,52 +527,54 @@ def refresh_binary_otc_pairs(
 
         LAST_PAIR_REFRESH = now
 
-        for pair in (
-            previous - current
-        ):
+        for pair in previous - current:
 
             PENDING_ENTRY.pop(
                 pair,
-                None
+                None,
             )
 
             LIVE_STATE.pop(
                 pair,
-                None
+                None,
             )
 
             LAST_TRADE_CANDLE.pop(
                 pair,
-                None
+                None,
             )
 
             LAST_DIVERGENCE_NOTICE.pop(
                 pair,
-                None
+                None,
             )
 
             STREAM_STARTED.pop(
                 pair,
-                None
+                None,
             )
 
     if set(selected) != previous:
+
+        # CORRECCIÓN PRINCIPAL DEL ERROR:
+        # La expresión condicional debe estar COMPLETA
+        # dentro del f-string.
+        selected_text = (
+            ", ".join(selected)
+            if selected
+            else "NINGUNO"
+        )
 
         msg = (
             "🔄 UNIVERSO OTC "
             "ACTUALIZADO\n\n"
             f"Pares disponibles: "
-            f"{len(selected)}/"
-            f"{MAX_OTC_PAIRS}\n\n"
-            f"{', '.join(selected) "
-            if selected else 'NINGUNO'}"
+            f"{len(selected)}/{MAX_OTC_PAIRS}\n\n"
+            f"{selected_text}"
         )
 
         logger.info(
-            msg.replace(
-                "\n",
-                " | "
-            )
+            msg.replace("\n", " | ")
         )
 
         telegram_send(msg)
@@ -727,7 +594,6 @@ def get_iq_server_timestamp() -> float:
         return time.time()
 
     try:
-
         value = float(
             IQ.get_server_timestamp()
         )
@@ -746,9 +612,7 @@ def floor_candle_timestamp(
 ) -> int:
 
     return (
-        int(
-            timestamp // TIMEFRAME
-        )
+        int(timestamp // TIMEFRAME)
         * TIMEFRAME
     )
 
@@ -766,8 +630,7 @@ def connect_iq() -> bool:
         or not IQ_PASSWORD
     ):
         raise ValueError(
-            "Faltan IQ_EMAIL/"
-            "IQ_PASSWORD"
+            "Faltan IQ_EMAIL/IQ_PASSWORD"
         )
 
     logger.info(
@@ -782,21 +645,16 @@ def connect_iq() -> bool:
     connected, reason = IQ.connect()
 
     if not connected:
-
         raise ConnectionError(
             "No se pudo conectar a "
             f"IQ Option: {reason}"
         )
 
-    refresh_binary_otc_pairs(
-        force=True
-    )
+    refresh_binary_otc_pairs(force=True)
 
     start_realtime_streams()
 
-    server_ts = (
-        get_iq_server_timestamp()
-    )
+    server_ts = get_iq_server_timestamp()
 
     logger.info(
         "IQ conectado | server=%.3f",
@@ -832,9 +690,7 @@ def ensure_connection() -> bool:
             "Reconectando..."
         )
 
-        connected, reason = (
-            IQ.connect()
-        )
+        connected, reason = IQ.connect()
 
         if not connected:
 
@@ -883,9 +739,7 @@ def start_realtime_streams() -> None:
 
         try:
 
-            if STREAM_STARTED.get(
-                pair
-            ):
+            if STREAM_STARTED.get(pair):
                 continue
 
             IQ.start_candles_stream(
@@ -894,9 +748,7 @@ def start_realtime_streams() -> None:
                 REALTIME_MAXDICT,
             )
 
-            STREAM_STARTED[
-                pair
-            ] = True
+            STREAM_STARTED[pair] = True
 
             logger.info(
                 "%s | stream M1 iniciado",
@@ -905,9 +757,7 @@ def start_realtime_streams() -> None:
 
         except Exception as exc:
 
-            STREAM_STARTED[
-                pair
-            ] = False
+            STREAM_STARTED[pair] = False
 
             logger.warning(
                 "%s | stream error: %s",
@@ -924,36 +774,24 @@ def realtime_dataframe(
         return pd.DataFrame()
 
     try:
-
-        candles = (
-            IQ.get_realtime_candles(
-                pair,
-                TIMEFRAME
-            )
+        candles = IQ.get_realtime_candles(
+            pair,
+            TIMEFRAME,
         )
-
     except Exception:
         return pd.DataFrame()
 
     if (
-        not isinstance(
-            candles,
-            dict
-        )
+        not isinstance(candles, dict)
         or not candles
     ):
         return pd.DataFrame()
 
     rows = []
 
-    for key, candle in (
-        candles.items()
-    ):
+    for key, candle in candles.items():
 
-        if not isinstance(
-            candle,
-            dict
-        ):
+        if not isinstance(candle, dict):
             continue
 
         try:
@@ -962,7 +800,7 @@ def realtime_dataframe(
                 float(
                     candle.get(
                         "from",
-                        key
+                        key,
                     )
                 )
             )
@@ -970,32 +808,20 @@ def realtime_dataframe(
             rows.append(
                 {
                     "from": ts,
-
-                    "open": float(
-                        candle["open"]
-                    ),
-
+                    "open": float(candle["open"]),
                     "high": float(
                         candle.get(
                             "max",
-                            candle.get(
-                                "high"
-                            )
+                            candle.get("high"),
                         )
                     ),
-
                     "low": float(
                         candle.get(
                             "min",
-                            candle.get(
-                                "low"
-                            )
+                            candle.get("low"),
                         )
                     ),
-
-                    "close": float(
-                        candle["close"]
-                    ),
+                    "close": float(candle["close"]),
                 }
             )
 
@@ -1009,7 +835,7 @@ def realtime_dataframe(
         pd.DataFrame(rows)
         .drop_duplicates(
             "from",
-            keep="last"
+            keep="last",
         )
         .sort_values("from")
     )
@@ -1040,9 +866,7 @@ def get_closed_candles(
         if not candles:
             return None
 
-        df = pd.DataFrame(
-            candles
-        ).rename(
+        df = pd.DataFrame(candles).rename(
             columns={
                 "max": "high",
                 "min": "low",
@@ -1064,27 +888,23 @@ def get_closed_candles(
             return None
 
         for col in required:
-
             df[col] = pd.to_numeric(
                 df[col],
-                errors="coerce"
+                errors="coerce",
             )
 
         df.dropna(
             subset=required,
-            inplace=True
+            inplace=True,
         )
 
-        df["from"] = (
-            df["from"]
-            .astype(int)
-        )
+        df["from"] = df["from"].astype(int)
 
         return (
             df
             .drop_duplicates(
                 "from",
-                keep="last"
+                keep="last",
             )
             .sort_values("from")
             .tail(CANDLE_COUNT)
@@ -1115,8 +935,7 @@ def get_row_by_ts(
         return None
 
     rows = df[
-        df["from"].astype(int)
-        == int(ts)
+        df["from"].astype(int) == int(ts)
     ]
 
     if rows.empty:
@@ -1153,39 +972,21 @@ def divergence_message(
         .get("divergence", {})
     )
 
-    bull = bool(
-        div.get("bullish")
-    )
-
-    bear = bool(
-        div.get("bearish")
-    )
+    bull = bool(div.get("bullish"))
+    bear = bool(div.get("bearish"))
 
     if bull:
 
-        side = (
-            "🟢 DIVERGENCIA ALCISTA"
-        )
+        side = "🟢 DIVERGENCIA ALCISTA"
 
-        p1 = div.get(
-            "previous_low"
-        )
-
-        p2 = div.get(
-            "current_low"
-        )
-
-        r1 = div.get(
-            "previous_low_rsi"
-        )
-
-        r2 = div.get(
-            "current_low_rsi"
-        )
+        p1 = div.get("previous_low")
+        p2 = div.get("current_low")
+        r1 = div.get("previous_low_rsi")
+        r2 = div.get("current_low_rsi")
 
         score = div.get(
             "bullish_score",
-            0
+            0,
         )
 
         details = (
@@ -1195,34 +996,21 @@ def divergence_message(
 
         rsi_difference = div.get(
             "bull_rsi_difference",
-            0
+            0,
         )
 
     elif bear:
 
-        side = (
-            "🔴 DIVERGENCIA BAJISTA"
-        )
+        side = "🔴 DIVERGENCIA BAJISTA"
 
-        p1 = div.get(
-            "previous_high"
-        )
-
-        p2 = div.get(
-            "current_high"
-        )
-
-        r1 = div.get(
-            "previous_high_rsi"
-        )
-
-        r2 = div.get(
-            "current_high_rsi"
-        )
+        p1 = div.get("previous_high")
+        p2 = div.get("current_high")
+        r1 = div.get("previous_high_rsi")
+        r2 = div.get("current_high_rsi")
 
         score = div.get(
             "bearish_score",
-            0
+            0,
         )
 
         details = (
@@ -1232,7 +1020,7 @@ def divergence_message(
 
         rsi_difference = div.get(
             "bear_rsi_difference",
-            0
+            0,
         )
 
     else:
@@ -1256,52 +1044,32 @@ def divergence_message(
 
     return (
         f"{side}\n\n"
-
         f"Par: {pair}\n"
         f"Vela N: {ts}\n"
         f"Score: {score}/100\n\n"
-
         f"{details}\n\n"
-
         f"RSI diferencia: "
         f"{rsi_difference:.2f}\n\n"
-
-        f"Apertura N: "
-        f"{c.get('open')}\n"
-
-        f"Máximo N: "
-        f"{c.get('high')}\n"
-
-        f"Mínimo N: "
-        f"{c.get('low')}\n"
-
-        f"Cierre N: "
-        f"{c.get('close')}\n"
-
+        f"Apertura N: {c.get('open')}\n"
+        f"Máximo N: {c.get('high')}\n"
+        f"Mínimo N: {c.get('low')}\n"
+        f"Cierre N: {c.get('close')}\n"
         f"Cuerpo: "
         f"{c.get('body_percent', 0):.1f}%\n"
-
         f"Posición cierre: "
         f"{c.get('close_position', 0):.1f}%\n\n"
-
         f"Vela anterior fuerte: "
         f"{'✅' if cond.get('previous_strong') else '❌'}\n"
-
         f"Vela descanso: "
         f"{'✅' if cond.get('current_rest') else '❌'}\n"
-
         f"Recuperación alcista: "
         f"{'✅' if cond.get('bull_recovery') else '❌'}\n"
-
         f"Recuperación bajista: "
         f"{'✅' if cond.get('bear_recovery') else '❌'}\n"
-
         f"Dominancia alcista: "
         f"{'✅' if cond.get('bull_dominance') else '❌'}\n"
-
         f"Dominancia bajista: "
         f"{'✅' if cond.get('bear_dominance') else '❌'}\n\n"
-
         f"Resultado:\n"
         f"{result.get('reason')}"
     )
@@ -1316,9 +1084,7 @@ def analyze_closed_candle(
     expected_closed_ts: int,
 ) -> bool:
 
-    realtime = (
-        realtime_dataframe(pair)
-    )
+    realtime = realtime_dataframe(pair)
 
     closed_row = get_row_by_ts(
         realtime,
@@ -1329,12 +1095,9 @@ def analyze_closed_candle(
 
     if closed_row is None:
 
-        df = get_closed_candles(
-            pair
-        )
+        df = get_closed_candles(pair)
 
         if df is not None:
-
             closed_row = get_row_by_ts(
                 df,
                 expected_closed_ts,
@@ -1347,10 +1110,7 @@ def analyze_closed_candle(
     ):
         return False
 
-    # --------------------------------------------------------
     # Solo hasta N.
-    # --------------------------------------------------------
-
     df = df[
         df["from"].astype(int)
         <= expected_closed_ts
@@ -1365,78 +1125,52 @@ def analyze_closed_candle(
     if len(df) < 22:
         return False
 
-    # --------------------------------------------------------
     # Evitar volver a analizar N.
-    # --------------------------------------------------------
-
-    current_state = (
-        LIVE_STATE.get(pair)
-    )
+    current_state = LIVE_STATE.get(pair)
 
     if (
         current_state is not None
         and int(
             current_state.get(
                 "analyzed_ts",
-                -1
+                -1,
             )
         )
         == expected_closed_ts
     ):
-
         return True
 
-    # --------------------------------------------------------
     # ANÁLISIS
-    # --------------------------------------------------------
-
     result = analyze_market(
         candle_1m=closed_row.to_dict(),
         previous_m1=df.iloc[:-1].copy(),
         pair=pair,
     )
 
-    # --------------------------------------------------------
     # MARCAR COMO ANALIZADA
-    # --------------------------------------------------------
-
     with STATE_LOCK:
 
         LIVE_STATE[pair] = {
-            "analyzed_ts":
-                int(expected_closed_ts),
-
-            "signal":
-                result.get("signal"),
-
-            "score":
-                int(
-                    result.get(
-                        "score",
-                        0
-                    )
-                ),
-
-            "reason":
+            "analyzed_ts": int(expected_closed_ts),
+            "signal": result.get("signal"),
+            "score": int(
                 result.get(
-                    "reason",
-                    ""
-                ),
-
-            "analysis":
-                result.get(
-                    "analysis",
-                    {}
-                ),
-
-            "created_at":
-                time.time(),
+                    "score",
+                    0,
+                )
+            ),
+            "reason": result.get(
+                "reason",
+                "",
+            ),
+            "analysis": result.get(
+                "analysis",
+                {},
+            ),
+            "created_at": time.time(),
         }
 
-    # --------------------------------------------------------
     # DIVERGENCIA
-    # --------------------------------------------------------
-
     div = (
         result
         .get("analysis", {})
@@ -1450,15 +1184,13 @@ def analyze_closed_candle(
 
     if (
         has_divergence
-        and LAST_DIVERGENCE_NOTICE.get(
-            pair
-        )
+        and LAST_DIVERGENCE_NOTICE.get(pair)
         != expected_closed_ts
     ):
 
-        LAST_DIVERGENCE_NOTICE[
-            pair
-        ] = expected_closed_ts
+        LAST_DIVERGENCE_NOTICE[pair] = (
+            expected_closed_ts
+        )
 
         msg = divergence_message(
             pair,
@@ -1468,32 +1200,22 @@ def analyze_closed_candle(
 
         logger.info(
             "%s",
-            msg.replace(
-                "\n",
-                " | "
-            ),
+            msg.replace("\n", " | "),
         )
 
         telegram_send(msg)
 
-    # --------------------------------------------------------
     # LOG
-    # --------------------------------------------------------
-
-    signal = result.get(
-        "signal"
-    )
+    signal = result.get("signal")
 
     score = int(
         result.get(
             "score",
-            0
+            0,
         )
     )
 
-    values = candle_values(
-        closed_row
-    )
+    values = candle_values(closed_row)
 
     logger.info(
         "%s | N CERRADA | "
@@ -1501,113 +1223,64 @@ def analyze_closed_candle(
         pair,
         signal,
         score,
-        result.get(
-            "reason"
-        ),
+        result.get("reason"),
     )
 
-    # --------------------------------------------------------
     # SIN SEÑAL
-    # --------------------------------------------------------
-
-    if signal not in (
-        "call",
-        "put",
-    ):
+    if signal not in ("call", "put"):
         return True
 
-    # --------------------------------------------------------
     # ARMAR N+1
-    # --------------------------------------------------------
-
     execution_ts = int(
-        expected_closed_ts
-        + TIMEFRAME
+        expected_closed_ts + TIMEFRAME
     )
 
     with STATE_LOCK:
 
         PENDING_ENTRY[pair] = {
-
-            "signal":
-                signal,
-
-            "score":
-                score,
-
-            "continuity_ts":
-                int(expected_closed_ts),
-
-            "execution_ts":
-                execution_ts,
-
-            "open":
-                values["open"],
-
-            "high":
-                values["high"],
-
-            "low":
-                values["low"],
-
-            "close":
-                values["close"],
-
-            "reason":
-                result.get(
-                    "reason",
-                    ""
-                ),
-
-            "analysis":
-                result.get(
-                    "analysis",
-                    {}
-                ),
-
-            "created_at":
-                time.time(),
+            "signal": signal,
+            "score": score,
+            "continuity_ts": int(
+                expected_closed_ts
+            ),
+            "execution_ts": execution_ts,
+            "open": values["open"],
+            "high": values["high"],
+            "low": values["low"],
+            "close": values["close"],
+            "reason": result.get(
+                "reason",
+                "",
+            ),
+            "analysis": result.get(
+                "analysis",
+                {},
+            ),
+            "created_at": time.time(),
         }
 
     side = (
         "CALL 🟢"
         if signal == "call"
-        else
-        "PUT 🔴"
+        else "PUT 🔴"
     )
 
     telegram_send(
         "🎯 SEÑAL COMPLETA — "
         "ENTRADA ARMADA\n\n"
-
         f"Par: {pair}\n"
         f"Dirección: {side}\n"
         f"Score: {score}/100\n\n"
-
-        f"Apertura N: "
-        f"{values['open']}\n"
-
-        f"Máximo N: "
-        f"{values['high']}\n"
-
-        f"Mínimo N: "
-        f"{values['low']}\n"
-
-        f"Cierre N: "
-        f"{values['close']}\n\n"
-
-        f"N cierre: "
-        f"{expected_closed_ts}\n"
-
-        f"N+1: "
-        f"{execution_ts}\n\n"
-
+        f"Apertura N: {values['open']}\n"
+        f"Máximo N: {values['high']}\n"
+        f"Mínimo N: {values['low']}\n"
+        f"Cierre N: {values['close']}\n\n"
+        f"N cierre: {expected_closed_ts}\n"
+        f"N+1: {execution_ts}\n\n"
         "🚫 N no se opera.\n"
         "⚡ SNIPER: ejecutar "
         "al abrir N+1.\n"
-        "⏳ Expiración: "
-        "5 minutos\n\n"
-
+        "⏳ Expiración: 5 minutos\n\n"
         f"{result.get('reason', '')}"
     )
 
@@ -1618,16 +1291,11 @@ def analyze_closed_candle(
 # COOLDOWN
 # ============================================================
 
-def cooldown_active(
-    pair: str,
-) -> bool:
+def cooldown_active(pair: str) -> bool:
 
     return (
         time.time()
-        - LAST_TRADE_TIME.get(
-            pair,
-            0.0
-        )
+        - LAST_TRADE_TIME.get(pair, 0.0)
         < TRADE_COOLDOWN
     )
 
@@ -1639,17 +1307,11 @@ def cooldown_active(
 def buy_binary(
     pair: str,
     signal: str,
-) -> Tuple[
-    bool,
-    Optional[Any]
-]:
+) -> Tuple[bool, Optional[Any]]:
 
     if (
         IQ is None
-        or signal not in (
-            "call",
-            "put",
-        )
+        or signal not in ("call", "put")
     ):
         return False, None
 
@@ -1662,15 +1324,10 @@ def buy_binary(
             EXPIRATION,
         )
 
-        if isinstance(
-            result,
-            tuple
-        ):
+        if isinstance(result, tuple):
 
             return (
-                bool(
-                    result[0]
-                ),
+                bool(result[0]),
                 (
                     result[1]
                     if len(result) > 1
@@ -1684,7 +1341,6 @@ def buy_binary(
             "error",
             -1,
         ):
-
             return True, result
 
         return False, result
@@ -1710,30 +1366,17 @@ def execute_sniper(
 ) -> bool:
 
     execution_ts = int(
-        pending[
-            "execution_ts"
-        ]
+        pending["execution_ts"]
     )
 
     signal = str(
-        pending[
-            "signal"
-        ]
+        pending["signal"]
     )
 
-    # --------------------------------------------------------
     # RELOJ IQ
-    # --------------------------------------------------------
+    now = get_iq_server_timestamp()
 
-    now = (
-        get_iq_server_timestamp()
-    )
-
-    current_ts = (
-        floor_candle_timestamp(
-            now
-        )
-    )
+    current_ts = floor_candle_timestamp(now)
 
     # Todavía no llegó N+1.
     if current_ts < execution_ts:
@@ -1743,33 +1386,25 @@ def execute_sniper(
     if current_ts > execution_ts:
 
         with STATE_LOCK:
-
             PENDING_ENTRY.pop(
                 pair,
-                None
+                None,
             )
 
         telegram_send(
             "⚠️ SNIPER DESCARTADO\n\n"
             f"Par: {pair}\n"
-            f"N+1 objetivo: "
-            f"{execution_ts}\n"
-            f"Minuto actual: "
-            f"{current_ts}\n\n"
+            f"N+1 objetivo: {execution_ts}\n"
+            f"Minuto actual: {current_ts}\n\n"
             "La señal no se "
             "trasladó a otra vela."
         )
 
         return False
 
-    # --------------------------------------------------------
     # PROTECCIONES
-    # --------------------------------------------------------
-
     if (
-        LAST_TRADE_CANDLE.get(
-            pair
-        )
+        LAST_TRADE_CANDLE.get(pair)
         == execution_ts
     ):
         return False
@@ -1777,18 +1412,11 @@ def execute_sniper(
     if cooldown_active(pair):
         return False
 
-    # --------------------------------------------------------
     # VERIFICACIÓN FINAL
-    # --------------------------------------------------------
-
-    now2 = (
-        get_iq_server_timestamp()
-    )
+    now2 = get_iq_server_timestamp()
 
     if (
-        floor_candle_timestamp(
-            now2
-        )
+        floor_candle_timestamp(now2)
         != execution_ts
     ):
         return False
@@ -1796,106 +1424,62 @@ def execute_sniper(
     telegram_send(
         "⚡ SNIPER EJECUTANDO\n\n"
         f"Par: {pair}\n"
-        f"Dirección: "
-        f"{signal.upper()}\n\n"
-        f"N cierre: "
-        f"{pending['close']}\n"
-
-        f"N+1 timestamp: "
-        f"{execution_ts}\n"
-
-        f"Reloj IQ: "
-        f"{now2:.3f}\n\n"
-
-        "⏳ Expiración: "
-        "5 minutos"
+        f"Dirección: {signal.upper()}\n\n"
+        f"N cierre: {pending['close']}\n"
+        f"N+1 timestamp: {execution_ts}\n"
+        f"Reloj IQ: {now2:.3f}\n\n"
+        "⏳ Expiración: 5 minutos"
     )
 
-    sent_at = (
-        get_iq_server_timestamp()
-    )
+    sent_at = get_iq_server_timestamp()
 
-    # --------------------------------------------------------
     # ORDEN
-    # --------------------------------------------------------
-
     ok, order_id = buy_binary(
         pair,
-        signal
+        signal,
     )
 
     if not ok:
 
         with STATE_LOCK:
-
             PENDING_ENTRY.pop(
                 pair,
-                None
+                None,
             )
 
         telegram_send(
             "❌ ORDEN BINARY "
             "RECHAZADA\n\n"
-
             f"Par: {pair}\n"
-            f"Dirección: "
-            f"{signal.upper()}\n"
-
-            f"N+1: "
-            f"{execution_ts}\n"
-
-            f"Reloj IQ: "
-            f"{sent_at:.3f}\n\n"
-
+            f"Dirección: {signal.upper()}\n"
+            f"N+1: {execution_ts}\n"
+            f"Reloj IQ: {sent_at:.3f}\n\n"
             "La señal no se "
             "trasladará a otra vela."
         )
 
         return False
 
-    # --------------------------------------------------------
     # REGISTRAR OPERACIÓN
-    # --------------------------------------------------------
-
-    LAST_TRADE_TIME[
-        pair
-    ] = time.time()
-
-    LAST_TRADE_CANDLE[
-        pair
-    ] = execution_ts
+    LAST_TRADE_TIME[pair] = time.time()
+    LAST_TRADE_CANDLE[pair] = execution_ts
 
     with STATE_LOCK:
-
         PENDING_ENTRY.pop(
             pair,
-            None
+            None,
         )
 
     telegram_send(
         "✅ SNIPER EJECUTADO\n\n"
-
         f"Par: {pair}\n"
-
-        f"Dirección: "
-        f"{signal.upper()}\n"
-
-        f"N cierre: "
-        f"{pending['close']}\n"
-
-        f"N+1: "
-        f"{execution_ts}\n"
-
-        f"Reloj envío IQ: "
-        f"{sent_at:.3f}\n"
-
+        f"Dirección: {signal.upper()}\n"
+        f"N cierre: {pending['close']}\n"
+        f"N+1: {execution_ts}\n"
+        f"Reloj envío IQ: {sent_at:.3f}\n"
         f"ID: {order_id}\n\n"
-
-        "⚡ Entrada inmediata "
-        "N+1\n"
-
-        "⏳ Expiración: "
-        "5 minutos"
+        "⚡ Entrada inmediata N+1\n"
+        "⏳ Expiración: 5 minutos"
     )
 
     logger.info(
@@ -1903,9 +1487,7 @@ def execute_sniper(
         "%s | N=%s | N+1=%s | ID=%s",
         pair,
         signal.upper(),
-        pending[
-            "continuity_ts"
-        ],
+        pending["continuity_ts"],
         execution_ts,
         order_id,
     )
@@ -1917,49 +1499,33 @@ def execute_sniper(
 # MOTOR POR PAR
 # ============================================================
 
-def process_pair(
-    pair: str,
-) -> None:
+def process_pair(pair: str) -> None:
 
     if IQ is None:
         return
 
-    server_now = (
-        get_iq_server_timestamp()
+    server_now = get_iq_server_timestamp()
+
+    current_ts = floor_candle_timestamp(
+        server_now
     )
 
-    current_ts = (
-        floor_candle_timestamp(
-            server_now
-        )
-    )
+    closed_ts = current_ts - TIMEFRAME
 
-    closed_ts = (
-        current_ts
-        - TIMEFRAME
-    )
-
-    # --------------------------------------------------------
     # ANALIZAR N UNA SOLA VEZ
-    # --------------------------------------------------------
-
-    state = LIVE_STATE.get(
-        pair
-    )
+    state = LIVE_STATE.get(pair)
 
     analyzed_ts = -1
 
     if state is not None:
 
         try:
-
             analyzed_ts = int(
                 state.get(
                     "analyzed_ts",
-                    -1
+                    -1,
                 )
             )
-
         except Exception:
             analyzed_ts = -1
 
@@ -1970,23 +1536,14 @@ def process_pair(
             closed_ts,
         )
 
-    # --------------------------------------------------------
     # ENTRADA PENDIENTE
-    # --------------------------------------------------------
-
-    pending = (
-        PENDING_ENTRY.get(
-            pair
-        )
-    )
+    pending = PENDING_ENTRY.get(pair)
 
     if pending is None:
         return
 
     if int(
-        pending[
-            "execution_ts"
-        ]
+        pending["execution_ts"]
     ) != current_ts:
         return
 
@@ -2013,13 +1570,9 @@ def analyze_all_pairs() -> None:
             return
 
         try:
-
-            process_pair(
-                pair
-            )
+            process_pair(pair)
 
         except Exception:
-
             logger.exception(
                 "Error procesando %s",
                 pair,
@@ -2037,60 +1590,37 @@ def main() -> None:
     logger.info(
         "========================================"
     )
-
-    logger.info(
-        "BOT BINARY OTC"
-    )
-
+    logger.info("BOT BINARY OTC")
     logger.info(
         "DIVERGENCIA RSI ESTRUCTURAL"
     )
-
     logger.info(
         "MODO SNIPER - EXPIRACION 5 MINUTOS"
     )
-
-    logger.info(
-        "TIMEFRAME M1"
-    )
-
+    logger.info("TIMEFRAME M1")
     logger.info(
         "MAX OTC: %d",
         MAX_OTC_PAIRS,
     )
-
     logger.info(
         "AMOUNT: %s",
         AMOUNT,
     )
-
     logger.info(
         "========================================"
     )
 
-    # --------------------------------------------------------
     # VARIABLES
-    # --------------------------------------------------------
-
     required = {
-
-        "IQ_EMAIL":
-            IQ_EMAIL,
-
-        "IQ_PASSWORD":
-            IQ_PASSWORD,
-
-        "TELEGRAM_TOKEN":
-            TELEGRAM_TOKEN,
-
-        "TELEGRAM_CHAT_ID":
-            TELEGRAM_CHAT_ID,
+        "IQ_EMAIL": IQ_EMAIL,
+        "IQ_PASSWORD": IQ_PASSWORD,
+        "TELEGRAM_TOKEN": TELEGRAM_TOKEN,
+        "TELEGRAM_CHAT_ID": TELEGRAM_CHAT_ID,
     }
 
     missing = [
         key
-        for key, value
-        in required.items()
+        for key, value in required.items()
         if not value
     ]
 
@@ -2103,21 +1633,14 @@ def main() -> None:
 
         return
 
-    # --------------------------------------------------------
     # TELEGRAM
-    # --------------------------------------------------------
-
     threading.Thread(
         target=telegram_command_loop,
         daemon=True,
     ).start()
 
-    # --------------------------------------------------------
     # IQ
-    # --------------------------------------------------------
-
     try:
-
         connect_iq()
 
     except Exception as exc:
@@ -2134,62 +1657,43 @@ def main() -> None:
 
         return
 
-    # --------------------------------------------------------
     # ARRANCA DETENIDO
-    # --------------------------------------------------------
-
     BOT_RUNNING = False
 
     telegram_send(
         "🤖 BOT LISTO\n\n"
-
         "🧠 DIVERGENCIA RSI "
         "ESTRUCTURAL\n"
-
         "🔎 Analiza todos los "
         "OTC BINARY disponibles.\n\n"
-
         "📌 La señal se decide "
         "al cierre de N.\n"
-
         "🚫 N nunca se opera.\n"
-
         "⚡ N+1 se ejecuta en "
         "modo SNIPER.\n"
-
         "⏳ Expiración: "
         "5 minutos.\n\n"
-
         "Usa /start para activar."
     )
 
-    # --------------------------------------------------------
     # LOOP
-    # --------------------------------------------------------
-
     while True:
 
         try:
 
             if not BOT_RUNNING:
 
-                time.sleep(
-                    0.25
-                )
-
+                time.sleep(0.25)
                 continue
 
             if not ensure_connection():
 
                 time.sleep(1)
-
                 continue
 
             analyze_all_pairs()
 
-            time.sleep(
-                SNIPER_POLL
-            )
+            time.sleep(SNIPER_POLL)
 
         except KeyboardInterrupt:
 
