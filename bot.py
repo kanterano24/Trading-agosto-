@@ -9,50 +9,6 @@ from typing import Any, Dict, Optional, Tuple
 import pandas as pd
 import requests
 from iqoptionapi.stable_api import IQ_Option
-import iqoptionapi.constants as OP_code
-
-
-# ============================================================
-# COMPATIBILIDAD IQOPTIONAPI - SOLO BINARY OTC
-# ============================================================
-# Algunas versiones de iqoptionapi arrancan un worker DIGITAL
-# durante la conexion. Ese worker llama a
-# get_digital_underlying_list_data() y puede recibir None,
-# provocando: TypeError: 'NoneType' object is not subscriptable.
-#
-# Este bot NO usa DIGITAL. Por eso se neutraliza DIGITAL antes
-# de crear cualquier instancia IQ_Option. Se mantiene una
-# respuesta valida para cualquier llamada accidental de la
-# libreria y se desactiva el worker privado si existe.
-def _binary_only_digital_underlying(self):
-    return {"underlying": []}
-
-
-def _disabled_digital_open(self, *args, **kwargs):
-    return None
-
-
-setattr(
-    IQ_Option,
-    "get_digital_underlying_list_data",
-    _binary_only_digital_underlying,
-)
-
-# La libreria ha usado distintos nombres/mangling para este
-# worker en diferentes versiones. Cubrimos los nombres que
-# pueden existir sin tocar ninguna otra funcion del API.
-for _digital_worker_name in (
-    "_IQ_Option__get_digital_open",
-    "__get_digital_open",
-    "_get_digital_open",
-):
-    if hasattr(IQ_Option, _digital_worker_name):
-        setattr(
-            IQ_Option,
-            _digital_worker_name,
-            _disabled_digital_open,
-        )
-
 
 from strategy import analyze_market
 
@@ -198,7 +154,7 @@ def _telegram_post(
         return response.status_code == 200
 
     except Exception as exc:
-        logger.debug(
+        logger.warning(
             "Telegram %s: %s",
             endpoint,
             exc,
@@ -357,7 +313,7 @@ def telegram_command_loop() -> None:
                     )
 
         except Exception as exc:
-            logger.debug(
+            logger.warning(
                 "Telegram commands: %s",
                 exc,
             )
@@ -382,89 +338,164 @@ def _is_otc_pair(value: Any) -> bool:
     )
 
 
-def _load_binary_otc_catalog() -> tuple[list[str], bool]:
-    """
-    Carga exclusivamente binary.actives desde get_all_init_v2().
+def _binary_open_pairs_from_open_time() -> list[str]:
 
-    Importante: NO se usa get_all_open_time(), porque versiones
-    antiguas de iqoptionapi implementan esa funcion consultando
-    DIGITAL y ahi aparece el NoneType de la captura.
-
-    Ademas actualizamos OP_code.ACTIVES con los IDs que entrega
-    IQ Option. Esto evita: "Asset front.X-OTC not found on consts".
-    """
-    if IQ is None or not hasattr(IQ, "get_all_init_v2"):
-        return [], False
+    if IQ is None:
+        return []
 
     try:
-        data = IQ.get_all_init_v2()
+        data = IQ.get_all_open_time()
+
+        binary = (
+            data.get("binary", {})
+            if isinstance(data, dict)
+            else {}
+        )
+
+        if not isinstance(binary, dict):
+            return []
+
+        result: list[str] = []
+
+        for asset, info in binary.items():
+
+            if (
+                not _is_otc_pair(asset)
+                or not isinstance(info, dict)
+            ):
+                continue
+
+            is_open = bool(
+                info.get("open")
+                or info.get("enabled")
+                or (
+                    isinstance(
+                        info.get("binary"),
+                        dict,
+                    )
+                    and info["binary"].get("open")
+                )
+            )
+
+            if is_open:
+                result.append(str(asset))
+
+        return sorted(set(result))
+
     except Exception as exc:
-        logger.warning("Catalogo BINARY no disponible: %s", exc)
-        return [], False
-
-    if not isinstance(data, dict):
-        return [], False
-
-    binary = data.get("binary")
-    if not isinstance(binary, dict):
-        # Algunas versiones envuelven el resultado en result.
-        result = data.get("result")
-        if isinstance(result, dict):
-            binary = result.get("binary")
-
-    if not isinstance(binary, dict):
-        return [], False
-
-    actives = binary.get("actives", {})
-    if not isinstance(actives, dict):
-        return [], False
-
-    pairs: list[str] = []
-
-    for active_id, info in actives.items():
-        if not isinstance(info, dict):
-            continue
-
-        raw_name = info.get("name")
-        if not isinstance(raw_name, str):
-            continue
-
-        # IQ suele entregar nombres como front.EURUSD-OTC.
-        name = raw_name.split(".", 1)[1] if "." in raw_name else raw_name
-        name = name.strip()
-
-        if not _is_otc_pair(name):
-            continue
-
-        enabled = info.get("enabled", True)
-        suspended = info.get("is_suspended", info.get("suspended", False))
-
-        if enabled is False or suspended is True:
-            continue
-
-        try:
-            numeric_id = int(active_id)
-        except (TypeError, ValueError):
-            continue
-
-        # Registro fundamental para get_candles()/start_candles_stream()/buy().
-        OP_code.ACTIVES[name] = numeric_id
-        pairs.append(name)
-
-    return sorted(set(pairs)), True
+        logger.warning(
+            "OTC discovery error: %s",
+            exc,
+        )
+        return []
 
 
 def _binary_assets_from_init_v2() -> list[str]:
-    pairs, ok = _load_binary_otc_catalog()
-    if not ok:
+
+    if (
+        IQ is None
+        or not hasattr(
+            IQ,
+            "get_all_init_v2",
+        )
+    ):
         return []
-    return pairs
+
+    try:
+        data = IQ.get_all_init_v2()
+    except Exception:
+        return []
+
+    found: set[str] = set()
+
+    def walk(obj: Any) -> None:
+
+        if isinstance(obj, dict):
+
+            for key in (
+                "name",
+                "symbol",
+                "asset",
+                "active",
+                "pair",
+            ):
+                value = obj.get(key)
+
+                if (
+                    isinstance(value, str)
+                    and _is_otc_pair(value)
+                ):
+                    suspended = bool(
+                        obj.get("is_suspended")
+                        or obj.get("suspended")
+                    )
+
+                    enabled = obj.get(
+                        "enabled",
+                        True,
+                    )
+
+                    if (
+                        not suspended
+                        and enabled is not False
+                    ):
+                        found.add(value)
+
+            for key, value in obj.items():
+
+                if (
+                    isinstance(key, str)
+                    and _is_otc_pair(key)
+                    and isinstance(value, dict)
+                ):
+                    suspended = bool(
+                        value.get("is_suspended")
+                        or value.get("suspended")
+                    )
+
+                    enabled = value.get(
+                        "enabled",
+                        True,
+                    )
+
+                    opened = value.get(
+                        "open",
+                        True,
+                    )
+
+                    if (
+                        not suspended
+                        and enabled is not False
+                        and opened is not False
+                    ):
+                        found.add(key)
+
+                walk(value)
+
+        elif isinstance(obj, (list, tuple)):
+
+            for item in obj:
+                walk(item)
+
+    walk(data)
+
+    return sorted(found)
+
 
 def discover_binary_otc_pairs() -> list[str]:
-    # Fuente única y compatible: binary.actives.
-    # No se consulta DIGITAL ni se recorren cfd/forex/crypto.
-    pairs = _binary_assets_from_init_v2()
-    return sorted(set(p for p in pairs if _is_otc_pair(p)))
+
+    pairs = _binary_open_pairs_from_open_time()
+
+    if not pairs:
+        pairs = _binary_assets_from_init_v2()
+
+    return sorted(
+        set(
+            p
+            for p in pairs
+            if _is_otc_pair(p)
+        )
+    )
 
 
 def refresh_binary_otc_pairs(
@@ -700,25 +731,120 @@ def ensure_connection() -> bool:
 # ============================================================
 
 def start_realtime_streams() -> None:
-    """
-    BINARY OTC no necesita start_candles_stream().
 
-    Las versiones antiguas de iqoptionapi pueden producir errores
-    de constantes al abrir muchos streams dinamicos. El bot analiza
-    velas CERRADAS, por lo que usamos get_candles() directamente.
-    Esto elimina por completo la fuente de los mensajes:
-    "Asset front.X-OTC not found on consts".
-    """
-    return None
+    if IQ is None:
+        return
+
+    for pair in list(PAIRS):
+
+        try:
+
+            if STREAM_STARTED.get(pair):
+                continue
+
+            IQ.start_candles_stream(
+                pair,
+                TIMEFRAME,
+                REALTIME_MAXDICT,
+            )
+
+            STREAM_STARTED[pair] = True
+
+            logger.info(
+                "%s | stream M1 iniciado",
+                pair,
+            )
+
+        except Exception as exc:
+
+            STREAM_STARTED[pair] = False
+
+            logger.warning(
+                "%s | stream error: %s",
+                pair,
+                exc,
+            )
 
 
 def realtime_dataframe(
     pair: str,
 ) -> pd.DataFrame:
-    # Se mantiene la funcion para no alterar el resto del motor,
-    # pero el bot BINARY trabaja exclusivamente con velas cerradas
-    # obtenidas por get_candles().
-    return pd.DataFrame()
+
+    if IQ is None:
+        return pd.DataFrame()
+
+    try:
+        candles = IQ.get_realtime_candles(
+            pair,
+            TIMEFRAME,
+        )
+    except Exception:
+        return pd.DataFrame()
+
+    if (
+        not isinstance(candles, dict)
+        or not candles
+    ):
+        return pd.DataFrame()
+
+    rows = []
+
+    for key, candle in candles.items():
+
+        if not isinstance(candle, dict):
+            continue
+
+        try:
+
+            ts = int(
+                float(
+                    candle.get(
+                        "from",
+                        key,
+                    )
+                )
+            )
+
+            rows.append(
+                {
+                    "from": ts,
+                    "open": float(candle["open"]),
+                    "high": float(
+                        candle.get(
+                            "max",
+                            candle.get("high"),
+                        )
+                    ),
+                    "low": float(
+                        candle.get(
+                            "min",
+                            candle.get("low"),
+                        )
+                    ),
+                    "close": float(candle["close"]),
+                }
+            )
+
+        except Exception:
+            continue
+
+    if not rows:
+        return pd.DataFrame()
+
+    df = (
+        pd.DataFrame(rows)
+        .drop_duplicates(
+            "from",
+            keep="last",
+        )
+        .sort_values("from")
+    )
+
+    return (
+        df
+        .tail(CANDLE_COUNT)
+        .reset_index(drop=True)
+    )
 
 
 def get_closed_candles(
