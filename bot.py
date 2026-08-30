@@ -10,54 +10,6 @@ import pandas as pd
 import requests
 from iqoptionapi.stable_api import IQ_Option
 
-
-# ============================================================
-# COMPATIBILIDAD IQOPTIONAPI - BINARY OTC
-# ============================================================
-# Algunas versiones de iqoptionapi lanzan durante connect() un
-# hilo interno llamado __get_digital_open. Ese hilo consulta
-# get_digital_underlying_list_data() y, cuando IQ Option devuelve
-# None, termina con:
-# TypeError: 'NoneType' object is not subscriptable
-#
-# Este bot SOLO utiliza BINARY OTC, por lo que no necesita ese
-# proceso DIGITAL. Se desactiva a nivel de clase ANTES de crear
-# la instancia IQ_Option, evitando que el hilo se inicie.
-_ORIGINAL_GET_DIGITAL_UNDERLYING = IQ_Option.get_digital_underlying_list_data
-
-
-def _safe_get_digital_underlying_list_data(self):
-    """Evita el TypeError cuando iqoptionapi devuelve None."""
-    try:
-        result = _ORIGINAL_GET_DIGITAL_UNDERLYING(self)
-        if not isinstance(result, dict):
-            return {"underlying": []}
-        underlying = result.get("underlying")
-        if not isinstance(underlying, list):
-            result["underlying"] = []
-        return result
-    except Exception:
-        return {"underlying": []}
-
-
-def _disabled_digital_open(self) -> None:
-    return None
-
-# Correccion robusta: si la libreria intenta consultar DIGITAL y la
-# respuesta es None, nunca se propaga None al codigo que hace
-# ["underlying"]. Ademas, el worker DIGITAL queda desactivado.
-setattr(
-    IQ_Option,
-    "get_digital_underlying_list_data",
-    _safe_get_digital_underlying_list_data,
-)
-setattr(
-    IQ_Option,
-    "_IQ_Option__get_digital_open",
-    _disabled_digital_open,
-)
-
-
 from strategy import analyze_market
 
 
@@ -532,18 +484,17 @@ def _binary_assets_from_init_v2() -> list[str]:
 
 def discover_binary_otc_pairs() -> list[str]:
 
-    # No usar get_all_open_time(): en varias versiones de
-    # iqoptionapi esa función también consulta DIGITAL y puede
-    # provocar el mismo error de NoneType.
-    pairs = _binary_assets_from_init_v2()
+    # SOLO usar el bloque BINARY de get_all_open_time().
+    # get_all_init_v2() también contiene activos OTC de otros
+    # mercados (por ejemplo AMZN-OTC, APPLE-OTC, etc.).
+    # Esos símbolos no son válidos para el stream de candles
+    # que utiliza este bot y provocan:
+    # "Asset front.<ACTIVO>-OTC not found on consts".
+    #
+    # Si la API no entrega el bloque BINARY, devolvemos una lista
+    # vacía en vez de introducir activos de otro mercado.
 
-    return sorted(
-        set(
-            p
-            for p in pairs
-            if _is_otc_pair(p)
-        )
-    )
+    return _binary_open_pairs_from_open_time()
 
 
 def refresh_binary_otc_pairs(
@@ -783,7 +734,22 @@ def start_realtime_streams() -> None:
     if IQ is None:
         return
 
+    # La lista PAIRS ya proviene exclusivamente de BINARY.
+    # No iniciar streams para símbolos que no estén confirmados
+    # por esa fuente.
+
+    valid_pairs = set(
+        _binary_open_pairs_from_open_time()
+    )
+
+    if not valid_pairs:
+        return
+
     for pair in list(PAIRS):
+
+        if pair not in valid_pairs:
+            STREAM_STARTED[pair] = False
+            continue
 
         try:
 
