@@ -15,15 +15,7 @@ import iqoptionapi.constants as OP_code
 # ============================================================
 # COMPATIBILIDAD IQOPTIONAPI - SOLO BINARY OTC
 # ============================================================
-# Algunas versiones de iqoptionapi arrancan un worker DIGITAL
-# durante la conexion. Ese worker llama a
-# get_digital_underlying_list_data() y puede recibir None,
-# provocando: TypeError: 'NoneType' object is not subscriptable.
-#
-# Este bot NO usa DIGITAL. Por eso se neutraliza DIGITAL antes
-# de crear cualquier instancia IQ_Option. Se mantiene una
-# respuesta valida para cualquier llamada accidental de la
-# libreria y se desactiva el worker privado si existe.
+
 def _binary_only_digital_underlying(self):
     return {"underlying": []}
 
@@ -38,9 +30,6 @@ setattr(
     _binary_only_digital_underlying,
 )
 
-# La libreria ha usado distintos nombres/mangling para este
-# worker en diferentes versiones. Cubrimos los nombres que
-# pueden existir sin tocar ninguna otra funcion del API.
 for _digital_worker_name in (
     "_IQ_Option__get_digital_open",
     "__get_digital_open",
@@ -58,7 +47,7 @@ from strategy import analyze_market
 
 
 # ============================================================
-# BOT OTC - DIVERGENCIA RSI ESTRUCTURAL / SNIPER 5 MINUTOS
+# BOT OTC - ESTRUCTURA / RECHAZO / SNIPER
 # ============================================================
 #
 # FLUJO:
@@ -66,25 +55,17 @@ from strategy import analyze_market
 # 1. Descubre todos los pares OTC Binary disponibles.
 # 2. Cada par se analiza en M1.
 # 3. Se espera el cierre completo de N.
-# 4. Se analiza:
-#       - OHLC
-#       - cuerpo
-#       - mechas
-#       - posición del cierre
-#       - estructura
-#       - máximos
-#       - mínimos
-#       - RSI
-#       - divergencia
-#       - descanso
-#       - rechazo
-#       - recuperación
-#       - dominancia
+# 4. strategy.py analiza N + historial anterior.
 # 5. Si existe señal confirmada:
-#       N = análisis
+#
+#       N   = análisis
 #       N+1 = ejecución
+#
 # 6. N+1 NO participa en la decisión.
 # 7. Expiración = 5 minutos.
+#
+# La estrategia NO ejecuta operaciones.
+# Este archivo es responsable de la ejecución.
 # ============================================================
 
 
@@ -124,7 +105,6 @@ MAX_OTC_PAIRS = int(
 
 PAIR_REFRESH_SECONDS = 60.0
 SNIPER_POLL = 0.02
-REALTIME_MAXDICT = 100
 TRADE_COOLDOWN = 60.0
 
 
@@ -249,6 +229,7 @@ def telegram_command_loop() -> None:
 
     while True:
         try:
+
             params: Dict[str, Any] = {
                 "timeout": 1,
             }
@@ -274,6 +255,7 @@ def telegram_command_loop() -> None:
                 "result",
                 [],
             ):
+
                 uid = update.get("update_id")
 
                 if uid is not None:
@@ -308,13 +290,13 @@ def telegram_command_loop() -> None:
                     continue
 
                 if text == "/start":
+
                     BOT_RUNNING = True
 
                     telegram_send(
                         "🟢 BOT ACTIVADO\n\n"
                         "⚡ SNIPER OTC\n"
-                        "🧠 DIVERGENCIA RSI "
-                        "ESTRUCTURAL\n\n"
+                        "🧠 ESTRUCTURA + RECHAZO\n\n"
                         f"OTC analizados: "
                         f"hasta {MAX_OTC_PAIRS}\n"
                         "⏱ Análisis: M1\n"
@@ -326,6 +308,7 @@ def telegram_command_loop() -> None:
                     )
 
                 elif text == "/stop":
+
                     BOT_RUNNING = False
 
                     telegram_send(
@@ -335,6 +318,7 @@ def telegram_command_loop() -> None:
                     )
 
                 elif text == "/status":
+
                     status = (
                         "🟢 ACTIVO"
                         if BOT_RUNNING
@@ -347,7 +331,7 @@ def telegram_command_loop() -> None:
                         "Modo: SNIPER\n"
                         "Mercado: BINARY OTC\n"
                         "Estrategia: "
-                        "DIVERGENCIA RSI\n"
+                        "ESTRUCTURA + RECHAZO\n"
                         "Temporalidad: 1 minuto\n"
                         "Entrada: N+1\n"
                         "Expiración: 5 minutos\n"
@@ -357,10 +341,12 @@ def telegram_command_loop() -> None:
                     )
 
         except Exception as exc:
+
             logger.debug(
                 "Telegram commands: %s",
                 exc,
             )
+
             time.sleep(1)
 
 
@@ -383,88 +369,133 @@ def _is_otc_pair(value: Any) -> bool:
 
 
 def _load_binary_otc_catalog() -> tuple[list[str], bool]:
-    """
-    Carga exclusivamente binary.actives desde get_all_init_v2().
 
-    Importante: NO se usa get_all_open_time(), porque versiones
-    antiguas de iqoptionapi implementan esa funcion consultando
-    DIGITAL y ahi aparece el NoneType de la captura.
-
-    Ademas actualizamos OP_code.ACTIVES con los IDs que entrega
-    IQ Option. Esto evita: "Asset front.X-OTC not found on consts".
-    """
-    if IQ is None or not hasattr(IQ, "get_all_init_v2"):
+    if IQ is None or not hasattr(
+        IQ,
+        "get_all_init_v2",
+    ):
         return [], False
 
     try:
+
         data = IQ.get_all_init_v2()
+
     except Exception as exc:
-        logger.warning("Catalogo BINARY no disponible: %s", exc)
+
+        logger.warning(
+            "Catalogo BINARY no disponible: %s",
+            exc,
+        )
+
         return [], False
 
     if not isinstance(data, dict):
         return [], False
 
     binary = data.get("binary")
+
     if not isinstance(binary, dict):
-        # Algunas versiones envuelven el resultado en result.
+
         result = data.get("result")
+
         if isinstance(result, dict):
             binary = result.get("binary")
 
     if not isinstance(binary, dict):
         return [], False
 
-    actives = binary.get("actives", {})
+    actives = binary.get(
+        "actives",
+        {},
+    )
+
     if not isinstance(actives, dict):
         return [], False
 
     pairs: list[str] = []
 
     for active_id, info in actives.items():
+
         if not isinstance(info, dict):
             continue
 
         raw_name = info.get("name")
+
         if not isinstance(raw_name, str):
             continue
 
-        # IQ suele entregar nombres como front.EURUSD-OTC.
-        name = raw_name.split(".", 1)[1] if "." in raw_name else raw_name
+        name = (
+            raw_name.split(".", 1)[1]
+            if "." in raw_name
+            else raw_name
+        )
+
         name = name.strip()
 
         if not _is_otc_pair(name):
             continue
 
-        enabled = info.get("enabled", True)
-        suspended = info.get("is_suspended", info.get("suspended", False))
+        enabled = info.get(
+            "enabled",
+            True,
+        )
 
-        if enabled is False or suspended is True:
+        suspended = info.get(
+            "is_suspended",
+            info.get(
+                "suspended",
+                False,
+            ),
+        )
+
+        if enabled is False:
+            continue
+
+        if suspended is True:
             continue
 
         try:
             numeric_id = int(active_id)
-        except (TypeError, ValueError):
+        except (
+            TypeError,
+            ValueError,
+        ):
             continue
 
-        # Registro fundamental para get_candles()/start_candles_stream()/buy().
-        OP_code.ACTIVES[name] = numeric_id
+        OP_code.ACTIVES[
+            name
+        ] = numeric_id
+
         pairs.append(name)
 
     return sorted(set(pairs)), True
 
 
 def _binary_assets_from_init_v2() -> list[str]:
-    pairs, ok = _load_binary_otc_catalog()
+
+    pairs, ok = (
+        _load_binary_otc_catalog()
+    )
+
     if not ok:
         return []
+
     return pairs
 
+
 def discover_binary_otc_pairs() -> list[str]:
-    # Fuente única y compatible: binary.actives.
-    # No se consulta DIGITAL ni se recorren cfd/forex/crypto.
-    pairs = _binary_assets_from_init_v2()
-    return sorted(set(p for p in pairs if _is_otc_pair(p)))
+
+    pairs = (
+        _binary_assets_from_init_v2()
+    )
+
+    return sorted(
+        set(
+            p
+            for p in pairs
+            if _is_otc_pair(p)
+        )
+    )
 
 
 def refresh_binary_otc_pairs(
@@ -483,9 +514,13 @@ def refresh_binary_otc_pairs(
     ):
         return list(PAIRS)
 
-    discovered = discover_binary_otc_pairs()
+    discovered = (
+        discover_binary_otc_pairs()
+    )
 
-    selected = discovered[:MAX_OTC_PAIRS]
+    selected = discovered[
+        :MAX_OTC_PAIRS
+    ]
 
     previous = set(PAIRS)
     current = set(selected)
@@ -525,9 +560,6 @@ def refresh_binary_otc_pairs(
 
     if set(selected) != previous:
 
-        # CORRECCIÓN PRINCIPAL DEL ERROR:
-        # La expresión condicional debe estar COMPLETA
-        # dentro del f-string.
         selected_text = (
             ", ".join(selected)
             if selected
@@ -543,7 +575,10 @@ def refresh_binary_otc_pairs(
         )
 
         logger.info(
-            msg.replace("\n", " | ")
+            msg.replace(
+                "\n",
+                " | ",
+            )
         )
 
         telegram_send(msg)
@@ -563,6 +598,7 @@ def get_iq_server_timestamp() -> float:
         return time.time()
 
     try:
+
         value = float(
             IQ.get_server_timestamp()
         )
@@ -614,16 +650,21 @@ def connect_iq() -> bool:
     connected, reason = IQ.connect()
 
     if not connected:
+
         raise ConnectionError(
             "No se pudo conectar a "
             f"IQ Option: {reason}"
         )
 
-    refresh_binary_otc_pairs(force=True)
+    refresh_binary_otc_pairs(
+        force=True
+    )
 
     start_realtime_streams()
 
-    server_ts = get_iq_server_timestamp()
+    server_ts = (
+        get_iq_server_timestamp()
+    )
 
     logger.info(
         "IQ conectado | server=%.3f",
@@ -633,8 +674,7 @@ def connect_iq() -> bool:
     telegram_send(
         "🟢 IQ OPTION CONECTADO\n\n"
         "⚡ MODO SNIPER\n"
-        "🧠 DIVERGENCIA RSI "
-        "ESTRUCTURAL\n"
+        "🧠 ESTRUCTURA + RECHAZO\n"
         "⏱ M1 cerrada → N+1\n"
         "⏳ Expiración: 5 minutos"
     )
@@ -659,7 +699,9 @@ def ensure_connection() -> bool:
             "Reconectando..."
         )
 
-        connected, reason = IQ.connect()
+        connected, reason = (
+            IQ.connect()
+        )
 
         if not connected:
 
@@ -701,13 +743,8 @@ def ensure_connection() -> bool:
 
 def start_realtime_streams() -> None:
     """
-    BINARY OTC no necesita start_candles_stream().
-
-    Las versiones antiguas de iqoptionapi pueden producir errores
-    de constantes al abrir muchos streams dinamicos. El bot analiza
-    velas CERRADAS, por lo que usamos get_candles() directamente.
-    Esto elimina por completo la fuente de los mensajes:
-    "Asset front.X-OTC not found on consts".
+    No utiliza streams.
+    El bot trabaja exclusivamente con velas cerradas.
     """
     return None
 
@@ -715,9 +752,7 @@ def start_realtime_streams() -> None:
 def realtime_dataframe(
     pair: str,
 ) -> pd.DataFrame:
-    # Se mantiene la funcion para no alterar el resto del motor,
-    # pero el bot BINARY trabaja exclusivamente con velas cerradas
-    # obtenidas por get_candles().
+
     return pd.DataFrame()
 
 
@@ -740,7 +775,9 @@ def get_closed_candles(
         if not candles:
             return None
 
-        df = pd.DataFrame(candles).rename(
+        df = pd.DataFrame(
+            candles
+        ).rename(
             columns={
                 "max": "high",
                 "min": "low",
@@ -762,6 +799,7 @@ def get_closed_candles(
             return None
 
         for col in required:
+
             df[col] = pd.to_numeric(
                 df[col],
                 errors="coerce",
@@ -772,7 +810,10 @@ def get_closed_candles(
             inplace=True,
         )
 
-        df["from"] = df["from"].astype(int)
+        df["from"] = (
+            df["from"]
+            .astype(int)
+        )
 
         return (
             df
@@ -809,7 +850,8 @@ def get_row_by_ts(
         return None
 
     rows = df[
-        df["from"].astype(int) == int(ts)
+        df["from"].astype(int)
+        == int(ts)
     ]
 
     if rows.empty:
@@ -831,121 +873,49 @@ def candle_values(
 
 
 # ============================================================
-# MENSAJE DIVERGENCIA
+# MENSAJE DE ANÁLISIS
 # ============================================================
 
-def divergence_message(
+def analysis_message(
     pair: str,
     ts: int,
     result: Dict[str, Any],
 ) -> str:
 
-    div = (
-        result
-        .get("analysis", {})
-        .get("divergence", {})
+    analysis = (
+        result.get(
+            "analysis",
+            {},
+        )
     )
 
-    bull = bool(div.get("bullish"))
-    bear = bool(div.get("bearish"))
-
-    if bull:
-
-        side = "🟢 DIVERGENCIA ALCISTA"
-
-        p1 = div.get("previous_low")
-        p2 = div.get("current_low")
-        r1 = div.get("previous_low_rsi")
-        r2 = div.get("current_low_rsi")
-
-        score = div.get(
-            "bullish_score",
-            0,
-        )
-
-        details = (
-            f"Precio: {p2} < {p1}\n"
-            f"RSI: {r2:.2f} > {r1:.2f}"
-        )
-
-        rsi_difference = div.get(
-            "bull_rsi_difference",
-            0,
-        )
-
-    elif bear:
-
-        side = "🔴 DIVERGENCIA BAJISTA"
-
-        p1 = div.get("previous_high")
-        p2 = div.get("current_high")
-        r1 = div.get("previous_high_rsi")
-        r2 = div.get("current_high_rsi")
-
-        score = div.get(
-            "bearish_score",
-            0,
-        )
-
-        details = (
-            f"Precio: {p2} > {p1}\n"
-            f"RSI: {r2:.2f} < {r1:.2f}"
-        )
-
-        rsi_difference = div.get(
-            "bear_rsi_difference",
-            0,
-        )
-
-    else:
-
-        return (
-            "⚠️ Divergencia sin datos "
-            "completos"
-        )
-
-    c = (
-        result
-        .get("analysis", {})
-        .get("candle", {})
+    structure = analysis.get(
+        "structure",
+        "range",
     )
 
-    cond = (
-        result
-        .get("analysis", {})
-        .get("conditions", {})
+    phase = analysis.get(
+        "impulse_phase",
+        "unknown",
+    )
+
+    quality = analysis.get(
+        "entry_quality",
+        0,
     )
 
     return (
-        f"{side}\n\n"
+        "🔎 ANÁLISIS ESTRUCTURAL\n\n"
         f"Par: {pair}\n"
         f"Vela N: {ts}\n"
-        f"Score: {score}/100\n\n"
-        f"{details}\n\n"
-        f"RSI diferencia: "
-        f"{rsi_difference:.2f}\n\n"
-        f"Apertura N: {c.get('open')}\n"
-        f"Máximo N: {c.get('high')}\n"
-        f"Mínimo N: {c.get('low')}\n"
-        f"Cierre N: {c.get('close')}\n"
-        f"Cuerpo: "
-        f"{c.get('body_percent', 0):.1f}%\n"
-        f"Posición cierre: "
-        f"{c.get('close_position', 0):.1f}%\n\n"
-        f"Vela anterior fuerte: "
-        f"{'✅' if cond.get('previous_strong') else '❌'}\n"
-        f"Vela descanso: "
-        f"{'✅' if cond.get('current_rest') else '❌'}\n"
-        f"Recuperación alcista: "
-        f"{'✅' if cond.get('bull_recovery') else '❌'}\n"
-        f"Recuperación bajista: "
-        f"{'✅' if cond.get('bear_recovery') else '❌'}\n"
-        f"Dominancia alcista: "
-        f"{'✅' if cond.get('bull_dominance') else '❌'}\n"
-        f"Dominancia bajista: "
-        f"{'✅' if cond.get('bear_dominance') else '❌'}\n\n"
-        f"Resultado:\n"
-        f"{result.get('reason')}"
+        f"Dirección: "
+        f"{result.get('direction')}\n"
+        f"Estructura: {structure}\n"
+        f"Fase impulso: {phase}\n"
+        f"Score: "
+        f"{result.get('score', 0)}/100\n"
+        f"Calidad: {quality}/100\n\n"
+        f"{result.get('reason', '')}"
     )
 
 
@@ -958,7 +928,9 @@ def analyze_closed_candle(
     expected_closed_ts: int,
 ) -> bool:
 
-    realtime = realtime_dataframe(pair)
+    realtime = realtime_dataframe(
+        pair
+    )
 
     closed_row = get_row_by_ts(
         realtime,
@@ -969,9 +941,12 @@ def analyze_closed_candle(
 
     if closed_row is None:
 
-        df = get_closed_candles(pair)
+        df = get_closed_candles(
+            pair
+        )
 
         if df is not None:
+
             closed_row = get_row_by_ts(
                 df,
                 expected_closed_ts,
@@ -984,7 +959,6 @@ def analyze_closed_candle(
     ):
         return False
 
-    # Solo hasta N.
     df = df[
         df["from"].astype(int)
         <= expected_closed_ts
@@ -999,8 +973,9 @@ def analyze_closed_candle(
     if len(df) < 22:
         return False
 
-    # Evitar volver a analizar N.
-    current_state = LIVE_STATE.get(pair)
+    current_state = (
+        LIVE_STATE.get(pair)
+    )
 
     if (
         current_state is not None
@@ -1014,19 +989,29 @@ def analyze_closed_candle(
     ):
         return True
 
+    # ========================================================
     # ANÁLISIS
+    # ========================================================
+
     result = analyze_market(
         candle_1m=closed_row.to_dict(),
         previous_m1=df.iloc[:-1].copy(),
         pair=pair,
     )
 
+    # ========================================================
     # MARCAR COMO ANALIZADA
+    # ========================================================
+
     with STATE_LOCK:
 
         LIVE_STATE[pair] = {
-            "analyzed_ts": int(expected_closed_ts),
-            "signal": result.get("signal"),
+            "analyzed_ts": int(
+                expected_closed_ts
+            ),
+            "signal": result.get(
+                "signal"
+            ),
             "score": int(
                 result.get(
                     "score",
@@ -1044,43 +1029,9 @@ def analyze_closed_candle(
             "created_at": time.time(),
         }
 
-    # DIVERGENCIA
-    div = (
-        result
-        .get("analysis", {})
-        .get("divergence", {})
+    signal = result.get(
+        "signal"
     )
-
-    has_divergence = bool(
-        div.get("bullish")
-        or div.get("bearish")
-    )
-
-    if (
-        has_divergence
-        and LAST_DIVERGENCE_NOTICE.get(pair)
-        != expected_closed_ts
-    ):
-
-        LAST_DIVERGENCE_NOTICE[pair] = (
-            expected_closed_ts
-        )
-
-        msg = divergence_message(
-            pair,
-            expected_closed_ts,
-            result,
-        )
-
-        logger.info(
-            "%s",
-            msg.replace("\n", " | "),
-        )
-
-        telegram_send(msg)
-
-    # LOG
-    signal = result.get("signal")
 
     score = int(
         result.get(
@@ -1089,24 +1040,34 @@ def analyze_closed_candle(
         )
     )
 
-    values = candle_values(closed_row)
-
     logger.info(
         "%s | N CERRADA | "
         "signal=%s | score=%s | %s",
         pair,
         signal,
         score,
-        result.get("reason"),
+        result.get(
+            "reason"
+        ),
     )
 
-    # SIN SEÑAL
-    if signal not in ("call", "put"):
+    # ========================================================
+    # TELEGRAM SOLO PARA SEÑALES
+    # ========================================================
+
+    if signal not in (
+        "call",
+        "put",
+    ):
         return True
 
-    # ARMAR N+1
+    values = candle_values(
+        closed_row
+    )
+
     execution_ts = int(
-        expected_closed_ts + TIMEFRAME
+        expected_closed_ts
+        + TIMEFRAME
     )
 
     with STATE_LOCK:
@@ -1139,12 +1100,25 @@ def analyze_closed_candle(
         else "PUT 🔴"
     )
 
+    analysis = result.get(
+        "analysis",
+        {},
+    )
+
     telegram_send(
         "🎯 SEÑAL COMPLETA — "
         "ENTRADA ARMADA\n\n"
         f"Par: {pair}\n"
         f"Dirección: {side}\n"
-        f"Score: {score}/100\n\n"
+        f"Score: {score}/100\n"
+        f"Calidad: "
+        f"{analysis.get('entry_quality', 0)}/100\n\n"
+        f"Estructura: "
+        f"{analysis.get('structure')}\n"
+        f"Fase impulso: "
+        f"{analysis.get('impulse_phase')}\n"
+        f"Zona: "
+        f"{analysis.get('zone')}\n\n"
         f"Apertura N: {values['open']}\n"
         f"Máximo N: {values['high']}\n"
         f"Mínimo N: {values['low']}\n"
@@ -1152,8 +1126,7 @@ def analyze_closed_candle(
         f"N cierre: {expected_closed_ts}\n"
         f"N+1: {execution_ts}\n\n"
         "🚫 N no se opera.\n"
-        "⚡ SNIPER: ejecutar "
-        "al abrir N+1.\n"
+        "⚡ Ejecutar al abrir N+1.\n"
         "⏳ Expiración: 5 minutos\n\n"
         f"{result.get('reason', '')}"
     )
@@ -1165,11 +1138,16 @@ def analyze_closed_candle(
 # COOLDOWN
 # ============================================================
 
-def cooldown_active(pair: str) -> bool:
+def cooldown_active(
+    pair: str,
+) -> bool:
 
     return (
         time.time()
-        - LAST_TRADE_TIME.get(pair, 0.0)
+        - LAST_TRADE_TIME.get(
+            pair,
+            0.0,
+        )
         < TRADE_COOLDOWN
     )
 
@@ -1185,7 +1163,10 @@ def buy_binary(
 
     if (
         IQ is None
-        or signal not in ("call", "put")
+        or signal not in (
+            "call",
+            "put",
+        )
     ):
         return False, None
 
@@ -1198,7 +1179,10 @@ def buy_binary(
             EXPIRATION,
         )
 
-        if isinstance(result, tuple):
+        if isinstance(
+            result,
+            tuple,
+        ):
 
             return (
                 bool(result[0]),
@@ -1247,19 +1231,23 @@ def execute_sniper(
         pending["signal"]
     )
 
-    # RELOJ IQ
-    now = get_iq_server_timestamp()
+    now = (
+        get_iq_server_timestamp()
+    )
 
-    current_ts = floor_candle_timestamp(now)
+    current_ts = (
+        floor_candle_timestamp(
+            now
+        )
+    )
 
-    # Todavía no llegó N+1.
     if current_ts < execution_ts:
         return False
 
-    # Ya pasó N+1.
     if current_ts > execution_ts:
 
         with STATE_LOCK:
+
             PENDING_ENTRY.pop(
                 pair,
                 None,
@@ -1268,17 +1256,20 @@ def execute_sniper(
         telegram_send(
             "⚠️ SNIPER DESCARTADO\n\n"
             f"Par: {pair}\n"
-            f"N+1 objetivo: {execution_ts}\n"
-            f"Minuto actual: {current_ts}\n\n"
+            f"N+1 objetivo: "
+            f"{execution_ts}\n"
+            f"Minuto actual: "
+            f"{current_ts}\n\n"
             "La señal no se "
             "trasladó a otra vela."
         )
 
         return False
 
-    # PROTECCIONES
     if (
-        LAST_TRADE_CANDLE.get(pair)
+        LAST_TRADE_CANDLE.get(
+            pair
+        )
         == execution_ts
     ):
         return False
@@ -1286,11 +1277,14 @@ def execute_sniper(
     if cooldown_active(pair):
         return False
 
-    # VERIFICACIÓN FINAL
-    now2 = get_iq_server_timestamp()
+    now2 = (
+        get_iq_server_timestamp()
+    )
 
     if (
-        floor_candle_timestamp(now2)
+        floor_candle_timestamp(
+            now2
+        )
         != execution_ts
     ):
         return False
@@ -1298,16 +1292,21 @@ def execute_sniper(
     telegram_send(
         "⚡ SNIPER EJECUTANDO\n\n"
         f"Par: {pair}\n"
-        f"Dirección: {signal.upper()}\n\n"
-        f"N cierre: {pending['close']}\n"
-        f"N+1 timestamp: {execution_ts}\n"
-        f"Reloj IQ: {now2:.3f}\n\n"
+        f"Dirección: "
+        f"{signal.upper()}\n\n"
+        f"N cierre: "
+        f"{pending['close']}\n"
+        f"N+1 timestamp: "
+        f"{execution_ts}\n"
+        f"Reloj IQ: "
+        f"{now2:.3f}\n\n"
         "⏳ Expiración: 5 minutos"
     )
 
-    sent_at = get_iq_server_timestamp()
+    sent_at = (
+        get_iq_server_timestamp()
+    )
 
-    # ORDEN
     ok, order_id = buy_binary(
         pair,
         signal,
@@ -1316,6 +1315,7 @@ def execute_sniper(
     if not ok:
 
         with STATE_LOCK:
+
             PENDING_ENTRY.pop(
                 pair,
                 None,
@@ -1325,20 +1325,27 @@ def execute_sniper(
             "❌ ORDEN BINARY "
             "RECHAZADA\n\n"
             f"Par: {pair}\n"
-            f"Dirección: {signal.upper()}\n"
+            f"Dirección: "
+            f"{signal.upper()}\n"
             f"N+1: {execution_ts}\n"
-            f"Reloj IQ: {sent_at:.3f}\n\n"
+            f"Reloj IQ: "
+            f"{sent_at:.3f}\n\n"
             "La señal no se "
             "trasladará a otra vela."
         )
 
         return False
 
-    # REGISTRAR OPERACIÓN
-    LAST_TRADE_TIME[pair] = time.time()
-    LAST_TRADE_CANDLE[pair] = execution_ts
+    LAST_TRADE_TIME[pair] = (
+        time.time()
+    )
+
+    LAST_TRADE_CANDLE[pair] = (
+        execution_ts
+    )
 
     with STATE_LOCK:
+
         PENDING_ENTRY.pop(
             pair,
             None,
@@ -1347,10 +1354,13 @@ def execute_sniper(
     telegram_send(
         "✅ SNIPER EJECUTADO\n\n"
         f"Par: {pair}\n"
-        f"Dirección: {signal.upper()}\n"
-        f"N cierre: {pending['close']}\n"
+        f"Dirección: "
+        f"{signal.upper()}\n"
+        f"N cierre: "
+        f"{pending['close']}\n"
         f"N+1: {execution_ts}\n"
-        f"Reloj envío IQ: {sent_at:.3f}\n"
+        f"Reloj envío IQ: "
+        f"{sent_at:.3f}\n"
         f"ID: {order_id}\n\n"
         "⚡ Entrada inmediata N+1\n"
         "⏳ Expiración: 5 minutos"
@@ -1373,34 +1383,47 @@ def execute_sniper(
 # MOTOR POR PAR
 # ============================================================
 
-def process_pair(pair: str) -> None:
+def process_pair(
+    pair: str,
+) -> None:
 
     if IQ is None:
         return
 
-    server_now = get_iq_server_timestamp()
-
-    current_ts = floor_candle_timestamp(
-        server_now
+    server_now = (
+        get_iq_server_timestamp()
     )
 
-    closed_ts = current_ts - TIMEFRAME
+    current_ts = (
+        floor_candle_timestamp(
+            server_now
+        )
+    )
 
-    # ANALIZAR N UNA SOLA VEZ
-    state = LIVE_STATE.get(pair)
+    closed_ts = (
+        current_ts
+        - TIMEFRAME
+    )
+
+    state = LIVE_STATE.get(
+        pair
+    )
 
     analyzed_ts = -1
 
     if state is not None:
 
         try:
+
             analyzed_ts = int(
                 state.get(
                     "analyzed_ts",
                     -1,
                 )
             )
+
         except Exception:
+
             analyzed_ts = -1
 
     if analyzed_ts != closed_ts:
@@ -1410,8 +1433,9 @@ def process_pair(pair: str) -> None:
             closed_ts,
         )
 
-    # ENTRADA PENDIENTE
-    pending = PENDING_ENTRY.get(pair)
+    pending = PENDING_ENTRY.get(
+        pair
+    )
 
     if pending is None:
         return
@@ -1444,9 +1468,13 @@ def analyze_all_pairs() -> None:
             return
 
         try:
-            process_pair(pair)
+
+            process_pair(
+                pair
+            )
 
         except Exception:
+
             logger.exception(
                 "Error procesando %s",
                 pair,
@@ -1464,27 +1492,38 @@ def main() -> None:
     logger.info(
         "========================================"
     )
-    logger.info("BOT BINARY OTC")
+
     logger.info(
-        "DIVERGENCIA RSI ESTRUCTURAL"
+        "BOT BINARY OTC"
     )
+
     logger.info(
-        "MODO SNIPER - EXPIRACION 5 MINUTOS"
+        "ESTRUCTURA + RECHAZO"
     )
-    logger.info("TIMEFRAME M1")
+
+    logger.info(
+        "MODO SNIPER - "
+        "EXPIRACION 5 MINUTOS"
+    )
+
+    logger.info(
+        "TIMEFRAME M1"
+    )
+
     logger.info(
         "MAX OTC: %d",
         MAX_OTC_PAIRS,
     )
+
     logger.info(
         "AMOUNT: %s",
         AMOUNT,
     )
+
     logger.info(
         "========================================"
     )
 
-    # VARIABLES
     required = {
         "IQ_EMAIL": IQ_EMAIL,
         "IQ_PASSWORD": IQ_PASSWORD,
@@ -1507,14 +1546,13 @@ def main() -> None:
 
         return
 
-    # TELEGRAM
     threading.Thread(
         target=telegram_command_loop,
         daemon=True,
     ).start()
 
-    # IQ
     try:
+
         connect_iq()
 
     except Exception as exc:
@@ -1531,13 +1569,11 @@ def main() -> None:
 
         return
 
-    # ARRANCA DETENIDO
     BOT_RUNNING = False
 
     telegram_send(
         "🤖 BOT LISTO\n\n"
-        "🧠 DIVERGENCIA RSI "
-        "ESTRUCTURAL\n"
+        "🧠 ESTRUCTURA + RECHAZO\n"
         "🔎 Analiza todos los "
         "OTC BINARY disponibles.\n\n"
         "📌 La señal se decide "
@@ -1550,7 +1586,6 @@ def main() -> None:
         "Usa /start para activar."
     )
 
-    # LOOP
     while True:
 
         try:
@@ -1567,7 +1602,9 @@ def main() -> None:
 
             analyze_all_pairs()
 
-            time.sleep(SNIPER_POLL)
+            time.sleep(
+                SNIPER_POLL
+            )
 
         except KeyboardInterrupt:
 
