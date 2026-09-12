@@ -164,7 +164,7 @@ PUT_RSI_MAX = 62.0
 
 MIN_STRUCTURE_SCORE = 3
 
-MIN_ENTRY_SCORE = 91
+MIN_ENTRY_SCORE = 99
 
 
 # ============================================================
