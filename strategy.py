@@ -1,7 +1,8 @@
 """
 strategy.py
 
-ESTRATEGIA ESTRUCTURAL DE RECHAZO + FASE DE IMPULSO
+ESTRATEGIA ESTRUCTURAL DE RECHAZO + CONTINUIDAD + DESCANSO
++ FUERZA + INDECISIÓN + DIVERGENCIA RSI
 PARA BINARY OTC M1.
 
 OBJETIVO PRINCIPAL
@@ -10,65 +11,34 @@ OBJETIVO PRINCIPAL
 Evitar entradas tardías después de que el precio ya haya recorrido
 gran parte del impulso.
 
-La estrategia NO entra simplemente porque:
-
-    "hay una vela verde"
-    "hay una vela roja"
-    "hay rechazo"
-    "estamos cerca de un soporte"
-
-Primero intenta determinar:
+La estrategia analiza:
 
 1. Estructura del mercado.
 2. Últimos máximos y mínimos confirmados.
 3. HH/HL o LH/LL.
-4. Si existió consolidación antes del movimiento.
-5. Dónde comenzó el impulso.
-6. Cuántas velas lleva desarrollándose.
-7. Cuánto ha recorrido el impulso en ATR.
-8. Si el movimiento está extendido.
-9. Si la vela N realmente rechaza una zona.
-10. Si existe espacio suficiente hasta el extremo contrario.
-11. Si la entrada representa continuación temprana/reacción
-    estructural y no persecución del precio.
+4. Consolidación previa.
+5. Inicio del impulso.
+6. Edad del impulso.
+7. Extensión del impulso en ATR.
+8. Agotamiento.
+9. Rechazo estructural.
+10. Continuidad.
+11. Descanso.
+12. Indecisión.
+13. Fuerza.
+14. Divergencia RSI.
+15. Distancia a soporte/resistencia.
+16. Distancia a tendencia dinámica.
 
-CALL:
-    estructura alcista
-    +
-    retroceso/test de soporte o último mínimo
-    +
-    rechazo alcista
-    +
-    recuperación
-    +
-    impulso no agotado
-    +
-    espacio suficiente
+IMPORTANTE
+----------
 
-PUT:
-    estructura bajista
-    +
-    retroceso/test de resistencia o último máximo
-    +
-    rechazo bajista
-    +
-    recuperación
-    +
-    impulso no agotado
-    +
-    espacio suficiente
+La vela N es la vela analizada.
 
-API compatible con bot.py:
+La estrategia NO utiliza N+1 para decidir.
 
-    analyze_market(
-        candle_1m=...,
-        previous_m1=...,
-        pair=...
-    )
-
-También acepta:
-
-    analyze_market(df)
+Cuando una configuración de N está preparada para N+1,
+el bot puede ejecutar en N+1 mediante su flujo normal.
 
 No ejecuta operaciones.
 No decide expiración.
@@ -195,6 +165,64 @@ PUT_RSI_MAX = 62.0
 MIN_STRUCTURE_SCORE = 3
 
 MIN_ENTRY_SCORE = 70
+
+
+# ============================================================
+# NUEVAS REGLAS
+# ============================================================
+
+# Distancia mínima para configuraciones que NO son rechazo.
+MIN_DISTANCE_FROM_ZONE_ATR = 0.35
+
+# Distancia mínima de la tendencia dinámica.
+MIN_DISTANCE_FROM_TRENDLINE_ATR = 0.30
+
+
+# ============================================================
+# INDECISIÓN
+# ============================================================
+
+INDECISION_MAX_BODY_RATIO = 0.30
+
+INDECISION_MIN_WICK_RATIO = 0.25
+
+
+# ============================================================
+# DESCANSO
+# ============================================================
+
+REST_MAX_BODY_RATIO = 0.50
+
+REST_MIN_PREVIOUS_BODY_RATIO = 0.55
+
+
+# ============================================================
+# CONTINUIDAD
+# ============================================================
+
+CONTINUITY_MIN_BODY_RATIO = 0.45
+
+CONTINUITY_MIN_BODY_ATR = 0.20
+
+
+# ============================================================
+# FUERZA
+# ============================================================
+
+FORCE_MIN_BODY_RATIO = 0.65
+
+FORCE_MIN_BODY_ATR = 0.35
+
+
+# ============================================================
+# DIVERGENCIA
+# ============================================================
+
+DIVERGENCE_LOOKBACK = 25
+
+DIVERGENCE_MIN_RSI_CHANGE = 2.0
+
+DIVERGENCE_MIN_PRICE_CHANGE_ATR = 0.05
 
 
 EPS = 1e-12
@@ -390,24 +418,9 @@ def _build_analysis_dataframe(
     df: Optional[pd.DataFrame] = None,
 ) -> pd.DataFrame:
 
-    # --------------------------------------------------------
-    # API ANTIGUA:
-    #
-    # analyze_market(df)
-    # --------------------------------------------------------
-
     if df is not None:
 
-        clean = _normalize(df)
-
-        return clean
-
-    # --------------------------------------------------------
-    # API NUEVA DEL BOT:
-    #
-    # candle_1m = N
-    # previous_m1 = velas anteriores a N
-    # --------------------------------------------------------
+        return _normalize(df)
 
     history = _normalize(
         previous_m1
@@ -458,11 +471,9 @@ def _build_analysis_dataframe(
         ignore_index=True,
     )
 
-    combined = _normalize(
+    return _normalize(
         combined
     )
-
-    return combined
 
 
 # ============================================================
@@ -479,9 +490,7 @@ def add_indicators(
         return out
 
     close = out["close"]
-
     high = out["high"]
-
     low = out["low"]
 
     out["ema9"] = (
@@ -511,9 +520,7 @@ def add_indicators(
         .mean()
     )
 
-    previous_close = (
-        close.shift(1)
-    )
+    previous_close = close.shift(1)
 
     tr = pd.concat(
         [
@@ -972,7 +979,6 @@ def detect_structure(
     )
 
     highs = swings["highs"]
-
     lows = swings["lows"]
 
     if (
@@ -981,11 +987,9 @@ def detect_structure(
     ):
 
         h1 = highs[-2][1]
-
         h2 = highs[-1][1]
 
         l1 = lows[-2][1]
-
         l2 = lows[-1][1]
 
         atr = _atr(
@@ -1070,7 +1074,6 @@ def structure_score(
     )
 
     highs = swings["highs"]
-
     lows = swings["lows"]
 
     score = 0
@@ -1219,11 +1222,6 @@ def detect_consolidation(
         "candles"
     ] = len(look)
 
-    # Consolidación:
-    #
-    # rango relativamente comprimido
-    # y poco desplazamiento neto.
-
     compressed = (
         range_atr
         <= MAX_CONSOLIDATION_RANGE_ATR
@@ -1355,12 +1353,6 @@ def analyze_impulse_phase(
     if len(data) < 8:
         return result
 
-    # --------------------------------------------------------
-    # Buscamos hacia atrás el punto donde comenzó el movimiento.
-    #
-    # No asumimos que la segunda vela sea automáticamente buena.
-    # --------------------------------------------------------
-
     target = (
         1
         if direction
@@ -1405,16 +1397,6 @@ def analyze_impulse_phase(
             metrics["body"]
             / atr
         )
-
-        # ----------------------------------------------------
-        # Ruptura local:
-        #
-        # Bullish:
-        # cierre > máximo anterior.
-        #
-        # Bearish:
-        # cierre < mínimo anterior.
-        # ----------------------------------------------------
 
         left_start = max(
             0,
@@ -1483,11 +1465,6 @@ def analyze_impulse_phase(
                     ),
                 )
             )
-
-    # --------------------------------------------------------
-    # Si no encontramos ruptura clara,
-    # buscamos el inicio por cambio de dominancia.
-    # --------------------------------------------------------
 
     if not candidates:
 
@@ -1561,7 +1538,6 @@ def analyze_impulse_phase(
 
         return result
 
-    # Utilizamos el inicio más reciente que cumpla las condiciones.
     start_index = candidates[-1][0]
 
     age = (
@@ -1569,10 +1545,6 @@ def analyze_impulse_phase(
         - 1
         - start_index
     )
-
-    # --------------------------------------------------------
-    # Extensión del impulso
-    # --------------------------------------------------------
 
     segment = data.iloc[
         start_index:
@@ -1603,10 +1575,6 @@ def analyze_impulse_phase(
         )
     )
 
-    # --------------------------------------------------------
-    # Fase
-    # --------------------------------------------------------
-
     if age <= 1:
 
         phase = "inicio"
@@ -1623,10 +1591,6 @@ def analyze_impulse_phase(
 
         phase = "tardío"
 
-    # --------------------------------------------------------
-    # Consolidación anterior
-    # --------------------------------------------------------
-
     before_start = data.iloc[
         max(
             0,
@@ -1640,10 +1604,6 @@ def analyze_impulse_phase(
         direction,
         atr,
     )
-
-    # --------------------------------------------------------
-    # Score
-    # --------------------------------------------------------
 
     score = 0
 
@@ -1700,10 +1660,6 @@ def analyze_impulse_phase(
     else:
         score -= 3
 
-    # --------------------------------------------------------
-    # Validez
-    # --------------------------------------------------------
-
     valid = True
 
     if age > MAX_IMPULSE_AGE:
@@ -1720,11 +1676,6 @@ def analyze_impulse_phase(
         > MAX_CONSECUTIVE_DIRECTION_CANDLES
     ):
         valid = False
-
-    # Un impulso avanzado puede ser válido solamente
-    # si el precio regresó a una zona estructural.
-    #
-    # La función principal se encargará de comprobarlo.
 
     result.update(
         {
@@ -2024,6 +1975,743 @@ def _body_is_valid(
 
 
 # ============================================================
+# NUEVO:
+# DISTANCIA A TENDENCIA DINÁMICA
+# ============================================================
+
+def _dynamic_trendline_distance(
+    history: pd.DataFrame,
+    current_price: float,
+    direction: str,
+    atr: float,
+) -> Dict[str, Any]:
+
+    result = {
+        "distance_atr": 999.0,
+        "line_price": None,
+        "valid": True,
+        "points": 0,
+        "reason": "sin tendencia dinámica suficiente",
+    }
+
+    if (
+        history is None
+        or len(history) < 10
+        or atr <= 0
+    ):
+        return result
+
+    swings = _last_swing_levels(
+        history
+    )
+
+    if direction == "bullish":
+
+        points = swings["lows"]
+
+    else:
+
+        points = swings["highs"]
+
+    if len(points) < 2:
+        return result
+
+    p1 = points[-2]
+    p2 = points[-1]
+
+    i1, v1 = p1
+    i2, v2 = p2
+
+    if i2 == i1:
+        return result
+
+    current_index = len(history)
+
+    slope = (
+        (v2 - v1)
+        / float(i2 - i1)
+    )
+
+    projected = (
+        v2
+        + slope
+        * (
+            current_index
+            - i2
+        )
+    )
+
+    distance = abs(
+        current_price
+        - projected
+    ) / atr
+
+    result.update(
+        {
+            "distance_atr": float(
+                distance
+            ),
+            "line_price": float(
+                projected
+            ),
+            "points": 2,
+            "valid": (
+                distance
+                >= MIN_DISTANCE_FROM_TRENDLINE_ATR
+            ),
+            "reason": (
+                "distancia a tendencia "
+                f"{distance:.2f} ATR"
+            ),
+        }
+    )
+
+    return result
+
+
+# ============================================================
+# NUEVO:
+# DISTANCIAS A SOPORTE / RESISTENCIA
+# ============================================================
+
+def _level_distances(
+    price: float,
+    support: Optional[float],
+    resistance: Optional[float],
+    atr: float,
+) -> Dict[str, float]:
+
+    if atr <= 0:
+        return {
+            "support_atr": 999.0,
+            "resistance_atr": 999.0,
+        }
+
+    support_distance = 999.0
+
+    resistance_distance = 999.0
+
+    if support is not None:
+
+        support_distance = (
+            abs(
+                price
+                - support
+            )
+            / atr
+        )
+
+    if resistance is not None:
+
+        resistance_distance = (
+            abs(
+                resistance
+                - price
+            )
+            / atr
+        )
+
+    return {
+        "support_atr": support_distance,
+        "resistance_atr": resistance_distance,
+    }
+
+
+# ============================================================
+# NUEVO:
+# LEJOS DE ZONA DE REVERSIÓN
+# ============================================================
+
+def _away_from_reversal_zone(
+    price: float,
+    support: Optional[float],
+    resistance: Optional[float],
+    atr: float,
+    direction: str,
+) -> Tuple[
+    bool,
+    float,
+]:
+
+    if atr <= 0:
+        return False, 0.0
+
+    distances = _level_distances(
+        price,
+        support,
+        resistance,
+        atr,
+    )
+
+    if direction == "bullish":
+
+        distance = distances[
+            "resistance_atr"
+        ]
+
+    else:
+
+        distance = distances[
+            "support_atr"
+        ]
+
+    return (
+        distance
+        >= MIN_DISTANCE_FROM_ZONE_ATR,
+        distance,
+    )
+
+
+# ============================================================
+# NUEVO:
+# VELA DE CONTINUIDAD
+# ============================================================
+
+def _is_continuity_candle(
+    c: Dict[str, float],
+    direction: str,
+    atr: float,
+) -> bool:
+
+    if atr <= 0:
+        return False
+
+    body_atr = (
+        c["body"]
+        / atr
+    )
+
+    if (
+        c["body_ratio"]
+        < CONTINUITY_MIN_BODY_RATIO
+    ):
+        return False
+
+    if (
+        body_atr
+        < CONTINUITY_MIN_BODY_ATR
+    ):
+        return False
+
+    if direction == "bullish":
+
+        return (
+            c["close"]
+            > c["open"]
+            and
+            c["close_position"]
+            >= 0.60
+        )
+
+    return (
+        c["close"]
+        < c["open"]
+        and
+        c["close_position"]
+        <= 0.40
+    )
+
+
+# ============================================================
+# NUEVO:
+# VELA DE DESCANSO
+# ============================================================
+
+def _is_rest_candle(
+    c: Dict[str, float],
+    previous: Dict[str, float],
+    direction: str,
+) -> bool:
+
+    if (
+        c["body_ratio"]
+        > REST_MAX_BODY_RATIO
+    ):
+        return False
+
+    if (
+        previous["body_ratio"]
+        < REST_MIN_PREVIOUS_BODY_RATIO
+    ):
+        return False
+
+    if direction == "bullish":
+
+        return (
+            previous["close"]
+            > previous["open"]
+        )
+
+    return (
+        previous["close"]
+        < previous["open"]
+    )
+
+
+# ============================================================
+# NUEVO:
+# VELA DE INDECISIÓN
+# ============================================================
+
+def _is_indecision_candle(
+    c: Dict[str, float],
+) -> bool:
+
+    if (
+        c["body_ratio"]
+        > INDECISION_MAX_BODY_RATIO
+    ):
+        return False
+
+    return (
+        c["upper_ratio"]
+        >= INDECISION_MIN_WICK_RATIO
+        or
+        c["lower_ratio"]
+        >= INDECISION_MIN_WICK_RATIO
+    )
+
+
+# ============================================================
+# NUEVO:
+# VELA DE FUERZA
+# ============================================================
+
+def _is_force_candle(
+    c: Dict[str, float],
+    direction: str,
+    atr: float,
+) -> bool:
+
+    if atr <= 0:
+        return False
+
+    body_atr = (
+        c["body"]
+        / atr
+    )
+
+    if (
+        c["body_ratio"]
+        < FORCE_MIN_BODY_RATIO
+    ):
+        return False
+
+    if (
+        body_atr
+        < FORCE_MIN_BODY_ATR
+    ):
+        return False
+
+    if direction == "bullish":
+
+        return (
+            c["close"]
+            > c["open"]
+            and
+            c["close_position"]
+            >= 0.65
+        )
+
+    return (
+        c["close"]
+        < c["open"]
+        and
+        c["close_position"]
+        <= 0.35
+    )
+
+
+# ============================================================
+# NUEVO:
+# DIVERGENCIA RSI
+# ============================================================
+
+def _detect_rsi_divergence(
+    history: pd.DataFrame,
+    current: pd.Series,
+    direction: str,
+    atr: float,
+) -> Dict[str, Any]:
+
+    result = {
+        "valid": False,
+        "type": None,
+        "price_previous": None,
+        "price_current": None,
+        "rsi_previous": None,
+        "rsi_current": None,
+        "price_change_atr": 0.0,
+        "rsi_change": 0.0,
+        "reason": "sin divergencia",
+    }
+
+    if (
+        history is None
+        or len(history) < 8
+        or atr <= 0
+    ):
+        return result
+
+    data = history.tail(
+        DIVERGENCE_LOOKBACK
+    ).copy()
+
+    if "rsi" not in data.columns:
+        return result
+
+    rsi_current = _safe_float(
+        current.get("rsi"),
+        50.0,
+    )
+
+    price_current = _safe_float(
+        current.get("close")
+    )
+
+    if direction == "bullish":
+
+        # Buscar un mínimo anterior relevante
+        # inferior al mínimo actual.
+
+        previous_low_index = None
+        previous_low_price = None
+        previous_low_rsi = None
+
+        for i in range(
+            len(data) - 1,
+            -1,
+            -1,
+        ):
+
+            row = data.iloc[i]
+
+            low = _safe_float(
+                row.get("low")
+            )
+
+            if (
+                low
+                < price_current
+            ):
+
+                if (
+                    previous_low_price
+                    is None
+                    or low
+                    < previous_low_price
+                ):
+
+                    previous_low_index = i
+                    previous_low_price = low
+                    previous_low_rsi = _safe_float(
+                        row.get("rsi"),
+                        50.0,
+                    )
+
+        if (
+            previous_low_price
+            is None
+            or previous_low_rsi
+            is None
+        ):
+            return result
+
+        price_change = (
+            previous_low_price
+            - price_current
+        )
+
+        price_change_atr = (
+            abs(price_change)
+            / atr
+        )
+
+        rsi_change = (
+            rsi_current
+            - previous_low_rsi
+        )
+
+        # Precio hace LL y RSI hace HL.
+        valid = (
+            price_current
+            < previous_low_price
+            and
+            rsi_current
+            > previous_low_rsi
+            and
+            rsi_change
+            >= DIVERGENCE_MIN_RSI_CHANGE
+            and
+            price_change_atr
+            >= DIVERGENCE_MIN_PRICE_CHANGE_ATR
+        )
+
+        if valid:
+
+            result.update(
+                {
+                    "valid": True,
+                    "type": "bullish",
+                    "price_previous": previous_low_price,
+                    "price_current": price_current,
+                    "rsi_previous": previous_low_rsi,
+                    "rsi_current": rsi_current,
+                    "price_change_atr": price_change_atr,
+                    "rsi_change": rsi_change,
+                    "reason": (
+                        "divergencia alcista "
+                        "precio LL + RSI HL"
+                    ),
+                }
+            )
+
+        return result
+
+    # --------------------------------------------------------
+    # DIVERGENCIA BAJISTA
+    # --------------------------------------------------------
+
+    previous_high_price = None
+    previous_high_rsi = None
+
+    for i in range(
+        len(data) - 1,
+        -1,
+        -1,
+    ):
+
+        row = data.iloc[i]
+
+        high = _safe_float(
+            row.get("high")
+        )
+
+        if (
+            high
+            > price_current
+        ):
+
+            if (
+                previous_high_price
+                is None
+                or high
+                > previous_high_price
+            ):
+
+                previous_high_price = high
+
+                previous_high_rsi = _safe_float(
+                    row.get("rsi"),
+                    50.0,
+                )
+
+    if (
+        previous_high_price
+        is None
+        or previous_high_rsi
+        is None
+    ):
+        return result
+
+    price_change = (
+        price_current
+        - previous_high_price
+    )
+
+    price_change_atr = (
+        abs(price_change)
+        / atr
+    )
+
+    rsi_change = (
+        previous_high_rsi
+        - rsi_current
+    )
+
+    # Precio hace HH y RSI hace LH.
+    valid = (
+        price_current
+        > previous_high_price
+        and
+        rsi_current
+        < previous_high_rsi
+        and
+        rsi_change
+        >= DIVERGENCE_MIN_RSI_CHANGE
+        and
+        price_change_atr
+        >= DIVERGENCE_MIN_PRICE_CHANGE_ATR
+    )
+
+    if valid:
+
+        result.update(
+            {
+                "valid": True,
+                "type": "bearish",
+                "price_previous": previous_high_price,
+                "price_current": price_current,
+                "rsi_previous": previous_high_rsi,
+                "rsi_current": rsi_current,
+                "price_change_atr": price_change_atr,
+                "rsi_change": rsi_change,
+                "reason": (
+                    "divergencia bajista "
+                    "precio HH + RSI LH"
+                ),
+            }
+        )
+
+    return result
+
+
+# ============================================================
+# NUEVO:
+# FASE SALUDABLE PARA CONTINUIDAD / FUERZA
+# ============================================================
+
+def _healthy_continuation_phase(
+    impulse: Dict[str, Any],
+) -> bool:
+
+    phase = impulse.get(
+        "phase",
+        "unknown",
+    )
+
+    extension = _safe_float(
+        impulse.get(
+            "extension_atr",
+            999.0,
+        ),
+        999.0,
+    )
+
+    consecutive = int(
+        impulse.get(
+            "consecutive",
+            999,
+        )
+    )
+
+    if phase in (
+        "inicio",
+        "temprano",
+    ):
+        return True
+
+    if phase == "avanzado":
+
+        return (
+            extension
+            <= 2.20
+            and
+            consecutive
+            <= 3
+        )
+
+    return False
+
+
+# ============================================================
+# NUEVO:
+# CALIDAD BASE DE SEÑALES ALTERNATIVAS
+# ============================================================
+
+def _alternative_quality(
+    structure_score_value: int,
+    impulse: Dict[str, Any],
+    candle: Dict[str, float],
+    distance_zone: float,
+    trendline_distance: float,
+    room_atr: float,
+) -> int:
+
+    score = 60.0
+
+    score += min(
+        10.0,
+        structure_score_value
+        * 2.0,
+    )
+
+    if impulse.get(
+        "phase"
+    ) == "inicio":
+
+        score += 10.0
+
+    elif impulse.get(
+        "phase"
+    ) == "temprano":
+
+        score += 8.0
+
+    elif impulse.get(
+        "phase"
+    ) == "avanzado":
+
+        score += 2.0
+
+    if (
+        impulse.get(
+            "extension_atr",
+            999.0,
+        )
+        <= 1.50
+    ):
+
+        score += 8.0
+
+    elif (
+        impulse.get(
+            "extension_atr",
+            999.0,
+        )
+        <= 2.20
+    ):
+
+        score += 4.0
+
+    if distance_zone >= 0.70:
+        score += 5.0
+
+    elif distance_zone >= 0.35:
+        score += 2.0
+
+    if trendline_distance >= 0.60:
+        score += 5.0
+
+    elif trendline_distance >= 0.30:
+        score += 2.0
+
+    if room_atr >= 1.20:
+        score += 5.0
+
+    elif room_atr >= 0.70:
+        score += 2.0
+
+    if candle[
+        "body_ratio"
+    ] >= 0.60:
+
+        score += 3.0
+
+    return int(
+        max(
+            0,
+            min(
+                100,
+                round(
+                    score
+                ),
+            ),
+        )
+    )
+
+
+# ============================================================
 # API PRINCIPAL
 # ============================================================
 
@@ -2072,13 +2760,7 @@ def analyze_market(
         return result
 
     # ========================================================
-    # IMPORTANTE:
-    #
-    # LA ÚLTIMA FILA ES N.
-    #
-    # N ES LA VELA QUE BOT.PY ACABA DE CERRAR.
-    #
-    # NO SE USA N+1.
+    # N ES LA ÚLTIMA VELA CERRADA
     # ========================================================
 
     current = data.iloc[-1]
@@ -2146,7 +2828,7 @@ def analyze_market(
     )
 
     # ========================================================
-    # MÉTRICAS VELA N
+    # MÉTRICAS
     # ========================================================
 
     c = candle_metrics(
@@ -2183,6 +2865,43 @@ def analyze_market(
         current,
         structure,
         atr,
+    )
+
+    # ========================================================
+    # TENDENCIA DINÁMICA
+    # ========================================================
+
+    trendline = (
+        _dynamic_trendline_distance(
+            history,
+            price,
+            structure,
+            atr,
+        )
+    )
+
+    # ========================================================
+    # DISTANCIAS S/R
+    # ========================================================
+
+    distances = _level_distances(
+        price,
+        last_low,
+        last_high,
+        atr,
+    )
+
+    # ========================================================
+    # DIVERGENCIA
+    # ========================================================
+
+    divergence = (
+        _detect_rsi_divergence(
+            history,
+            current,
+            structure,
+            atr,
+        )
     )
 
     # ========================================================
@@ -2242,6 +2961,14 @@ def analyze_market(
                     "consolidation"
                 ],
                 "candle": c,
+                "trendline": trendline,
+                "distance_support_atr": distances[
+                    "support_atr"
+                ],
+                "distance_resistance_atr": distances[
+                    "resistance_atr"
+                ],
+                "divergence": divergence,
             },
         }
     )
@@ -2296,124 +3023,10 @@ def analyze_market(
         return result
 
     # ========================================================
-    # CUERPO DE N
-    # ========================================================
-
-    if not _body_is_valid(
-        c,
-        atr,
-    ):
-
-        result[
-            "reason"
-        ] = (
-            "Vela N demasiado pequeña "
-            "o demasiado grande"
-        )
-
-        result[
-            "analysis"
-        ][
-            "blocked_reason"
-        ] = "cuerpo inválido"
-
-        return result
-
-    # ========================================================
-    # IMPULSO EXCESIVAMENTE EXTENDIDO
-    # ========================================================
-
-    if (
-        impulse[
-            "extension_atr"
-        ]
-        > MAX_IMPULSE_TOTAL_ATR
-    ):
-
-        result[
-            "reason"
-        ] = (
-            "Entrada bloqueada: "
-            "impulso excesivamente extendido"
-        )
-
-        result[
-            "zone"
-        ] = "impulso_extendido"
-
-        return result
-
-    # ========================================================
-    # DEMASIADAS VELAS CONSECUTIVAS
-    # ========================================================
-
-    if (
-        impulse[
-            "consecutive"
-        ]
-        > MAX_CONSECUTIVE_DIRECTION_CANDLES
-    ):
-
-        result[
-            "reason"
-        ] = (
-            "Entrada bloqueada: "
-            "demasiadas velas consecutivas "
-            "en la misma dirección"
-        )
-
-        result[
-            "zone"
-        ] = "late_trend"
-
-        return result
-
-    # ========================================================
-    # CALL
+    # ROOM AL EXTREMO CONTRARIO
     # ========================================================
 
     if structure == "bullish":
-
-        # ----------------------------------------------------
-        # EMA
-        # ----------------------------------------------------
-
-        if not _ema_alignment(
-            current,
-            "bullish",
-        ):
-
-            result[
-                "reason"
-            ] = (
-                "EMA no confirma "
-                "estructura alcista"
-            )
-
-            return result
-
-        # ----------------------------------------------------
-        # RSI
-        # ----------------------------------------------------
-
-        if not (
-            CALL_RSI_MIN
-            <= rsi
-            <= CALL_RSI_MAX
-        ):
-
-            result[
-                "reason"
-            ] = (
-                f"RSI CALL fuera "
-                f"de rango {rsi:.1f}"
-            )
-
-            return result
-
-        # ----------------------------------------------------
-        # EVITAR COMPRAR CERCA DEL MÁXIMO
-        # ----------------------------------------------------
 
         room_ok, room_atr = (
             _room_to_opposite(
@@ -2424,337 +3037,7 @@ def analyze_market(
             )
         )
 
-        if not room_ok:
-
-            result[
-                "reason"
-            ] = (
-                "CALL bloqueado: "
-                "poco espacio hasta "
-                "el último máximo"
-            )
-
-            result[
-                "zone"
-            ] = "extremo_opuesto"
-
-            result[
-                "analysis"
-            ][
-                "room_to_opposite_atr"
-            ] = room_atr
-
-            return result
-
-        # ----------------------------------------------------
-        # RECHAZO DEL SOPORTE
-        # ----------------------------------------------------
-
-        support_ok, distance, _ = (
-            _zone_test(
-                c,
-                last_low,
-                atr,
-                "support",
-            )
-        )
-
-        if not support_ok:
-
-            result[
-                "reason"
-            ] = (
-                "Esperando rechazo real "
-                "del último mínimo/soporte"
-            )
-
-            result[
-                "zone"
-            ] = "soporte"
-
-            return result
-
-        # ----------------------------------------------------
-        # NO DEBE ESTAR LEJOS DEL SOPORTE
-        # ----------------------------------------------------
-
-        if (
-            distance
-            > MAX_ENTRY_DISTANCE_ATR
-        ):
-
-            result[
-                "reason"
-            ] = (
-                "CALL rechazado: "
-                "cierre demasiado alejado "
-                "del soporte"
-            )
-
-            return result
-
-        # ----------------------------------------------------
-        # RECUPERACIÓN
-        # ----------------------------------------------------
-
-        if price <= p["close"]:
-
-            result[
-                "reason"
-            ] = (
-                "CALL bloqueado: "
-                "el rechazo no recuperó "
-                "el cierre anterior"
-            )
-
-            return result
-
-        # ----------------------------------------------------
-        # FASE DEL IMPULSO
-        # ----------------------------------------------------
-
-        phase = impulse[
-            "phase"
-        ]
-
-        # Si es tardío, no entra.
-        if phase == "tardío":
-
-            result[
-                "reason"
-            ] = (
-                "CALL bloqueado: "
-                "impulso tardío"
-            )
-
-            return result
-
-        # Un impulso avanzado solo se permite si
-        # realmente existe retroceso hasta estructura.
-        if (
-            phase == "avanzado"
-            and distance
-            > MAX_ENTRY_DISTANCE_ATR
-        ):
-
-            result[
-                "reason"
-            ] = (
-                "CALL bloqueado: "
-                "impulso avanzado "
-                "sin retroceso suficiente"
-            )
-
-            return result
-
-        # ----------------------------------------------------
-        # CALIDAD
-        # ----------------------------------------------------
-
-        wick_strength = (
-            c["lower"]
-            / max(
-                c["range"],
-                EPS,
-            )
-        )
-
-        recovery_strength = max(
-            0.0,
-            min(
-                1.0,
-                (
-                    price
-                    - p["close"]
-                )
-                / max(
-                    atr,
-                    EPS,
-                ),
-            ),
-        )
-
-        quality = 45.0
-
-        quality += min(
-            15.0,
-            wick_strength
-            * 30.0,
-        )
-
-        quality += min(
-            10.0,
-            s_score
-            * 2.0,
-        )
-
-        quality += min(
-            10.0,
-            recovery_strength
-            * 10.0,
-        )
-
-        if impulse[
-            "phase"
-        ] == "inicio":
-
-            quality += 10.0
-
-        elif impulse[
-            "phase"
-        ] == "temprano":
-
-            quality += 7.0
-
-        elif impulse[
-            "phase"
-        ] == "avanzado":
-
-            quality -= 5.0
-
-        if impulse[
-            "consolidation"
-        ]:
-
-            quality += 5.0
-
-        if (
-            impulse[
-                "extension_atr"
-            ]
-            <= 1.50
-        ):
-
-            quality += 5.0
-
-        # Penalización si está cerca del extremo opuesto.
-        if room_atr < 1.0:
-
-            quality -= 10.0
-
-        quality = int(
-            max(
-                0,
-                min(
-                    100,
-                    round(
-                        quality
-                    ),
-                ),
-            )
-        )
-
-        if quality < MIN_ENTRY_SCORE:
-
-            result[
-                "reason"
-            ] = (
-                f"CALL rechazado: "
-                f"calidad {quality}/100"
-            )
-
-            return result
-
-        # ----------------------------------------------------
-        # SCORE FINAL
-        # ----------------------------------------------------
-
-        final_score = int(
-            round(
-                quality
-            )
-        )
-
-        result.update(
-            {
-                "signal": "call",
-                "score": final_score,
-                "reason": (
-                    "CALL | "
-                    "rechazo estructural "
-                    "de soporte | "
-                    f"calidad={quality}/100 | "
-                    f"fase={phase} | "
-                    f"impulso={impulse['age']} velas | "
-                    f"extensión="
-                    f"{impulse['extension_atr']:.2f} ATR"
-                ),
-                "continuity": True,
-                "blocked": False,
-                "zone": "soporte_rechazado",
-                "entry_type": (
-                    "rejection_support"
-                ),
-                "entry_quality": quality,
-                "signal_price": price,
-                "candle_open": c["open"],
-                "candle_close": c["close"],
-                "distance_to_zone_atr": distance,
-                "analysis": {
-                    **result[
-                        "analysis"
-                    ],
-                    "zone": (
-                        "soporte_rechazado"
-                    ),
-                    "entry_quality": quality,
-                    "room_to_opposite_atr": room_atr,
-                    "distance_to_zone_atr": distance,
-                    "impulse_reason": impulse[
-                        "reason"
-                    ],
-                },
-            }
-        )
-
-        return result
-
-    # ========================================================
-    # PUT
-    # ========================================================
-
-    if structure == "bearish":
-
-        # ----------------------------------------------------
-        # EMA
-        # ----------------------------------------------------
-
-        if not _ema_alignment(
-            current,
-            "bearish",
-        ):
-
-            result[
-                "reason"
-            ] = (
-                "EMA no confirma "
-                "estructura bajista"
-            )
-
-            return result
-
-        # ----------------------------------------------------
-        # RSI
-        # ----------------------------------------------------
-
-        if not (
-            PUT_RSI_MIN
-            <= rsi
-            <= PUT_RSI_MAX
-        ):
-
-            result[
-                "reason"
-            ] = (
-                f"RSI PUT fuera "
-                f"de rango {rsi:.1f}"
-            )
-
-            return result
-
-        # ----------------------------------------------------
-        # EVITAR VENDER CERCA DEL MÍNIMO
-        # ----------------------------------------------------
+    else:
 
         room_ok, room_atr = (
             _room_to_opposite(
@@ -2765,290 +3048,1093 @@ def analyze_market(
             )
         )
 
-        if not room_ok:
-
-            result[
-                "reason"
-            ] = (
-                "PUT bloqueado: "
-                "poco espacio hasta "
-                "el último mínimo"
-            )
-
-            result[
-                "zone"
-            ] = "extremo_opuesto"
-
-            result[
-                "analysis"
-            ][
-                "room_to_opposite_atr"
-            ] = room_atr
-
-            return result
-
-        # ----------------------------------------------------
-        # RECHAZO RESISTENCIA
-        # ----------------------------------------------------
-
-        resistance_ok, distance, _ = (
-            _zone_test(
-                c,
-                last_high,
-                atr,
-                "resistance",
-            )
-        )
-
-        if not resistance_ok:
-
-            result[
-                "reason"
-            ] = (
-                "Esperando rechazo real "
-                "del último máximo/resistencia"
-            )
-
-            result[
-                "zone"
-            ] = "resistencia"
-
-            return result
-
-        # ----------------------------------------------------
-        # NO DEBE ESTAR LEJOS
-        # ----------------------------------------------------
-
-        if (
-            distance
-            > MAX_ENTRY_DISTANCE_ATR
-        ):
-
-            result[
-                "reason"
-            ] = (
-                "PUT rechazado: "
-                "cierre demasiado alejado "
-                "de la resistencia"
-            )
-
-            return result
-
-        # ----------------------------------------------------
-        # RECUPERACIÓN BAJISTA
-        # ----------------------------------------------------
-
-        if price >= p["close"]:
-
-            result[
-                "reason"
-            ] = (
-                "PUT bloqueado: "
-                "el rechazo no recuperó "
-                "a la baja"
-            )
-
-            return result
-
-        # ----------------------------------------------------
-        # FASE
-        # ----------------------------------------------------
-
-        phase = impulse[
-            "phase"
-        ]
-
-        if phase == "tardío":
-
-            result[
-                "reason"
-            ] = (
-                "PUT bloqueado: "
-                "impulso tardío"
-            )
-
-            return result
-
-        if (
-            phase == "avanzado"
-            and distance
-            > MAX_ENTRY_DISTANCE_ATR
-        ):
-
-            result[
-                "reason"
-            ] = (
-                "PUT bloqueado: "
-                "impulso avanzado "
-                "sin retroceso suficiente"
-            )
-
-            return result
-
-        # ----------------------------------------------------
-        # CALIDAD
-        # ----------------------------------------------------
-
-        wick_strength = (
-            c["upper"]
-            / max(
-                c["range"],
-                EPS,
-            )
-        )
-
-        recovery_strength = max(
-            0.0,
-            min(
-                1.0,
-                (
-                    p["close"]
-                    - price
-                )
-                / max(
-                    atr,
-                    EPS,
-                ),
-            ),
-        )
-
-        quality = 45.0
-
-        quality += min(
-            15.0,
-            wick_strength
-            * 30.0,
-        )
-
-        quality += min(
-            10.0,
-            s_score
-            * 2.0,
-        )
-
-        quality += min(
-            10.0,
-            recovery_strength
-            * 10.0,
-        )
-
-        if impulse[
-            "phase"
-        ] == "inicio":
-
-            quality += 10.0
-
-        elif impulse[
-            "phase"
-        ] == "temprano":
-
-            quality += 7.0
-
-        elif impulse[
-            "phase"
-        ] == "avanzado":
-
-            quality -= 5.0
-
-        if impulse[
-            "consolidation"
-        ]:
-
-            quality += 5.0
-
-        if (
-            impulse[
-                "extension_atr"
-            ]
-            <= 1.50
-        ):
-
-            quality += 5.0
-
-        if room_atr < 1.0:
-
-            quality -= 10.0
-
-        quality = int(
-            max(
-                0,
-                min(
-                    100,
-                    round(
-                        quality
-                    ),
-                ),
-            )
-        )
-
-        if quality < MIN_ENTRY_SCORE:
-
-            result[
-                "reason"
-            ] = (
-                f"PUT rechazado: "
-                f"calidad {quality}/100"
-            )
-
-            return result
-
-        final_score = int(
-            round(
-                quality
-            )
-        )
-
-        result.update(
-            {
-                "signal": "put",
-                "score": final_score,
-                "reason": (
-                    "PUT | "
-                    "rechazo estructural "
-                    "de resistencia | "
-                    f"calidad={quality}/100 | "
-                    f"fase={phase} | "
-                    f"impulso={impulse['age']} velas | "
-                    f"extensión="
-                    f"{impulse['extension_atr']:.2f} ATR"
-                ),
-                "continuity": True,
-                "blocked": False,
-                "zone": "resistencia_rechazada",
-                "entry_type": (
-                    "rejection_resistance"
-                ),
-                "entry_quality": quality,
-                "signal_price": price,
-                "candle_open": c["open"],
-                "candle_close": c["close"],
-                "distance_to_zone_atr": distance,
-                "analysis": {
-                    **result[
-                        "analysis"
-                    ],
-                    "zone": (
-                        "resistencia_rechazada"
-                    ),
-                    "entry_quality": quality,
-                    "room_to_opposite_atr": room_atr,
-                    "distance_to_zone_atr": distance,
-                    "impulse_reason": impulse[
-                        "reason"
-                    ],
-                },
-            }
-        )
-
-        return result
+    result[
+        "analysis"
+    ][
+        "room_to_opposite_atr"
+    ] = room_atr
 
     # ========================================================
-    # SEGURIDAD
+    # ========================================================
+    # PRIMERA PRIORIDAD:
+    # RECHAZO ESTRUCTURAL EXISTENTE
+    # ========================================================
+    # ========================================================
+
+    # ========================================================
+    # CALL — RECHAZO
+    # ========================================================
+
+    if structure == "bullish":
+
+        if _ema_alignment(
+            current,
+            "bullish",
+        ):
+
+            if (
+                CALL_RSI_MIN
+                <= rsi
+                <= CALL_RSI_MAX
+            ):
+
+                support_ok, distance, _ = (
+                    _zone_test(
+                        c,
+                        last_low,
+                        atr,
+                        "support",
+                    )
+                )
+
+                if support_ok:
+
+                    if (
+                        distance
+                        <= MAX_ENTRY_DISTANCE_ATR
+                    ):
+
+                        if (
+                            price
+                            > p["close"]
+                        ):
+
+                            phase = impulse[
+                                "phase"
+                            ]
+
+                            impulse_extension = (
+                                impulse[
+                                    "extension_atr"
+                                ]
+                            )
+
+                            consecutive = (
+                                impulse[
+                                    "consecutive"
+                                ]
+                            )
+
+                            if (
+                                impulse_extension
+                                <= MAX_IMPULSE_TOTAL_ATR
+                                and
+                                consecutive
+                                <= MAX_CONSECUTIVE_DIRECTION_CANDLES
+                                and
+                                phase
+                                != "tardío"
+                            ):
+
+                                wick_strength = (
+                                    c["lower"]
+                                    / max(
+                                        c["range"],
+                                        EPS,
+                                    )
+                                )
+
+                                recovery_strength = max(
+                                    0.0,
+                                    min(
+                                        1.0,
+                                        (
+                                            price
+                                            - p["close"]
+                                        )
+                                        / max(
+                                            atr,
+                                            EPS,
+                                        ),
+                                    ),
+                                )
+
+                                quality = 45.0
+
+                                quality += min(
+                                    15.0,
+                                    wick_strength
+                                    * 30.0,
+                                )
+
+                                quality += min(
+                                    10.0,
+                                    s_score
+                                    * 2.0,
+                                )
+
+                                quality += min(
+                                    10.0,
+                                    recovery_strength
+                                    * 10.0,
+                                )
+
+                                if phase == "inicio":
+                                    quality += 10.0
+
+                                elif phase == "temprano":
+                                    quality += 7.0
+
+                                elif phase == "avanzado":
+                                    quality -= 5.0
+
+                                if impulse[
+                                    "consolidation"
+                                ]:
+                                    quality += 5.0
+
+                                if (
+                                    impulse[
+                                        "extension_atr"
+                                    ]
+                                    <= 1.50
+                                ):
+                                    quality += 5.0
+
+                                if room_atr < 1.0:
+                                    quality -= 10.0
+
+                                quality = int(
+                                    max(
+                                        0,
+                                        min(
+                                            100,
+                                            round(
+                                                quality
+                                            ),
+                                        ),
+                                    )
+                                )
+
+                                if (
+                                    quality
+                                    >= MIN_ENTRY_SCORE
+                                ):
+
+                                    result.update(
+                                        {
+                                            "signal": "call",
+                                            "score": quality,
+                                            "reason": (
+                                                "CALL | "
+                                                "rechazo estructural "
+                                                "de soporte | "
+                                                f"calidad={quality}/100 | "
+                                                f"fase={phase} | "
+                                                f"impulso="
+                                                f"{impulse['age']} velas | "
+                                                f"extensión="
+                                                f"{impulse_extension:.2f} ATR"
+                                            ),
+                                            "continuity": True,
+                                            "blocked": False,
+                                            "zone": "soporte_rechazado",
+                                            "entry_type": (
+                                                "rejection_support"
+                                            ),
+                                            "entry_quality": quality,
+                                            "signal_price": price,
+                                            "candle_open": c["open"],
+                                            "candle_close": c["close"],
+                                            "distance_to_zone_atr": distance,
+                                            "analysis": {
+                                                **result[
+                                                    "analysis"
+                                                ],
+                                                "zone": (
+                                                    "soporte_rechazado"
+                                                ),
+                                                "entry_quality": quality,
+                                                "room_to_opposite_atr": room_atr,
+                                                "distance_to_zone_atr": distance,
+                                                "impulse_reason": impulse[
+                                                    "reason"
+                                                ],
+                                            },
+                                        }
+                                    )
+
+                                    return result
+
+    # ========================================================
+    # PUT — RECHAZO
+    # ========================================================
+
+    if structure == "bearish":
+
+        if _ema_alignment(
+            current,
+            "bearish",
+        ):
+
+            if (
+                PUT_RSI_MIN
+                <= rsi
+                <= PUT_RSI_MAX
+            ):
+
+                resistance_ok, distance, _ = (
+                    _zone_test(
+                        c,
+                        last_high,
+                        atr,
+                        "resistance",
+                    )
+                )
+
+                if resistance_ok:
+
+                    if (
+                        distance
+                        <= MAX_ENTRY_DISTANCE_ATR
+                    ):
+
+                        if (
+                            price
+                            < p["close"]
+                        ):
+
+                            phase = impulse[
+                                "phase"
+                            ]
+
+                            impulse_extension = (
+                                impulse[
+                                    "extension_atr"
+                                ]
+                            )
+
+                            consecutive = (
+                                impulse[
+                                    "consecutive"
+                                ]
+                            )
+
+                            if (
+                                impulse_extension
+                                <= MAX_IMPULSE_TOTAL_ATR
+                                and
+                                consecutive
+                                <= MAX_CONSECUTIVE_DIRECTION_CANDLES
+                                and
+                                phase
+                                != "tardío"
+                            ):
+
+                                wick_strength = (
+                                    c["upper"]
+                                    / max(
+                                        c["range"],
+                                        EPS,
+                                    )
+                                )
+
+                                recovery_strength = max(
+                                    0.0,
+                                    min(
+                                        1.0,
+                                        (
+                                            p["close"]
+                                            - price
+                                        )
+                                        / max(
+                                            atr,
+                                            EPS,
+                                        ),
+                                    ),
+                                )
+
+                                quality = 45.0
+
+                                quality += min(
+                                    15.0,
+                                    wick_strength
+                                    * 30.0,
+                                )
+
+                                quality += min(
+                                    10.0,
+                                    s_score
+                                    * 2.0,
+                                )
+
+                                quality += min(
+                                    10.0,
+                                    recovery_strength
+                                    * 10.0,
+                                )
+
+                                if phase == "inicio":
+                                    quality += 10.0
+
+                                elif phase == "temprano":
+                                    quality += 7.0
+
+                                elif phase == "avanzado":
+                                    quality -= 5.0
+
+                                if impulse[
+                                    "consolidation"
+                                ]:
+                                    quality += 5.0
+
+                                if (
+                                    impulse[
+                                        "extension_atr"
+                                    ]
+                                    <= 1.50
+                                ):
+                                    quality += 5.0
+
+                                if room_atr < 1.0:
+                                    quality -= 10.0
+
+                                quality = int(
+                                    max(
+                                        0,
+                                        min(
+                                            100,
+                                            round(
+                                                quality
+                                            ),
+                                        ),
+                                    )
+                                )
+
+                                if (
+                                    quality
+                                    >= MIN_ENTRY_SCORE
+                                ):
+
+                                    result.update(
+                                        {
+                                            "signal": "put",
+                                            "score": quality,
+                                            "reason": (
+                                                "PUT | "
+                                                "rechazo estructural "
+                                                "de resistencia | "
+                                                f"calidad={quality}/100 | "
+                                                f"fase={phase} | "
+                                                f"impulso="
+                                                f"{impulse['age']} velas | "
+                                                f"extensión="
+                                                f"{impulse_extension:.2f} ATR"
+                                            ),
+                                            "continuity": True,
+                                            "blocked": False,
+                                            "zone": "resistencia_rechazada",
+                                            "entry_type": (
+                                                "rejection_resistance"
+                                            ),
+                                            "entry_quality": quality,
+                                            "signal_price": price,
+                                            "candle_open": c["open"],
+                                            "candle_close": c["close"],
+                                            "distance_to_zone_atr": distance,
+                                            "analysis": {
+                                                **result[
+                                                    "analysis"
+                                                ],
+                                                "zone": (
+                                                    "resistencia_rechazada"
+                                                ),
+                                                "entry_quality": quality,
+                                                "room_to_opposite_atr": room_atr,
+                                                "distance_to_zone_atr": distance,
+                                                "impulse_reason": impulse[
+                                                    "reason"
+                                                ],
+                                            },
+                                        }
+                                    )
+
+                                    return result
+
+    # ========================================================
+    # DESDE AQUÍ:
+    # SEÑALES ALTERNATIVAS
+    #
+    # Estas NO sustituyen el rechazo.
+    #
+    # Permiten:
+    # CONTINUIDAD
+    # DESCANSO
+    # INDECISIÓN
+    # FUERZA
+    # DIVERGENCIA
+    # ========================================================
+
+    # --------------------------------------------------------
+    # NO APLICAR EL FILTRO DE CUERPO ORIGINAL AQUÍ.
+    #
+    # DESCANSO E INDECISIÓN necesitan cuerpos pequeños.
+    # --------------------------------------------------------
+
+    healthy_phase = (
+        _healthy_continuation_phase(
+            impulse
+        )
+    )
+
+    # --------------------------------------------------------
+    # DISTANCIA A LA ZONA CONTRARIA
+    # --------------------------------------------------------
+
+    away_from_zone, zone_distance = (
+        _away_from_reversal_zone(
+            price,
+            last_low,
+            last_high,
+            atr,
+            structure,
+        )
+    )
+
+    # --------------------------------------------------------
+    # DISTANCIA A TRENDLINE
+    # --------------------------------------------------------
+
+    trendline_distance = _safe_float(
+        trendline.get(
+            "distance_atr",
+            999.0,
+        ),
+        999.0,
+    )
+
+    away_from_trendline = (
+        trendline_distance
+        >= MIN_DISTANCE_FROM_TRENDLINE_ATR
+    )
+
+    # ========================================================
+    # REGLA DE SEGURIDAD PARA CONTINUACIÓN
+    # ========================================================
+
+    if (
+        not room_ok
+        and
+        structure in (
+            "bullish",
+            "bearish",
+        )
+    ):
+
+        result[
+            "analysis"
+        ][
+            "alternative_blocked"
+        ] = (
+            "poco espacio hasta "
+            "extremo contrario"
+        )
+
+    # ========================================================
+    # 1. DIVERGENCIA
+    # ========================================================
+    #
+    # CALL:
+    # precio LL + RSI HL + estructura alcista
+    #
+    # PUT:
+    # precio HH + RSI LH + estructura bajista
+    #
+    # La divergencia no se permite demasiado extendida.
+    # ========================================================
+
+    if divergence[
+        "valid"
+    ]:
+
+        divergence_direction = (
+            divergence[
+                "type"
+            ]
+        )
+
+        direction_matches = (
+            (
+                structure
+                == "bullish"
+                and
+                divergence_direction
+                == "bullish"
+            )
+            or
+            (
+                structure
+                == "bearish"
+                and
+                divergence_direction
+                == "bearish"
+            )
+        )
+
+        if direction_matches:
+
+            divergence_phase_ok = (
+                impulse[
+                    "extension_atr"
+                ]
+                <= MAX_IMPULSE_TOTAL_ATR
+                and
+                impulse[
+                    "phase"
+                ]
+                != "tardío"
+            )
+
+            if (
+                divergence_phase_ok
+                and
+                room_ok
+                and
+                away_from_zone
+                and
+                away_from_trendline
+            ):
+
+                quality = (
+                    72
+                    + min(
+                        10,
+                        s_score * 2,
+                    )
+                )
+
+                if (
+                    divergence[
+                        "rsi_change"
+                    ]
+                    >= 4.0
+                ):
+                    quality += 5
+
+                if (
+                    divergence[
+                        "price_change_atr"
+                    ]
+                    >= 0.15
+                ):
+                    quality += 5
+
+                quality = min(
+                    100,
+                    quality,
+                )
+
+                if (
+                    quality
+                    >= 70
+                ):
+
+                    if (
+                        divergence_direction
+                        == "bullish"
+                    ):
+
+                        signal = "call"
+                        zone = "divergencia_alcista"
+
+                    else:
+
+                        signal = "put"
+                        zone = "divergencia_bajista"
+
+                    result.update(
+                        {
+                            "signal": signal,
+                            "score": quality,
+                            "reason": (
+                                f"{signal.upper()} | "
+                                f"{divergence['reason']} | "
+                                "estructura confirmada | "
+                                f"calidad={quality}/100"
+                            ),
+                            "continuity": True,
+                            "blocked": False,
+                            "zone": zone,
+                            "entry_type": (
+                                "rsi_divergence"
+                            ),
+                            "entry_quality": quality,
+                            "signal_price": price,
+                            "candle_open": c["open"],
+                            "candle_close": c["close"],
+                            "analysis": {
+                                **result[
+                                    "analysis"
+                                ],
+                                "divergence": divergence,
+                                "entry_quality": quality,
+                                "zone_distance_atr": zone_distance,
+                                "trendline_distance_atr": trendline_distance,
+                            },
+                        }
+                    )
+
+                    return result
+
+    # ========================================================
+    # 2. FUERZA
+    # ========================================================
+    #
+    # Solo al comienzo o fase temprana.
+    # Nunca cerca de soporte/resistencia.
+    # Nunca cerca de trendline.
+    # ========================================================
+
+    if (
+        healthy_phase
+        and
+        room_ok
+        and
+        away_from_zone
+        and
+        away_from_trendline
+        and
+        _is_force_candle(
+            c,
+            structure,
+            atr,
+        )
+    ):
+
+        quality = _alternative_quality(
+            s_score,
+            impulse,
+            c,
+            zone_distance,
+            trendline_distance,
+            room_atr,
+        )
+
+        quality += 8
+
+        quality = min(
+            100,
+            quality,
+        )
+
+        if quality >= 70:
+
+            if structure == "bullish":
+
+                signal = "call"
+
+                zone = (
+                    "fuerza_alcista"
+                )
+
+            else:
+
+                signal = "put"
+
+                zone = (
+                    "fuerza_bajista"
+                )
+
+            result.update(
+                {
+                    "signal": signal,
+                    "score": quality,
+                    "reason": (
+                        f"{signal.upper()} | "
+                        "vela de FUERZA | "
+                        "inicio/continuación "
+                        "temprana del impulso | "
+                        f"calidad={quality}/100"
+                    ),
+                    "continuity": True,
+                    "blocked": False,
+                    "zone": zone,
+                    "entry_type": "force",
+                    "entry_quality": quality,
+                    "signal_price": price,
+                    "candle_open": c["open"],
+                    "candle_close": c["close"],
+                    "analysis": {
+                        **result[
+                            "analysis"
+                        ],
+                        "entry_quality": quality,
+                        "zone_distance_atr": zone_distance,
+                        "trendline_distance_atr": trendline_distance,
+                    },
+                }
+            )
+
+            return result
+
+    # ========================================================
+    # 3. CONTINUIDAD
+    # ========================================================
+    #
+    # Debe existir tendencia.
+    #
+    # N es vela de continuidad.
+    #
+    # CALL:
+    # no cerca de resistencia.
+    #
+    # PUT:
+    # no cerca de soporte.
+    #
+    # Se prepara la entrada para N+1.
+    # ========================================================
+
+    if (
+        healthy_phase
+        and
+        room_ok
+        and
+        away_from_zone
+        and
+        away_from_trendline
+        and
+        _is_continuity_candle(
+            c,
+            structure,
+            atr,
+        )
+    ):
+
+        quality = _alternative_quality(
+            s_score,
+            impulse,
+            c,
+            zone_distance,
+            trendline_distance,
+            room_atr,
+        )
+
+        if structure == "bullish":
+
+            # No comprar cerca de resistencia.
+
+            if (
+                distances[
+                    "resistance_atr"
+                ]
+                < MIN_DISTANCE_FROM_ZONE_ATR
+            ):
+
+                quality = 0
+
+        else:
+
+            # No vender cerca de soporte.
+
+            if (
+                distances[
+                    "support_atr"
+                ]
+                < MIN_DISTANCE_FROM_ZONE_ATR
+            ):
+
+                quality = 0
+
+        if quality >= 70:
+
+            if structure == "bullish":
+
+                signal = "call"
+
+                zone = (
+                    "continuidad_alcista"
+                )
+
+            else:
+
+                signal = "put"
+
+                zone = (
+                    "continuidad_bajista"
+                )
+
+            result.update(
+                {
+                    "signal": signal,
+                    "score": quality,
+                    "reason": (
+                        f"{signal.upper()} | "
+                        "CONTINUIDAD | "
+                        "vela N confirma "
+                        "dirección | "
+                        "entrada preparada para N+1 | "
+                        f"calidad={quality}/100"
+                    ),
+                    "continuity": True,
+                    "blocked": False,
+                    "zone": zone,
+                    "entry_type": "continuity",
+                    "entry_quality": quality,
+                    "signal_price": price,
+                    "candle_open": c["open"],
+                    "candle_close": c["close"],
+                    "analysis": {
+                        **result[
+                            "analysis"
+                        ],
+                        "entry_quality": quality,
+                        "zone_distance_atr": zone_distance,
+                        "trendline_distance_atr": trendline_distance,
+                        "entry_for_next_candle": True,
+                    },
+                }
+            )
+
+            return result
+
+    # ========================================================
+    # 4. DESCANSO
+    # ========================================================
+    #
+    # N es una vela pequeña de descanso.
+    #
+    # Solo se permite en dirección de tendencia.
+    #
+    # La vela anterior debe demostrar fuerza/dirección.
+    #
+    # Se prepara N+1.
+    # ========================================================
+
+    if (
+        room_ok
+        and
+        away_from_zone
+        and
+        away_from_trendline
+        and
+        _is_rest_candle(
+            c,
+            p,
+            structure,
+        )
+    ):
+
+        # La vela anterior debe ir en dirección
+        # de la tendencia.
+
+        previous_direction = (
+            candle_direction(
+                previous
+            )
+        )
+
+        correct_previous_direction = (
+            (
+                structure == "bullish"
+                and
+                previous_direction
+                == "bull"
+            )
+            or
+            (
+                structure == "bearish"
+                and
+                previous_direction
+                == "bear"
+            )
+        )
+
+        if correct_previous_direction:
+
+            quality = (
+                _alternative_quality(
+                    s_score,
+                    impulse,
+                    c,
+                    zone_distance,
+                    trendline_distance,
+                    room_atr,
+                )
+            )
+
+            quality += 3
+
+            quality = min(
+                100,
+                quality,
+            )
+
+            if quality >= 70:
+
+                if structure == "bullish":
+
+                    signal = "call"
+
+                    zone = (
+                        "descanso_alcista"
+                    )
+
+                else:
+
+                    signal = "put"
+
+                    zone = (
+                        "descanso_bajista"
+                    )
+
+                result.update(
+                    {
+                        "signal": signal,
+                        "score": quality,
+                        "reason": (
+                            f"{signal.upper()} | "
+                            "DESCANSO | "
+                            "vela N descansa "
+                            "dentro de tendencia | "
+                            "entrada preparada para N+1 | "
+                            f"calidad={quality}/100"
+                        ),
+                        "continuity": True,
+                        "blocked": False,
+                        "zone": zone,
+                        "entry_type": "rest",
+                        "entry_quality": quality,
+                        "signal_price": price,
+                        "candle_open": c["open"],
+                        "candle_close": c["close"],
+                        "analysis": {
+                            **result[
+                                "analysis"
+                            ],
+                            "entry_quality": quality,
+                            "zone_distance_atr": zone_distance,
+                            "trendline_distance_atr": trendline_distance,
+                            "entry_for_next_candle": True,
+                        },
+                    }
+                )
+
+                return result
+
+    # ========================================================
+    # 5. INDECISIÓN
+    # ========================================================
+    #
+    # La vela N NO es una entrada directa.
+    #
+    # Se utiliza para preparar N+1.
+    #
+    # N+1 debe quedar alejada de:
+    #
+    # - soporte
+    # - resistencia
+    # - punto de reversión
+    # - trendline
+    #
+    # Como bot.py ejecuta la señal en N+1 después de analizar N,
+    # devolvemos la preparación como señal.
+    # ========================================================
+
+    if (
+        room_ok
+        and
+        away_from_zone
+        and
+        away_from_trendline
+        and
+        _is_indecision_candle(
+            c
+        )
+    ):
+
+        quality = (
+            _alternative_quality(
+                s_score,
+                impulse,
+                c,
+                zone_distance,
+                trendline_distance,
+                room_atr,
+            )
+        )
+
+        # Indecisión requiere mayor confirmación
+        # estructural.
+
+        if s_score >= 3:
+
+            quality += 2
+
+        quality = min(
+            100,
+            quality,
+        )
+
+        if quality >= 70:
+
+            if structure == "bullish":
+
+                signal = "call"
+
+                zone = (
+                    "indecision_alcista"
+                )
+
+            else:
+
+                signal = "put"
+
+                zone = (
+                    "indecision_bajista"
+                )
+
+            result.update(
+                {
+                    "signal": signal,
+                    "score": quality,
+                    "reason": (
+                        f"{signal.upper()} | "
+                        "INDECISIÓN | "
+                        "N no entra directamente | "
+                        "preparada para N+1 | "
+                        "lejos de S/R y tendencia | "
+                        f"calidad={quality}/100"
+                    ),
+                    "continuity": True,
+                    "blocked": False,
+                    "zone": zone,
+                    "entry_type": "indecision",
+                    "entry_quality": quality,
+                    "signal_price": price,
+                    "candle_open": c["open"],
+                    "candle_close": c["close"],
+                    "analysis": {
+                        **result[
+                            "analysis"
+                        ],
+                        "entry_quality": quality,
+                        "zone_distance_atr": zone_distance,
+                        "trendline_distance_atr": trendline_distance,
+                        "entry_for_next_candle": True,
+                        "indecision_requires_n_plus_1": True,
+                    },
+                }
+            )
+
+            return result
+
+    # ========================================================
+    # NINGUNA CONFIGURACIÓN
     # ========================================================
 
     result[
         "reason"
-    ] = "Sin dirección válida"
+    ] = (
+        "Sin configuración válida: "
+        "rechazo, continuidad, descanso, "
+        "fuerza, indecisión o divergencia"
+    )
+
+    result[
+        "analysis"
+    ][
+        "alternative_blocked"
+    ] = True
 
     return result
 
