@@ -85,7 +85,7 @@ EXPIRATION = 1
 AMOUNT = float(
     os.getenv(
         "AMOUNT",
-        "1200",
+        "120",
     )
 )
 
