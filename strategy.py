@@ -2715,7 +2715,7 @@ def _alternative_quality(
 # API PRINCIPAL
 # ============================================================
 
-def analyze_market(
+def _analyze_market_full(
     df: Optional[pd.DataFrame] = None,
     candle_1m: Any = None,
     candles_5s: Optional[pd.DataFrame] = None,
@@ -3571,7 +3571,16 @@ def analyze_market(
             )
         )
 
-        if direction_matches:
+        # Si la vela actual es de FUERZA, la prioridad es FUERZA.
+        # No permitir que una divergencia la reemplace.
+        if (
+            direction_matches
+            and not _is_force_candle(
+                c,
+                structure,
+                atr,
+            )
+        ):
 
             divergence_phase_ok = (
                 impulse[
@@ -4135,6 +4144,46 @@ def analyze_market(
     ][
         "alternative_blocked"
     ] = True
+
+    return result
+
+
+# ============================================================
+# API PUBLICA: SOLO FUERZA
+# ============================================================
+#
+# strategy.py analiza internamente la vela completa, pero SOLO
+# expone una señal cuando entry_type == "force".
+# Las señales de rechazo, divergencia, continuidad, descanso
+# e indecisión quedan bloqueadas y nunca llegan a bot.py.
+# ============================================================
+
+def analyze_market(
+    df: Optional[pd.DataFrame] = None,
+    candle_1m: Any = None,
+    candles_5s: Optional[pd.DataFrame] = None,
+    previous_m1: Optional[pd.DataFrame] = None,
+    pair: Optional[str] = None,
+) -> Dict[str, Any]:
+
+    result = _analyze_market_full(
+        df=df,
+        candle_1m=candle_1m,
+        candles_5s=candles_5s,
+        previous_m1=previous_m1,
+        pair=pair,
+    )
+
+    if result.get("entry_type") != "force":
+        result["signal"] = None
+        result["blocked"] = True
+        result["reason"] = (
+            "SIN SEÑAL: strategy.py solo permite "
+            "señales de FUERZA"
+        )
+        result["entry_type"] = None
+        result["entry_quality"] = 0
+        return result
 
     return result
 
