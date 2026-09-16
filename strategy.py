@@ -17,7 +17,7 @@ import math
 import pandas as pd
 
 
-MAX_CANDLES = 60
+MAX_CANDLES = 90
 EMA_FAST = 9
 EMA_SLOW = 21
 ATR_PERIOD = 14
@@ -30,19 +30,19 @@ MIN_SWING_ATR = 0.15
 
 # Multiplicadores deliberadamente conservadores: si el precio está cerca
 # de una zona importante, la operación se bloquea.
-SR_ATR_DISTANCE = 0.45
+SR_ATR_DISTANCE = 0.35
 
 # Filtro obligatorio de ubicación: solo permite operar en los extremos
 # del rango estructural reciente. La zona central queda bloqueada.
 EXTREME_LOW_PERCENT = 0.20
 EXTREME_HIGH_PERCENT = 0.80
 
-REJECTION_WICK_RATIO = 0.55
-MIN_BODY_ATR = 0.22
-MAX_COUNTER_WICK_ATR = 0.65
+REJECTION_WICK_RATIO = 0.50
+MIN_BODY_ATR = 0.18
+MAX_COUNTER_WICK_ATR = 0.55
 
 # Evita entrar cuando la tendencia ya está demasiado extendida.
-END_TREND_DISTANCE_ATR = 0.75
+END_TREND_DISTANCE_ATR = 0.60
 
 EPS = 1e-12
 
