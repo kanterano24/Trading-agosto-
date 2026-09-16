@@ -59,6 +59,12 @@ SNIPER_POLL = 0.06
 TRADE_COOLDOWN = float(os.getenv("TRADE_COOLDOWN", "60"))
 MIN_HISTORY = 35
 
+# Inicia el análisis automáticamente después de conectar a IQ Option.
+# Puede desactivarse con AUTO_START=false y usar /start desde Telegram.
+AUTO_START = os.getenv("AUTO_START", "true").strip().lower() in {
+    "1", "true", "yes", "on"
+}
+
 # La API publica de strategy.py debe exponer solamente entry_type=force.
 REQUIRE_FORCE = True
 REQUIRE_N_PLUS_1 = True
@@ -792,7 +798,9 @@ def main() -> None:
         telegram_send(f"❌ ERROR DE CONEXIÓN\n\n{exc}")
         return
 
-    BOT_RUNNING = False
+    # En Railway el proceso debe comenzar a trabajar sin depender de
+    # un comando manual de Telegram. /stop sigue permitiendo detenerlo.
+    BOT_RUNNING = AUTO_START
 
     telegram_send(
         "🤖 BOT LISTO\n\n"
@@ -800,8 +808,18 @@ def main() -> None:
         "📌 Analiza N cerrada\n"
         "🚫 No opera N\n"
         "⚡ Ejecuta en N+1\n"
-        f"⏳ Expiración: {EXPIRATION} minuto(s)\n\n"
-        "Usa /start para activar."
+        f"⏳ Expiración: {EXPIRATION} minuto(s)\n"
+        f"🚀 Inicio automático: {"SI" if AUTO_START else "NO"}\n\n"
+        + (
+            "🟢 Análisis automático activado."
+            if AUTO_START
+            else "Usa /start para activar."
+        )
+    )
+
+    logger.info(
+        "Motor de análisis: %s",
+        "ACTIVO AUTOMÁTICAMENTE" if AUTO_START else "ESPERANDO /start",
     )
 
     while True:
