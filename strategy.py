@@ -60,24 +60,24 @@ import pandas as pd
 MIN_BARS = 35
 MAX_CANDLES = 90
 
-EMA_FAST = 9
-EMA_MID = 21
-EMA_SLOW = 50
+EMA_FAST = 18
+EMA_MID = 42
+EMA_SLOW = 100
 
-RSI_PERIOD = 16
-ATR_PERIOD = 16
+RSI_PERIOD = 7
+ATR_PERIOD = 7
 
 
 # ============================================================
 # PIVOTES / ESTRUCTURA
 # ============================================================
 
-PIVOT_LEFT = 2
-PIVOT_RIGHT = 2
+PIVOT_LEFT = 3
+PIVOT_RIGHT = 3
 
-SWING_LOOKBACK = 35
+SWING_LOOKBACK = 45
 
-MIN_STRUCTURE_GAP_ATR = 0.05
+MIN_STRUCTURE_GAP_ATR = 0.08
 
 
 # ============================================================
@@ -95,13 +95,13 @@ MIN_ROOM_TO_OPPOSITE_ATR = 0.70
 # RECHAZO
 # ============================================================
 
-MIN_BODY_RATIO = 0.25
+MIN_BODY_RATIO = 0.45
 
-MIN_REJECTION_WICK_RATIO = 0.35
+MIN_REJECTION_WICK_RATIO = 0.55
 
-MIN_WICK_BODY_RATIO = 1.15
+MIN_WICK_BODY_RATIO = 2.30
 
-MIN_CLOSE_POSITION_CALL = 0.62
+MIN_CLOSE_POSITION_CALL = 1.65
 
 MAX_CLOSE_POSITION_PUT = 0.38
 
