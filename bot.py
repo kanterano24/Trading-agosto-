@@ -85,7 +85,7 @@ EXPIRATION = 1
 AMOUNT = float(
     os.getenv(
         "AMOUNT",
-        "3420",
+        "5000",
     )
 )
 
@@ -104,7 +104,7 @@ MAX_OTC_PAIRS = int(
 )
 
 PAIR_REFRESH_SECONDS = 60.0
-SNIPER_POLL = 0.03
+SNIPER_POLL = 0.06
 TRADE_COOLDOWN = 60.0
 
 
