@@ -1040,6 +1040,26 @@ def analyze_closed_candle(
         )
     )
 
+    entry_quality = int(
+        result.get(
+            "entry_quality",
+            0,
+        )
+    )
+
+    entry_type = result.get(
+        "entry_type"
+    )
+
+    # Compatibilidad con strategy.py:
+    # solo aceptar señales FUERZA con calidad >= 90.
+    if (
+        signal not in ("call", "put")
+        or entry_type != "force"
+        or entry_quality < 90
+    ):
+        signal = None
+
     logger.info(
         "%s | N CERRADA | "
         "signal=%s | score=%s | %s",
