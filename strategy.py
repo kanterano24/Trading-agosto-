@@ -164,7 +164,10 @@ PUT_RSI_MAX = 62.0
 
 MIN_STRUCTURE_SCORE = 3
 
-MIN_ENTRY_SCORE = 99
+# Calidad mínima exigida para emitir una señal.
+# Es una puntuación interna de confluencia, no una
+# probabilidad estadística garantizada de ganar.
+MIN_ENTRY_SCORE = 90
 
 
 # ============================================================
