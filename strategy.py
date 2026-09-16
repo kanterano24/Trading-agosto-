@@ -1,23 +1,22 @@
 """
 strategy.py
 
-ESTRATEGIA SOLO INDECISIÓN
+ESTRATEGIA SOLO DESCANSO
 PARA BINARY OTC M1
 
-Analiza únicamente velas de indecisión en N
+Detecta vela de descanso en N
 y prepara entrada para N+1.
 
 NO usa:
 - rechazo
 - continuidad
-- descanso
+- indecisión
 - fuerza
 - divergencia
 """
 
 from __future__ import annotations
 from typing import Any, Dict, Optional
-import math
 import pandas as pd
 import numpy as np
 
@@ -27,21 +26,16 @@ import numpy as np
 # ============================================================
 
 MIN_BARS = 35
+
 EMA_FAST = 9
 EMA_MID = 21
 EMA_SLOW = 50
 
 ATR_PERIOD = 14
-RSI_PERIOD = 14
 
-# INDECISIÓN
-INDECISION_MAX_BODY_RATIO = 0.30
-INDECISION_MIN_WICK_RATIO = 0.25
-
-MIN_STRUCTURE_SCORE = 3
-
-
-EPS = 1e-12
+# DESCANSO
+REST_MAX_BODY_RATIO = 0.50
+REST_MIN_PREVIOUS_BODY_RATIO = 0.55
 
 
 # ============================================================
@@ -101,31 +95,10 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df["ema21"] = close.ewm(span=EMA_MID).mean()
     df["ema50"] = close.ewm(span=EMA_SLOW).mean()
 
-    # ATR
-    high = df["high"]
-    low = df["low"]
-
-    tr = (high - low)
-    df["atr"] = tr.rolling(ATR_PERIOD).mean()
-
-    # RSI
-    delta = close.diff()
-    gain = delta.clip(lower=0)
-    loss = -delta.clip(upper=0)
-
-    avg_gain = gain.rolling(RSI_PERIOD).mean()
-    avg_loss = loss.rolling(RSI_PERIOD).mean()
-
-    rs = avg_gain / avg_loss.replace(0, np.nan)
-    df["rsi"] = 100 - (100 / (1 + rs))
+    # ATR simple
+    df["atr"] = (df["high"] - df["low"]).rolling(ATR_PERIOD).mean()
 
     return df
-
-
-def _atr(df: pd.DataFrame) -> float:
-    if df.empty:
-        return 0.0
-    return float(df["atr"].iloc[-1] or 0.0)
 
 
 # ============================================================
@@ -138,15 +111,13 @@ def candle_metrics(c):
     l = float(c["low"])
     cl = float(c["close"])
 
-    rng = max(h - l, EPS)
+    rng = max(h - l, 1e-12)
     body = abs(cl - o)
 
     return {
-        "body_ratio": body / rng,
-        "upper_ratio": (h - max(o, cl)) / rng,
-        "lower_ratio": (min(o, cl) - l) / rng,
+        "open": o,
         "close": cl,
-        "open": o
+        "body_ratio": body / rng
     }
 
 
@@ -159,17 +130,27 @@ def candle_direction(c):
 
 
 # ============================================================
-# INDECISIÓN
+# DESCANSO
 # ============================================================
 
-def _is_indecision(c):
-    if c["body_ratio"] > INDECISION_MAX_BODY_RATIO:
+def _is_rest_candle(current, previous, direction):
+
+    # cuerpo pequeño en vela actual
+    if current["body_ratio"] > REST_MAX_BODY_RATIO:
         return False
 
-    return (
-        c["upper_ratio"] >= INDECISION_MIN_WICK_RATIO
-        or c["lower_ratio"] >= INDECISION_MIN_WICK_RATIO
-    )
+    # vela anterior debe ser fuerte
+    if previous["body_ratio"] < REST_MIN_PREVIOUS_BODY_RATIO:
+        return False
+
+    # dirección correcta
+    if direction == "bullish":
+        return previous["close"] > previous["open"]
+
+    if direction == "bearish":
+        return previous["close"] < previous["open"]
+
+    return False
 
 
 # ============================================================
@@ -206,28 +187,26 @@ def analyze_market(df: Optional[pd.DataFrame] = None, **kwargs) -> Dict[str, Any
         return result
 
     current = df.iloc[-1]
-    history = df.iloc[:-1]
-
-    atr = _atr(df)
+    previous = df.iloc[-2]
 
     structure = detect_structure(df)
 
     c = candle_metrics(current)
+    p = candle_metrics(previous)
 
     # ========================================================
-    # SOLO INDECISIÓN
+    # SOLO DESCANSO
     # ========================================================
 
-    if _is_indecision(c):
+    if _is_rest_candle(c, p, structure):
 
-        # dirección basada en tendencia
         if structure == "bullish":
             signal = "call"
-            zone = "indecision_alcista"
+            zone = "descanso_alcista"
 
         elif structure == "bearish":
             signal = "put"
-            zone = "indecision_bajista"
+            zone = "descanso_bajista"
 
         else:
             return result
@@ -237,13 +216,13 @@ def analyze_market(df: Optional[pd.DataFrame] = None, **kwargs) -> Dict[str, Any
             "score": 75,
             "blocked": False,
             "continuity": True,
-            "entry_type": "indecision",
-            "reason": f"{signal.upper()} | INDECISIÓN | entrada en N+1",
+            "entry_type": "rest",
+            "reason": f"{signal.upper()} | DESCANSO | entrada en N+1",
             "analysis": {
                 "structure": structure,
-                "atr": atr,
-                "candle": c,
-                "note": "esperar confirmación siguiente vela"
+                "current_candle": c,
+                "previous_candle": p,
+                "note": "vela de pausa tras impulso, esperar continuación"
             }
         })
 
@@ -265,4 +244,4 @@ def signal(df):
 
 
 if __name__ == "__main__":
-    print("Strategy SOLO INDECISIÓN lista.")
+    print("Strategy SOLO DESCANSO lista.")
