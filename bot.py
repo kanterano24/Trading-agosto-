@@ -99,7 +99,7 @@ CANDLE_COUNT = int(
 MAX_OTC_PAIRS = int(
     os.getenv(
         "MAX_OTC_PAIRS",
-        "5",
+        "30",
     )
 )
 
@@ -334,7 +334,7 @@ def telegram_command_loop() -> None:
                         "ESTRUCTURA + RECHAZO\n"
                         "Temporalidad: 1 minuto\n"
                         "Entrada: N+1\n"
-                        "Expiración: 1 minutos\n"
+                        "Expiración: 5 minutos\n"
                         f"Importe: {AMOUNT:g}\n"
                         f"Pares OTC: "
                         f"{len(PAIRS)}"
@@ -676,7 +676,7 @@ def connect_iq() -> bool:
         "⚡ MODO SNIPER\n"
         "🧠 ESTRUCTURA + RECHAZO\n"
         "⏱ M1 cerrada → N+1\n"
-        "⏳ Expiración: 1 minutos"
+        "⏳ Expiración: 5 minutos"
     )
 
     return True
@@ -1039,26 +1039,6 @@ def analyze_closed_candle(
             0,
         )
     )
-
-    entry_quality = int(
-        result.get(
-            "entry_quality",
-            0,
-        )
-    )
-
-    entry_type = result.get(
-        "entry_type"
-    )
-
-    # Compatibilidad con strategy.py:
-    # solo aceptar señales FUERZA con calidad >= 90.
-    if (
-        signal not in ("call", "put")
-        or entry_type != "force"
-        or entry_quality < 90
-    ):
-        signal = None
 
     logger.info(
         "%s | N CERRADA | "
