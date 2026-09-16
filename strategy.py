@@ -23,7 +23,10 @@ EMA_SLOW = 21
 ATR_PERIOD = 14
 
 STRUCTURE_LOOKBACK = 8
-SR_LOOKBACK = 20
+SR_LOOKBACK = 20  # Compatibilidad; el rango ya no depende de un número fijo.
+PIVOT_LEFT = 2
+PIVOT_RIGHT = 2
+MIN_SWING_ATR = 0.15
 
 # Multiplicadores deliberadamente conservadores: si el precio está cerca
 # de una zona importante, la operación se bloquea.
@@ -207,29 +210,71 @@ def _candle_metrics(candle: pd.Series) -> Dict[str, float]:
     }
 
 
+def _confirmed_swings(history: pd.DataFrame) -> tuple[list[float], list[float]]:
+    """Detecta swings confirmados usando vecinos a izquierda y derecha.
+
+    Los pivots se calculan solamente sobre velas cerradas. El rango resultante
+    se adapta a la estructura observada de cada par, sin usar tail(20).
+    """
+    highs: list[float] = []
+    lows: list[float] = []
+    n = len(history)
+
+    if n < PIVOT_LEFT + PIVOT_RIGHT + 1:
+        return highs, lows
+
+    for i in range(PIVOT_LEFT, n - PIVOT_RIGHT):
+        h = float(history["high"].iloc[i])
+        l = float(history["low"].iloc[i])
+        left_highs = history["high"].iloc[i - PIVOT_LEFT:i]
+        right_highs = history["high"].iloc[i + 1:i + 1 + PIVOT_RIGHT]
+        left_lows = history["low"].iloc[i - PIVOT_LEFT:i]
+        right_lows = history["low"].iloc[i + 1:i + 1 + PIVOT_RIGHT]
+
+        if h >= float(left_highs.max()) and h >= float(right_highs.max()):
+            highs.append(h)
+        if l <= float(left_lows.min()) and l <= float(right_lows.min()):
+            lows.append(l)
+
+    return highs, lows
+
+
+def _dynamic_structural_range(
+    history: pd.DataFrame,
+    atr: float,
+) -> tuple[Optional[float], Optional[float], str]:
+    """Obtiene el rango activo desde swings confirmados del par.
+
+    Se usan el último máximo y mínimo estructural disponibles. Si todavía no
+    existen ambos, no se inventa un rango: la señal queda bloqueada.
+    """
+    swing_highs, swing_lows = _confirmed_swings(history)
+
+    if not swing_highs or not swing_lows:
+        return None, None, "sin_swings_confirmados"
+
+    high = max(swing_highs[-3:])
+    low = min(swing_lows[-3:])
+
+    if high - low < max(atr * MIN_SWING_ATR, EPS):
+        return high, low, "rango_estructural_pequeno"
+
+    return high, low, "rango_estructural_dinamico"
+
+
 def _extreme_location(
     history: pd.DataFrame,
     price: float,
     direction: str,
+    atr: float,
 ) -> tuple[bool, Optional[str], Optional[float], Optional[float]]:
-    """
-    Filtro obligatorio de ubicación.
+    """Filtra la ubicación usando el rango estructural dinámico del par."""
+    recent_high, recent_low, range_status = _dynamic_structural_range(history, atr)
 
-    - CALL solamente en el 20% inferior del rango reciente.
-    - PUT solamente en el 20% superior del rango reciente.
-    - La zona central y la dirección incompatible quedan bloqueadas.
+    if recent_high is None or recent_low is None:
+        return False, range_status, recent_high, recent_low
 
-    El rango se calcula con las velas cerradas para evitar usar datos
-    posteriores a la vela analizada.
-    """
-    if len(history) < 5:
-        return False, "insuficiente_historial", None, None
-
-    w = history.tail(SR_LOOKBACK)
-    recent_high = float(w["high"].max())
-    recent_low = float(w["low"].min())
     range_size = recent_high - recent_low
-
     if range_size <= EPS:
         return False, "rango_invalido", recent_high, recent_low
 
@@ -241,10 +286,9 @@ def _extreme_location(
     if direction == "bearish" and position >= EXTREME_HIGH_PERCENT:
         return True, "extremo_superior", recent_high, recent_low
 
-    if position < EXTREME_LOW_PERCENT:
+    if position <= EXTREME_LOW_PERCENT:
         return False, "extremo_inferior_direccion_incompatible", recent_high, recent_low
-
-    if position > EXTREME_HIGH_PERCENT:
+    if position >= EXTREME_HIGH_PERCENT:
         return False, "extremo_superior_direccion_incompatible", recent_high, recent_low
 
     return False, "zona_central", recent_high, recent_low
@@ -329,10 +373,9 @@ def _end_of_trend(
     de la estructura reciente. Esto evita vender en máximos o comprar
     en mínimos, además del bloqueo general de S/R.
     """
-    w = history.tail(SR_LOOKBACK)
-
-    recent_high = float(w["high"].max())
-    recent_low = float(w["low"].min())
+    recent_high, recent_low, _ = _dynamic_structural_range(history, atr)
+    if recent_high is None or recent_low is None:
+        return True
     price = live["close"]
 
     if direction == "bullish":
@@ -412,6 +455,7 @@ def analyze_market(df: pd.DataFrame) -> Dict[str, Any]:
         history,
         c_live["close"],
         direction,
+        atr,
     )
 
     if not at_extreme:
