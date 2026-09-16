@@ -809,7 +809,7 @@ def main() -> None:
         "🚫 No opera N\n"
         "⚡ Ejecuta en N+1\n"
         f"⏳ Expiración: {EXPIRATION} minuto(s)\n"
-        f"🚀 Inicio automático: {"SI" if AUTO_START else "NO"}\n\n"
+        f"🚀 Inicio automático: {'SI' if AUTO_START else 'NO'}\n\n"
         + (
             "🟢 Análisis automático activado."
             if AUTO_START
