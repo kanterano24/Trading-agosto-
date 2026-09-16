@@ -1,8 +1,8 @@
 """
 strategy.py
 
-ESTRATEGIA ESTRUCTURAL DE FUERZA DESPUÉS DE PULLBACK
-+ CONFIRMACIÓN N + ENTRADA PREPARADA PARA N+1
+ESTRATEGIA ESTRUCTURAL DE RECHAZO + CONTINUIDAD + DESCANSO
++ FUERZA + INDECISIÓN + DIVERGENCIA RSI
 PARA BINARY OTC M1.
 
 OBJETIVO PRINCIPAL
@@ -29,8 +29,6 @@ La estrategia analiza:
 14. Divergencia RSI.
 15. Distancia a soporte/resistencia.
 16. Distancia a tendencia dinámica.
-17. Pullback estructural previo.
-18. Confirmación de N contra vela anterior y extremo del pullback.
 
 IMPORTANTE
 ----------
@@ -214,16 +212,6 @@ CONTINUITY_MIN_BODY_ATR = 0.20
 FORCE_MIN_BODY_RATIO = 0.65
 
 FORCE_MIN_BODY_ATR = 0.35
-
-# ============================================================
-# PULLBACK + CONFIRMACIÓN DE FUERZA
-# ============================================================
-
-PULLBACK_LOOKBACK = 6
-MIN_PULLBACK_OPPOSITE_CANDLES = 1
-MAX_PULLBACK_CANDLES = 4
-MAX_PULLBACK_RANGE_ATR = 2.00
-MIN_PRE_PULLBACK_IMPULSE_CANDLES = 2
 
 
 # ============================================================
@@ -2335,173 +2323,6 @@ def _is_force_candle(
 
 
 # ============================================================
-# PULLBACK ESTRUCTURAL + CONFIRMACIÓN N
-# ============================================================
-
-def _detect_pullback(
-    history: pd.DataFrame,
-    current: pd.Series,
-    direction: str,
-    atr: float,
-) -> Dict[str, Any]:
-    """
-    Detecta un pullback reciente y exige que la vela N confirme:
-
-    1. Existencia de una tendencia previa en la dirección solicitada.
-    2. Retroceso contrario de 1 a MAX_PULLBACK_CANDLES velas.
-    3. Respeto de la estructura anterior.
-    4. Cierre de N por encima/debajo de la vela anterior.
-    5. Cierre de N superando el extremo del pullback.
-
-    La función no usa información futura: current representa N y
-    history contiene únicamente las velas cerradas anteriores.
-    """
-
-    result: Dict[str, Any] = {
-        "valid": False,
-        "pullback_found": False,
-        "structure_respected": False,
-        "confirmation_previous": False,
-        "confirmation_pullback": False,
-        "confirmation_both": False,
-        "pullback_candles": 0,
-        "pullback_high": None,
-        "pullback_low": None,
-        "structure_reference": None,
-        "reason": "sin pullback válido",
-    }
-
-    if history is None or history.empty or atr <= 0:
-        result["reason"] = "historial/ATR insuficiente"
-        return result
-
-    if direction not in ("bullish", "bearish"):
-        result["reason"] = "dirección inválida"
-        return result
-
-    data = history.tail(PULLBACK_LOOKBACK).copy()
-    if len(data) < 3:
-        result["reason"] = "pocas velas para detectar pullback"
-        return result
-
-    target = 1 if direction == "bullish" else -1
-    opposite = -target
-
-    # El pullback debe terminar inmediatamente antes de N.
-    pullback_indices = []
-    opposite_count = 0
-
-    for i in range(len(data) - 1, -1, -1):
-        row_direction = _direction_of_row(data.iloc[i])
-
-        if row_direction == opposite:
-            opposite_count += 1
-            pullback_indices.append(i)
-        elif row_direction == 0 and pullback_indices:
-            pullback_indices.append(i)
-        else:
-            break
-
-        if len(pullback_indices) >= MAX_PULLBACK_CANDLES:
-            break
-
-    if opposite_count < MIN_PULLBACK_OPPOSITE_CANDLES:
-        result["reason"] = "no hay retroceso contrario reciente"
-        return result
-
-    pullback_indices = sorted(pullback_indices)
-    pullback = data.iloc[pullback_indices]
-    pullback_start = pullback_indices[0]
-
-    if direction == "bullish":
-        pullback_low = float(pullback["low"].min())
-        pullback_high = float(pullback["high"].max())
-    else:
-        pullback_low = float(pullback["low"].min())
-        pullback_high = float(pullback["high"].max())
-
-    pullback_range = pullback_high - pullback_low
-    if pullback_range > MAX_PULLBACK_RANGE_ATR * atr:
-        result["reason"] = "pullback demasiado amplio"
-        return result
-
-    # Debe existir un impulso previo en la dirección de la tendencia.
-    pre_start = max(0, pullback_start - 8)
-    pre_pullback = data.iloc[pre_start:pullback_start]
-    directional_count = sum(
-        1
-        for i in range(len(pre_pullback))
-        if _direction_of_row(pre_pullback.iloc[i]) == target
-    )
-
-    if directional_count < MIN_PRE_PULLBACK_IMPULSE_CANDLES:
-        result["reason"] = "no existe impulso previo suficiente"
-        return result
-
-    if pre_pullback.empty:
-        result["reason"] = "sin referencia estructural previa"
-        return result
-
-    # Respeto estructural: el retroceso no debe superar el extremo
-    # de referencia del tramo previo. Se permite un margen pequeño ATR
-    # para evitar rechazos por ruido de OTC.
-    if direction == "bullish":
-        structure_reference = float(pre_pullback["low"].min())
-        structure_respected = pullback_low >= (structure_reference - 0.10 * atr)
-    else:
-        structure_reference = float(pre_pullback["high"].max())
-        structure_respected = pullback_high <= (structure_reference + 0.10 * atr)
-
-    result.update(
-        {
-            "pullback_found": True,
-            "pullback_candles": int(opposite_count),
-            "pullback_high": pullback_high,
-            "pullback_low": pullback_low,
-            "structure_reference": structure_reference,
-            "structure_respected": bool(structure_respected),
-        }
-    )
-
-    if not structure_respected:
-        result["reason"] = "pullback rompe la estructura previa"
-        return result
-
-    current_close = _safe_float(current.get("close"))
-    previous_row = history.iloc[-1]
-    previous_high = _safe_float(previous_row.get("high"))
-    previous_low = _safe_float(previous_row.get("low"))
-
-    if direction == "bullish":
-        confirmation_previous = current_close > previous_high
-        confirmation_pullback = current_close > pullback_high
-    else:
-        confirmation_previous = current_close < previous_low
-        confirmation_pullback = current_close < pullback_low
-
-    result["confirmation_previous"] = bool(confirmation_previous)
-    result["confirmation_pullback"] = bool(confirmation_pullback)
-    result["confirmation_both"] = bool(
-        confirmation_previous and confirmation_pullback
-    )
-
-    if not confirmation_previous:
-        result["reason"] = "N no supera el extremo de la vela anterior"
-        return result
-
-    if not confirmation_pullback:
-        result["reason"] = "N no supera el extremo del pullback"
-        return result
-
-    result["valid"] = True
-    result["reason"] = (
-        "pullback respetado + confirmación de vela anterior "
-        "+ confirmación del extremo del pullback"
-    )
-    return result
-
-
-# ============================================================
 # NUEVO:
 # DIVERGENCIA RSI
 # ============================================================
@@ -3047,17 +2868,6 @@ def _analyze_market_full(
     )
 
     # ========================================================
-    # PULLBACK + CONFIRMACIÓN DE N
-    # ========================================================
-
-    pullback = _detect_pullback(
-        history=history,
-        current=current,
-        direction=structure,
-        atr=atr,
-    )
-
-    # ========================================================
     # TENDENCIA DINÁMICA
     # ========================================================
 
@@ -3159,7 +2969,6 @@ def _analyze_market_full(
                     "resistance_atr"
                 ],
                 "divergence": divergence,
-                "pullback": pullback,
             },
         }
     )
@@ -3888,8 +3697,6 @@ def _analyze_market_full(
     if (
         healthy_phase
         and
-        pullback["valid"]
-        and
         room_ok
         and
         away_from_zone
@@ -3943,9 +3750,9 @@ def _analyze_market_full(
                     "score": quality,
                     "reason": (
                         f"{signal.upper()} | "
-                        "vela de FUERZA después de PULLBACK | "
-                        "N confirma vela anterior y extremo del pullback | "
-                        "entrada preparada para N+1 | "
+                        "vela de FUERZA | "
+                        "inicio/continuación "
+                        "temprana del impulso | "
                         f"calidad={quality}/100"
                     ),
                     "continuity": True,
@@ -3963,10 +3770,6 @@ def _analyze_market_full(
                         "entry_quality": quality,
                         "zone_distance_atr": zone_distance,
                         "trendline_distance_atr": trendline_distance,
-                        "pullback": pullback,
-                        "entry_for_next_candle": True,
-                        "force_confirmation_previous": pullback["confirmation_previous"],
-                        "force_confirmation_pullback": pullback["confirmation_pullback"],
                     },
                 }
             )
@@ -4346,15 +4149,16 @@ def _analyze_market_full(
 
 
 # ============================================================
-# API PUBLICA: MODO OBSERVACION
+# API PUBLICA: SOLO INDECISIÓN
 # ============================================================
 #
-# La API publica devuelve el resultado completo de la estrategia.
-# No se bloquean las familias por entry_type, porque el objetivo
-# actual es registrar y comparar todas las configuraciones sin
-# ejecutar operaciones.
-# La ejecucion, cuando corresponda en el futuro, debe controlarse
-# exclusivamente desde bot.py y despues de pruebas suficientes.
+# La estrategia analiza internamente todas las configuraciones,
+# pero SOLO permite que llegue a bot.py una señal cuyo
+# entry_type sea "indecision".
+#
+# Todas las demás familias quedan bloqueadas: rechazo,
+# continuidad, descanso, fuerza y divergencia.
+# La señal de indecisión se prepara en N para ejecutar en N+1.
 # ============================================================
 
 def analyze_market(
@@ -4373,8 +4177,17 @@ def analyze_market(
         pair=pair,
     )
 
-    # En observacion se devuelve la señal completa, sin filtrar
-    # por familia. El bot registra el entry_type y no ejecuta.
+    if result.get("entry_type") != "indecision":
+        result["signal"] = None
+        result["blocked"] = True
+        result["reason"] = (
+            "SIN SEÑAL: strategy.py solo permite "
+            "señales de INDECISIÓN"
+        )
+        result["entry_type"] = None
+        result["entry_quality"] = 0
+        return result
+
     return result
 
 
