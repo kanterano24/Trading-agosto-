@@ -4346,13 +4346,15 @@ def _analyze_market_full(
 
 
 # ============================================================
-# API PUBLICA: SOLO FUERZA
+# API PUBLICA: MODO OBSERVACION
 # ============================================================
 #
-# strategy.py analiza internamente la vela completa, pero SOLO
-# expone una señal cuando entry_type == "force".
-# Las señales de rechazo, divergencia, continuidad, descanso
-# e indecisión quedan bloqueadas y nunca llegan a bot.py.
+# La API publica devuelve el resultado completo de la estrategia.
+# No se bloquean las familias por entry_type, porque el objetivo
+# actual es registrar y comparar todas las configuraciones sin
+# ejecutar operaciones.
+# La ejecucion, cuando corresponda en el futuro, debe controlarse
+# exclusivamente desde bot.py y despues de pruebas suficientes.
 # ============================================================
 
 def analyze_market(
@@ -4371,17 +4373,8 @@ def analyze_market(
         pair=pair,
     )
 
-    if result.get("entry_type") != "force":
-        result["signal"] = None
-        result["blocked"] = True
-        result["reason"] = (
-            "SIN SEÑAL: strategy.py solo permite "
-            "señales de FUERZA"
-        )
-        result["entry_type"] = None
-        result["entry_quality"] = 0
-        return result
-
+    # En observacion se devuelve la señal completa, sin filtrar
+    # por familia. El bot registra el entry_type y no ejecuta.
     return result
 
 
