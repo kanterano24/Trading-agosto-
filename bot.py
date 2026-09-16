@@ -474,6 +474,13 @@ def is_force_signal(result: Dict[str, Any], signal: Any) -> bool:
     if REQUIRE_FORCE and analysis.get("force") is False:
         return False
 
+    quality = result.get("entry_quality", analysis.get("entry_quality", 0))
+    try:
+        if int(quality or 0) < 80:
+            return False
+    except (TypeError, ValueError):
+        return False
+
     expected_direction = "bullish" if signal == "call" else "bearish"
     returned_direction = result.get("direction")
 
@@ -657,6 +664,7 @@ def execute_sniper(pair: str, pending: Dict[str, Any]) -> bool:
 
     current_ts = floor_candle_timestamp(get_iq_server_timestamp())
 
+    # Nunca ejecutar una señal atrasada ni fuera del inicio exacto de N+1.
     if current_ts < execution_ts:
         return False
 
@@ -809,7 +817,7 @@ def main() -> None:
         "🚫 No opera N\n"
         "⚡ Ejecuta en N+1\n"
         f"⏳ Expiración: {EXPIRATION} minuto(s)\n"
-        f"🚀 Inicio automático: {'SI' if AUTO_START else 'NO'}\n\n"
+        f"🚀 Inicio automático: {"SI" if AUTO_START else "NO"}\n\n"
         + (
             "🟢 Análisis automático activado."
             if AUTO_START
