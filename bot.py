@@ -81,14 +81,21 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 TIMEFRAME = 60
-EXPIRATION = 1
+EXPIRATION = int(os.getenv("EXPIRATION", "5"))
 
-# MODO OBSERVACION FIJO: registra y muestra señales, pero NO ejecuta.
-# Esta version no permite activar operaciones reales accidentalmente.
-OBSERVATION_MODE = True
-SIGNAL_LOG_PATH = os.getenv("SIGNAL_LOG_PATH", "signals_observation.csv")
-EXECUTABLE_ENTRY_TYPES: set[str] = set()
-MIN_EXECUTION_QUALITY = 0
+# EJECUCIÓN REAL PROTEGIDA: requiere dos variables explícitas.
+# Por defecto permanece desactivada.
+OBSERVATION_MODE = os.getenv("OBSERVATION_MODE", "false").strip().lower() in {"1", "true", "yes", "si", "sí"}
+DEMO_MODE = True
+REAL_TRADING_CONFIRM = True  # Solo demo
+SIGNAL_LOG_PATH = os.getenv("SIGNAL_LOG_PATH", "signals_execution.csv")
+EXECUTABLE_ENTRY_TYPES = {
+    item.strip() for item in os.getenv(
+        "EXECUTABLE_ENTRY_TYPES",
+        "force,continuity,rest,indecision,divergence,rejection_support,rejection_resistance",
+    ).split(",") if item.strip()
+}
+MIN_EXECUTION_QUALITY = int(os.getenv("MIN_EXECUTION_QUALITY", "70"))
 
 AMOUNT = float(
     os.getenv(
@@ -701,6 +708,13 @@ def connect_iq() -> bool:
             f"IQ Option: {reason}"
         )
 
+    # Seguridad: seleccionar siempre la cuenta demo.
+    try:
+        IQ.change_balance("PRACTICE")
+        logger.info("Cuenta seleccionada: DEMO/PRACTICE")
+    except Exception as exc:
+        raise RuntimeError("No se pudo seleccionar la cuenta demo; bot detenido.") from exc
+
     refresh_binary_otc_pairs(
         force=True
     )
@@ -721,7 +735,7 @@ def connect_iq() -> bool:
         "⚡ MODO SNIPER\n"
         "🧠 ESTRUCTURA + RECHAZO\n"
         "⏱ M1 cerrada → N+1\n"
-        "⏳ Expiración: 5 minutos"
+        f"⏳ Expiración: {EXPIRATION} minutos"
     )
 
     return True
@@ -1139,7 +1153,7 @@ def analyze_closed_candle(
         return True
 
     side = "CALL 🟢" if signal == "call" else "PUT 🔴"
-    mode_label = "OBSERVACIÓN — SIN EJECUCIÓN" if OBSERVATION_MODE else "EJECUCIÓN HABILITADA"
+    mode_label = "OBSERVACIÓN — SIN EJECUCIÓN" if OBSERVATION_MODE else "EJECUCIÓN DEMO/PRACTICE"
     telegram_send(
         "🔎 SEÑAL CLASIFICADA\n\n"
         f"Modo: {mode_label}\n"
@@ -1159,15 +1173,47 @@ def analyze_closed_candle(
 
     if OBSERVATION_MODE:
         logger.info(
-            "%s | OBSERVACION | familia=%s | señal=%s | no se arma entrada",
+            "%s | OBSERVACION/BLOQUEADO | familia=%s | señal=%s | no se arma entrada",
             pair, family, signal,
         )
         return True
 
-    logger.warning(
-        "%s | ejecución bloqueada por modo observación permanente",
-        pair,
-    )
+    if entry_type not in EXECUTABLE_ENTRY_TYPES or entry_quality < MIN_EXECUTION_QUALITY:
+        logger.info(
+            "%s | señal no ejecutable | tipo=%s | calidad=%s",
+            pair, entry_type, entry_quality,
+        )
+        return True
+
+    with STATE_LOCK:
+        PENDING_ENTRY[pair] = {
+            "signal": signal,
+            "entry_type": entry_type,
+            "entry_quality": entry_quality,
+            "close": result.get("signal_price", closed_row.get("close")),
+            "continuity_ts": expected_closed_ts,
+            "execution_ts": expected_closed_ts + TIMEFRAME,
+            "created_at": time.time(),
+        }
+
+    _append_signal_record({
+        "observed_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "pair": pair,
+        "candle_timestamp": expected_closed_ts,
+        "execution_timestamp": expected_closed_ts + TIMEFRAME,
+        "signal": signal or "",
+        "direction": result.get("direction", ""),
+        "entry_type": entry_type or "",
+        "signal_family": family,
+        "score": score,
+        "entry_quality": entry_quality,
+        "structure": analysis.get("structure", ""),
+        "impulse_phase": analysis.get("impulse_phase", ""),
+        "zone": analysis.get("zone", result.get("zone", "")),
+        "status": "pending",
+        "reason": result.get("reason", ""),
+    })
+    logger.info("%s | entrada armada para N+1 | %s", pair, signal.upper())
     return True
 
 
@@ -1197,12 +1243,21 @@ def buy_binary(
     pair: str,
     signal: str,
 ) -> Tuple[bool, Optional[Any]]:
-    """Bloqueo permanente: esta entrega solo observa y registra."""
-    logger.warning(
-        "%s | orden bloqueada: bot en modo observacion",
-        pair,
-    )
-    return False, None
+    if OBSERVATION_MODE:
+        logger.warning("%s | orden bloqueada: protección de ejecución activa", pair)
+        return False, None
+    if signal not in {"call", "put"}:
+        return False, None
+    if IQ is None:
+        return False, None
+    try:
+        result = IQ.buy(AMOUNT, pair, signal, EXPIRATION)
+        if isinstance(result, tuple):
+            return bool(result[0]), result[1] if len(result) > 1 else None
+        return bool(result), None
+    except Exception:
+        logger.exception("%s | error enviando orden %s", pair, signal)
+        return False, None
 
 
 # ============================================================
@@ -1281,7 +1336,7 @@ def execute_sniper(
         return False
 
     telegram_send(
-        "⚡ SNIPER EJECUTANDO\n\n"
+        "🧪 EJECUCIÓN DEMO/PRACTICE\n\n"
         f"Par: {pair}\n"
         f"Dirección: "
         f"{signal.upper()}\n\n"
@@ -1291,7 +1346,7 @@ def execute_sniper(
         f"{execution_ts}\n"
         f"Reloj IQ: "
         f"{now2:.3f}\n\n"
-        "⏳ Expiración: 5 minutos"
+        f"⏳ Expiración: {EXPIRATION} minutos"
     )
 
     sent_at = (
@@ -1354,7 +1409,7 @@ def execute_sniper(
         f"{sent_at:.3f}\n"
         f"ID: {order_id}\n\n"
         "⚡ Entrada inmediata N+1\n"
-        "⏳ Expiración: 5 minutos"
+        f"⏳ Expiración: {EXPIRATION} minutos"
     )
 
     logger.info(
