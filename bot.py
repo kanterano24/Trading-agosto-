@@ -83,18 +83,12 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 TIMEFRAME = 60
 EXPIRATION = 1
 
-# MODO SEGURO: registra y muestra señales, pero NO ejecuta operaciones.
-# Para habilitar operaciones reales debe establecerse OBSERVATION_MODE=false.
-OBSERVATION_MODE = os.getenv("OBSERVATION_MODE", "true").strip().lower() in (
-    "1", "true", "yes", "on",
-)
+# MODO OBSERVACION FIJO: registra y muestra señales, pero NO ejecuta.
+# Esta version no permite activar operaciones reales accidentalmente.
+OBSERVATION_MODE = True
 SIGNAL_LOG_PATH = os.getenv("SIGNAL_LOG_PATH", "signals_observation.csv")
-EXECUTABLE_ENTRY_TYPES = {
-    item.strip()
-    for item in os.getenv("EXECUTABLE_ENTRY_TYPES", "force").split(",")
-    if item.strip()
-}
-MIN_EXECUTION_QUALITY = int(os.getenv("MIN_EXECUTION_QUALITY", "90"))
+EXECUTABLE_ENTRY_TYPES: set[str] = set()
+MIN_EXECUTION_QUALITY = 0
 
 AMOUNT = float(
     os.getenv(
@@ -1165,56 +1159,15 @@ def analyze_closed_candle(
 
     if OBSERVATION_MODE:
         logger.info(
-            "%s | OBSERVACIÓN | familia=%s | señal=%s | no se arma entrada",
+            "%s | OBSERVACION | familia=%s | señal=%s | no se arma entrada",
             pair, family, signal,
         )
         return True
 
-    # Incluso al habilitar ejecución, conservar una lista explícita de familias
-    # permitidas y un umbral de calidad para evitar activar todo accidentalmente.
-    if (
-        entry_type not in EXECUTABLE_ENTRY_TYPES
-        or entry_quality < MIN_EXECUTION_QUALITY
-    ):
-        logger.info(
-            "%s | BLOQUEADA PARA EJECUCIÓN | entry_type=%s | calidad=%s",
-            pair, entry_type, entry_quality,
-        )
-        return True
-
-    values = candle_values(
-        closed_row
+    logger.warning(
+        "%s | ejecución bloqueada por modo observación permanente",
+        pair,
     )
-
-    execution_ts = int(
-        expected_closed_ts
-        + TIMEFRAME
-    )
-
-    with STATE_LOCK:
-
-        PENDING_ENTRY[pair] = {
-            "signal": signal,
-            "score": score,
-            "continuity_ts": int(
-                expected_closed_ts
-            ),
-            "execution_ts": execution_ts,
-            "open": values["open"],
-            "high": values["high"],
-            "low": values["low"],
-            "close": values["close"],
-            "reason": result.get(
-                "reason",
-                "",
-            ),
-            "analysis": result.get(
-                "analysis",
-                {},
-            ),
-            "created_at": time.time(),
-        }
-
     return True
 
 
@@ -1244,58 +1197,12 @@ def buy_binary(
     pair: str,
     signal: str,
 ) -> Tuple[bool, Optional[Any]]:
-
-    if (
-        IQ is None
-        or signal not in (
-            "call",
-            "put",
-        )
-    ):
-        return False, None
-
-    try:
-
-        result = IQ.buy(
-            AMOUNT,
-            pair,
-            signal,
-            EXPIRATION,
-        )
-
-        if isinstance(
-            result,
-            tuple,
-        ):
-
-            return (
-                bool(result[0]),
-                (
-                    result[1]
-                    if len(result) > 1
-                    else None
-                ),
-            )
-
-        if result not in (
-            None,
-            False,
-            "error",
-            -1,
-        ):
-            return True, result
-
-        return False, result
-
-    except Exception as exc:
-
-        logger.error(
-            "%s | buy error: %s",
-            pair,
-            exc,
-        )
-
-        return False, None
+    """Bloqueo permanente: esta entrega solo observa y registra."""
+    logger.warning(
+        "%s | orden bloqueada: bot en modo observacion",
+        pair,
+    )
+    return False, None
 
 
 # ============================================================
