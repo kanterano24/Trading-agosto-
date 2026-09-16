@@ -28,6 +28,12 @@ SR_LOOKBACK = 20
 # Multiplicadores deliberadamente conservadores: si el precio está cerca
 # de una zona importante, la operación se bloquea.
 SR_ATR_DISTANCE = 0.45
+
+# Filtro obligatorio de ubicación: solo permite operar en los extremos
+# del rango estructural reciente. La zona central queda bloqueada.
+EXTREME_LOW_PERCENT = 0.20
+EXTREME_HIGH_PERCENT = 0.80
+
 REJECTION_WICK_RATIO = 0.55
 MIN_BODY_ATR = 0.22
 MAX_COUNTER_WICK_ATR = 0.65
@@ -201,35 +207,47 @@ def _candle_metrics(candle: pd.Series) -> Dict[str, float]:
     }
 
 
-def _near_sr(
+def _extreme_location(
     history: pd.DataFrame,
     price: float,
-    atr: float,
-) -> tuple[bool, Optional[str], Optional[float]]:
+    direction: str,
+) -> tuple[bool, Optional[str], Optional[float], Optional[float]]:
     """
-    Bloqueo absoluto cerca de máximos/mínimos recientes.
-    history NO incluye la vela viva.
+    Filtro obligatorio de ubicación.
+
+    - CALL solamente en el 20% inferior del rango reciente.
+    - PUT solamente en el 20% superior del rango reciente.
+    - La zona central y la dirección incompatible quedan bloqueadas.
+
+    El rango se calcula con las velas cerradas para evitar usar datos
+    posteriores a la vela analizada.
     """
     if len(history) < 5:
-        return True, "insuficiente_historial", None
+        return False, "insuficiente_historial", None, None
 
     w = history.tail(SR_LOOKBACK)
-
     recent_high = float(w["high"].max())
     recent_low = float(w["low"].min())
+    range_size = recent_high - recent_low
 
-    tolerance = max(atr * SR_ATR_DISTANCE, EPS)
+    if range_size <= EPS:
+        return False, "rango_invalido", recent_high, recent_low
 
-    dist_high = abs(price - recent_high)
-    dist_low = abs(price - recent_low)
+    position = (price - recent_low) / range_size
 
-    if dist_high <= tolerance:
-        return True, "resistencia", recent_high
+    if direction == "bullish" and position <= EXTREME_LOW_PERCENT:
+        return True, "extremo_inferior", recent_high, recent_low
 
-    if dist_low <= tolerance:
-        return True, "soporte", recent_low
+    if direction == "bearish" and position >= EXTREME_HIGH_PERCENT:
+        return True, "extremo_superior", recent_high, recent_low
 
-    return False, None, None
+    if position < EXTREME_LOW_PERCENT:
+        return False, "extremo_inferior_direccion_incompatible", recent_high, recent_low
+
+    if position > EXTREME_HIGH_PERCENT:
+        return False, "extremo_superior_direccion_incompatible", recent_high, recent_low
+
+    return False, "zona_central", recent_high, recent_low
 
 
 def _rejection(c: Dict[str, float], direction: str) -> bool:
@@ -365,6 +383,16 @@ def analyze_market(df: pd.DataFrame) -> Dict[str, Any]:
         "blocked": True,
         "zone": None,
         "atr": atr,
+        "entry_type": None,
+        "entry_quality": 0,
+        "analysis": {
+            "force": False,
+            "structure": direction,
+            "atr": atr,
+            "last_swing_high": None,
+            "last_swing_low": None,
+            "entry_quality": 0,
+        },
         "candle_timestamp": (
             int(live["from"]) if "from" in work.columns and not pd.isna(live["from"])
             else None
@@ -378,18 +406,24 @@ def analyze_market(df: pd.DataFrame) -> Dict[str, Any]:
     c_live = _candle_metrics(live)
     c_prev = _candle_metrics(previous)
 
-    # S/R: bloqueo absoluto.
-    blocked, zone, level = _near_sr(
+    # Ubicación obligatoria: únicamente extremos estructurales.
+    # La zona central queda bloqueada antes de evaluar continuidad.
+    at_extreme, zone, recent_high, recent_low = _extreme_location(
         history,
         c_live["close"],
-        atr,
+        direction,
     )
 
-    if blocked:
-        result["reason"] = f"Precio en {zone}"
+    if not at_extreme:
+        result["reason"] = f"Ubicación bloqueada: {zone}"
         result["zone"] = zone
-        result["level"] = level
+        result["recent_high"] = recent_high
+        result["recent_low"] = recent_low
         return result
+
+    result["zone"] = zone
+    result["recent_high"] = recent_high
+    result["recent_low"] = recent_low
 
     # Rechazo.
     if _rejection(c_live, direction):
@@ -436,11 +470,22 @@ def analyze_market(df: pd.DataFrame) -> Dict[str, Any]:
     result.update(
         {
             "signal": signal,
-            "reason": "Continuidad confirmada",
+            "reason": "Continuidad confirmada en extremo estructural",
             "score": 5,
             "continuity": True,
             "blocked": False,
-            "zone": "continuidad",
+            "zone": zone,
+            "entry_type": "force",
+            "entry_quality": 5,
+            "analysis": {
+                "force": True,
+                "structure": direction,
+                "atr": atr,
+                "last_swing_high": recent_high,
+                "last_swing_low": recent_low,
+                "entry_quality": 5,
+                "extreme_zone": zone,
+            },
             "signal_price": c_live["close"],
             "candle_open": c_live["open"],
             "candle_close": c_live["close"],
