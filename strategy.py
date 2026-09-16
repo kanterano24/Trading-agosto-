@@ -1,268 +1,161 @@
-"""
-strategy.py
-
-ESTRATEGIA PROFESIONAL MULTI-SETUP (COMPATIBLE CON bot.py)
-
-- Rechazo
-- Continuidad
-- Descanso
-- Fuerza
-- Divergencia RSI
-
-✔ No rompe compatibilidad
-✔ Mantiene estructura esperada por bot.py
-✔ Selecciona el mejor setup automáticamente
-"""
-
-from __future__ import annotations
-
-from typing import Any, Dict, Optional, Tuple
-import math
-
-import numpy as np
+from typing import Dict, Any
 import pandas as pd
 
+# ==============================
+# CONFIG
+# ==============================
 
-# =========================
-# CONFIGURACIÓN
-# =========================
+MIN_SCORE_TO_TRADE = 70
+MIN_BODY_RATIO = 0.40
 
-MIN_CANDLES = 22
-MIN_SCORE_TO_TRADE = 75
-
-PRIORITY = {
-    "force": 5,
-    "rejection_resistance": 4,
-    "rejection_support": 4,
-    "continuity": 3,
-    "rest": 2,
-    "rsi_divergence": 2,
+ALLOWED_ENTRY_TYPES = {
+    "force",
+    "continuity",
+    "rest",
+    "indecision"
 }
 
+# ==============================
+# HELPERS
+# ==============================
 
-# =========================
-# UTILIDADES
-# =========================
-
-def safe_dataframe(df: pd.DataFrame) -> pd.DataFrame:
-    if df is None or len(df) < MIN_CANDLES:
-        return pd.DataFrame()
-
-    df = df.copy()
-    df = df.sort_values("from")
-    df = df.drop_duplicates(subset=["from"])
-
-    return df.tail(100)
-
-
-def candle_info(c) -> Tuple[float, float, float, str]:
-    body = abs(c["close"] - c["open"])
-    wick_up = c["high"] - max(c["open"], c["close"])
-    wick_down = min(c["open"], c["close"]) - c["low"]
-
-    direction = "bull" if c["close"] > c["open"] else "bear"
-
-    return body, wick_up, wick_down, direction
-
-
-# =========================
-# ESTRUCTURA
-# =========================
-
-def detect_structure(df: pd.DataFrame) -> Dict[str, Any]:
-    highs = df["high"].tail(10).values
-    lows = df["low"].tail(10).values
-
-    higher_highs = all(highs[i] > highs[i - 1] for i in range(1, len(highs)))
-    lower_lows = all(lows[i] < lows[i - 1] for i in range(1, len(lows)))
-
-    if higher_highs:
-        return {"trend": "up", "score": 15}
-    elif lower_lows:
-        return {"trend": "down", "score": 15}
-    else:
-        return {"trend": "range", "score": 5}
-
-
-# =========================
-# RSI
-# =========================
-
-def calculate_rsi(df: pd.DataFrame, period: int = 14) -> pd.Series:
-    delta = df["close"].diff()
-
-    gain = delta.where(delta > 0, 0.0)
-    loss = -delta.where(delta < 0, 0.0)
-
-    avg_gain = gain.rolling(period).mean()
-    avg_loss = loss.rolling(period).mean()
-
-    rs = avg_gain / avg_loss.replace(0, np.nan)
-
-    rsi = 100 - (100 / (1 + rs))
-    return rsi.fillna(50)
-
-
-# =========================
-# ANÁLISIS PRINCIPAL
-# =========================
-
-def analyze_market(df: pd.DataFrame) -> Dict[str, Any]:
-    df = safe_dataframe(df)
-
-    result: Dict[str, Any] = {
-        "valid": False,
+def _empty_result(reason=""):
+    return {
         "signal": None,
         "score": 0,
         "entry_type": None,
-        "entry_quality": 0,
-        "analysis": {}
+        "blocked": True,
+        "reason": reason
     }
 
-    if df.empty:
-        return result
+def candle_info(c):
+    body = abs(c["close"] - c["open"])
+    total = c["high"] - c["low"] if c["high"] != c["low"] else 1e-6
+    return {
+        "body_ratio": body / total
+    }
 
-    structure = detect_structure(df)
-    df["rsi"] = calculate_rsi(df)
+def detect_structure(df: pd.DataFrame):
+    highs = df["high"].tail(5)
+    lows = df["low"].tail(5)
 
-    last = df.iloc[-1]
-    prev = df.iloc[-2]
+    if highs.is_monotonic_increasing and lows.is_monotonic_increasing:
+        return "bullish"
+    if highs.is_monotonic_decreasing and lows.is_monotonic_decreasing:
+        return "bearish"
+    return "neutral"
 
-    avg_range = (df["high"] - df["low"]).mean()
+# ==============================
+# MAIN ANALYSIS
+# ==============================
 
-    candidates = []
+def analyze_market(data: pd.DataFrame) -> Dict[str, Any]:
 
-    # =========================
-    # 1. FUERZA
-    # =========================
-    body, _, _, direction = candle_info(last)
+    if data is None or len(data) < 10:
+        return _empty_result("No hay suficientes velas")
 
-    if body > avg_range * 0.6:
-        candidates.append({
-            **result,
-            "valid": True,
-            "signal": "call" if direction == "bull" else "put",
-            "score": 80,
-            "entry_type": "force",
-            "entry_quality": 9,
-            "analysis": {"structure_score": structure["score"]}
-        })
+    # Última cerrada
+    c = data.iloc[-1]
 
-    # =========================
-    # 2. CONTINUIDAD
-    # =========================
-    if structure["trend"] == "up" and last["close"] > prev["close"]:
-        candidates.append({
-            **result,
-            "valid": True,
-            "signal": "call",
-            "score": 78,
-            "entry_type": "continuity",
-            "entry_quality": 7,
-            "analysis": {"structure_score": structure["score"]}
-        })
+    # Historial sin la actual
+    history = data.iloc[:-1].copy()
 
-    if structure["trend"] == "down" and last["close"] < prev["close"]:
-        candidates.append({
-            **result,
-            "valid": True,
-            "signal": "put",
-            "score": 78,
-            "entry_type": "continuity",
-            "entry_quality": 7,
-            "analysis": {"structure_score": structure["score"]}
-        })
+    # ========================================================
+    # FILTRO DE 3 VELAS EXTERIORES
+    # ========================================================
 
-    # =========================
-    # 3. RECHAZO
-    # =========================
-    body, wick_up, wick_down, _ = candle_info(last)
+    last3 = history.tail(3)
 
-    if wick_down > body * 1.5:
-        candidates.append({
-            **result,
-            "valid": True,
-            "signal": "call",
-            "score": 82,
-            "entry_type": "rejection_support",
-            "entry_quality": 8,
-            "analysis": {"structure_score": structure["score"]}
-        })
+    bulls = sum(1 for i in last3.itertuples() if i.close > i.open)
+    bears = sum(1 for i in last3.itertuples() if i.close < i.open)
 
-    if wick_up > body * 1.5:
-        candidates.append({
-            **result,
-            "valid": True,
-            "signal": "put",
-            "score": 82,
-            "entry_type": "rejection_resistance",
-            "entry_quality": 8,
-            "analysis": {"structure_score": structure["score"]}
-        })
+    if bulls >= 2:
+        three_candle_bias = "bullish"
+    elif bears >= 2:
+        three_candle_bias = "bearish"
+    else:
+        three_candle_bias = "neutral"
 
-    # =========================
-    # 4. DESCANSO
-    # =========================
-    last5 = df.tail(5)
-    bodies = abs(last5["close"] - last5["open"])
+    # ========================================================
+    # ESTRUCTURA
+    # ========================================================
 
-    if bodies.mean() < avg_range * 0.4:
-        candidates.append({
-            **result,
-            "valid": True,
-            "signal": "call" if structure["trend"] == "up" else "put",
-            "score": 75,
-            "entry_type": "rest",
-            "entry_quality": 6,
-            "analysis": {"structure_score": structure["score"]}
-        })
+    structure = detect_structure(history)
 
-    # =========================
-    # 5. DIVERGENCIA RSI
-    # =========================
-    rsi_last = df["rsi"].iloc[-1]
+    if three_candle_bias != "neutral" and structure != three_candle_bias:
+        return _empty_result("Conflicto estructura vs 3 velas")
 
-    if rsi_last < 30:
-        candidates.append({
-            **result,
-            "valid": True,
-            "signal": "call",
-            "score": 77,
-            "entry_type": "rsi_divergence",
-            "entry_quality": 7,
-            "analysis": {"structure_score": structure["score"]}
-        })
+    # ========================================================
+    # DIRECCIÓN BASE
+    # ========================================================
 
-    if rsi_last > 70:
-        candidates.append({
-            **result,
-            "valid": True,
-            "signal": "put",
-            "score": 77,
-            "entry_type": "rsi_divergence",
-            "entry_quality": 7,
-            "analysis": {"structure_score": structure["score"]}
-        })
+    if structure == "bullish":
+        signal = "call"
+    elif structure == "bearish":
+        signal = "put"
+    else:
+        return _empty_result("Sin estructura clara")
 
-    # =========================
-    # SELECCIÓN FINAL
-    # =========================
-    if not candidates:
-        return result
+    # ========================================================
+    # INFO DE VELA ACTUAL
+    # ========================================================
 
-    best = sorted(
-        candidates,
-        key=lambda x: (
-            PRIORITY.get(x["entry_type"], 0),
-            x["score"],
-            x["entry_quality"],
-            x["analysis"].get("structure_score", 0)
-        ),
-        reverse=True
-    )[0]
+    info = candle_info(c)
+    body_ratio = info["body_ratio"]
 
-    if best["score"] < MIN_SCORE_TO_TRADE:
-        best["valid"] = False
-        best["signal"] = None
+    if body_ratio < MIN_BODY_RATIO:
+        return _empty_result("Vela débil")
 
-    return best
+    # ========================================================
+    # SCORE
+    # ========================================================
+
+    score = 50
+
+    # fuerza de vela
+    if body_ratio >= 0.6:
+        score += 20
+    elif body_ratio >= 0.5:
+        score += 10
+
+    # confirmación 3 velas
+    if three_candle_bias == structure:
+        score += 15
+
+    # micro continuidad
+    prev = history.iloc[-1]
+    if signal == "call" and prev.close > prev.open:
+        score += 10
+    if signal == "put" and prev.close < prev.open:
+        score += 10
+
+    # límite
+    score = min(score, 100)
+
+    # ========================================================
+    # ENTRY TYPE
+    # ========================================================
+
+    if score >= 85:
+        entry_type = "force"
+    elif score >= 75:
+        entry_type = "continuity"
+    elif score >= 70:
+        entry_type = "rest"
+    else:
+        return _empty_result("Score bajo")
+
+    # ========================================================
+    # FILTRO FINAL
+    # ========================================================
+
+    if entry_type not in ALLOWED_ENTRY_TYPES:
+        return _empty_result("Tipo no permitido")
+
+    return {
+        "signal": signal,
+        "score": score,
+        "entry_type": entry_type,
+        "blocked": False,
+        "reason": f"{entry_type} + estructura + 3 velas"
+    }
