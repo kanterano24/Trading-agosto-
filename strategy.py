@@ -267,9 +267,6 @@ def _empty_result(
         "atr": 0.0,
         "candle_timestamp": None,
         "analysis": {},
-        # Clasificación visible en Railway: análisis por estructura.
-        "analysis_number": 0,
-        "analysis_name": "SIN CLASIFICAR",
     }
 
 
@@ -4349,65 +4346,13 @@ def _analyze_market_full(
 
 
 # ============================================================
-# CLASIFICACIÓN DE ANÁLISIS PARA RAILWAY
-# ============================================================
-
-def _classify_analysis(result: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Asigna una categoría estable a cada análisis para que Railway muestre
-    qué estructura fue detectada, incluso cuando la señal sea bloqueada.
-
-    #1 = continuidad después de retroceso
-    #2 = fuerza/ruptura después de pullback
-    #3 = rechazo estructural en soporte/resistencia
-    #4 = divergencia RSI
-    #0 = sin configuración identificable
-    """
-    entry_type = str(result.get("entry_type") or "").lower()
-    zone = str(result.get("zone") or "").lower()
-    reason = str(result.get("reason") or "").lower()
-    analysis = result.get("analysis") or {}
-
-    if entry_type in {"rejection_support", "rejection_resistance"} or "rechazo" in zone or "rechazo estructural" in reason:
-        number = 3
-        name = "RECHAZO ESTRUCTURAL"
-    elif entry_type == "force" or "fuerza" in zone or "fuerza" in reason:
-        number = 2
-        name = "FUERZA / RUPTURA DESPUÉS DE PULLBACK"
-    elif entry_type in {"continuity", "rest", "indecision"} or analysis.get("pullback") or "continuidad" in zone or "continuidad" in reason:
-        number = 1
-        name = "CONTINUIDAD DESPUÉS DE RETROCESO"
-    elif entry_type == "rsi_divergence" or "divergencia" in zone or "divergencia" in reason:
-        number = 4
-        name = "DIVERGENCIA RSI ESTRUCTURAL"
-    else:
-        number = 0
-        name = "SIN CONFIGURACIÓN IDENTIFICABLE"
-
-    label = f"ANALISIS #{number} | {name}"
-    result["analysis_number"] = number
-    result["analysis_name"] = name
-    result["analysis_label"] = label
-    result.setdefault("analysis", {})
-    result["analysis"]["analysis_number"] = number
-    result["analysis"]["analysis_name"] = name
-    result["analysis"]["analysis_label"] = label
-
-    current_reason = str(result.get("reason") or "sin señal")
-    if not current_reason.startswith("ANALISIS #"):
-        result["reason"] = f"{label} | {current_reason}"
-
-    return result
-
-
-# ============================================================
-# API PUBLICA: TODAS LAS ESTRUCTURAS VALIDAS
+# API PUBLICA: SOLO FUERZA
 # ============================================================
 #
-# strategy.py expone las señales validas de todas las estructuras
-# aprobadas por _analyze_market_full: rechazo, continuidad,
-# descanso, fuerza, indecision y divergencia RSI.
-# La etiqueta ANALISIS #1/#2/#3/#4 se conserva para Railway.
+# strategy.py analiza internamente la vela completa, pero SOLO
+# expone una señal cuando entry_type == "force".
+# Las señales de rechazo, divergencia, continuidad, descanso
+# e indecisión quedan bloqueadas y nunca llegan a bot.py.
 # ============================================================
 
 def analyze_market(
@@ -4426,19 +4371,16 @@ def analyze_market(
         pair=pair,
     )
 
-    # Clasificar todas las estructuras antes de devolver el resultado.
-    # NO bloquear por entry_type == "force": las estructuras validas
-    # de continuidad, descanso, rechazo, indecision y divergencia
-    # tambien pueden llegar a bot.py cuando generan una señal.
-    result = _classify_analysis(result)
-
-    # La estrategia interna ya determina si existe una señal valida.
-    # Solo normalizamos el estado para que Railway reciba un mensaje
-    # coherente con la estructura detectada.
-    if result.get("signal") in {"call", "put"}:
-        result["blocked"] = False
-    else:
+    if result.get("entry_type") != "force":
+        result["signal"] = None
         result["blocked"] = True
+        result["reason"] = (
+            "SIN SEÑAL: strategy.py solo permite "
+            "señales de FUERZA"
+        )
+        result["entry_type"] = None
+        result["entry_quality"] = 0
+        return result
 
     return result
 
