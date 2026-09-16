@@ -58,26 +58,26 @@ import pandas as pd
 # ============================================================
 
 MIN_BARS = 35
-MAX_CANDLES = 90
+MAX_CANDLES = 10
 
-EMA_FAST = 18
-EMA_MID = 42
+EMA_FAST = 20
+EMA_MID = 50
 EMA_SLOW = 100
 
-RSI_PERIOD = 7
-ATR_PERIOD = 7
+RSI_PERIOD = 14
+ATR_PERIOD = 14
 
 
 # ============================================================
 # PIVOTES / ESTRUCTURA
 # ============================================================
 
-PIVOT_LEFT = 3
-PIVOT_RIGHT = 3
+PIVOT_LEFT = 4
+PIVOT_RIGHT = 4
 
 SWING_LOOKBACK = 45
 
-MIN_STRUCTURE_GAP_ATR = 0.08
+MIN_STRUCTURE_GAP_ATR = 0.10
 
 
 # ============================================================
@@ -119,52 +119,52 @@ MAX_BODY_ATR = 1.35
 # IMPULSO
 # ============================================================
 
-IMPULSE_LOOKBACK = 12
+IMPULSE_LOOKBACK = 100
 
-MAX_IMPULSE_AGE = 5
+MAX_IMPULSE_AGE = 100
 
-MAX_IMPULSE_TOTAL_ATR = 3.20
+MAX_IMPULSE_TOTAL_ATR = 100
 
-MAX_CONSECUTIVE_DIRECTION_CANDLES = 5
+MAX_CONSECUTIVE_DIRECTION_CANDLES = 100
 
-MIN_IMPULSE_BODY_RATIO = 0.45
+MIN_IMPULSE_BODY_RATIO = 100
 
-MIN_IMPULSE_BODY_ATR = 0.35
+MIN_IMPULSE_BODY_ATR = 100
 
-BREAKOUT_LOOKBACK = 5
+BREAKOUT_LOOKBACK = 100
 
 
 # ============================================================
 # CONSOLIDACIÓN
 # ============================================================
 
-CONSOLIDATION_LOOKBACK = 8
+CONSOLIDATION_LOOKBACK = 100
 
-MIN_CONSOLIDATION_CANDLES = 4
+MIN_CONSOLIDATION_CANDLES = 100
 
-MAX_CONSOLIDATION_RANGE_ATR = 2.20
+MAX_CONSOLIDATION_RANGE_ATR = 100
 
-MAX_CONSOLIDATION_DRIFT_ATR = 1.20
+MAX_CONSOLIDATION_DRIFT_ATR = 100
 
 
 # ============================================================
 # RSI
 # ============================================================
 
-CALL_RSI_MIN = 48.0
-CALL_RSI_MAX = 78.0
+CALL_RSI_MIN = 100
+CALL_RSI_MAX = 100
 
-PUT_RSI_MIN = 42.0
-PUT_RSI_MAX = 72.0
+PUT_RSI_MIN = 100
+PUT_RSI_MAX = 100
 
 
 # ============================================================
 # SCORE
 # ============================================================
 
-MIN_STRUCTURE_SCORE = 3
+MIN_STRUCTURE_SCORE = 100
 
-MIN_ENTRY_SCORE = 87
+MIN_ENTRY_SCORE = 100
 
 
 # ============================================================
