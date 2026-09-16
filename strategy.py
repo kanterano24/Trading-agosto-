@@ -1,41 +1,37 @@
 """
 strategy.py
 
-ESTRATEGIA SOLO DESCANSO
+ESTRATEGIA: DESCANSO + INDECISIÓN (PRICE ACTION PURO)
 PARA BINARY OTC M1
 
-Detecta vela de descanso en N
-y prepara entrada para N+1.
+✔ SOLO usa velas (OHLC)
+✔ NO usa indicadores (EMA, RSI, ATR, etc.)
 
-NO usa:
-- rechazo
-- continuidad
-- indecisión
-- fuerza
-- divergencia
+Detecta:
+- Descanso
+- Indecisión
+
+Entrada en N+1
 """
 
 from __future__ import annotations
 from typing import Any, Dict, Optional
 import pandas as pd
-import numpy as np
 
 
 # ============================================================
 # CONFIG
 # ============================================================
 
-MIN_BARS = 35
-
-EMA_FAST = 9
-EMA_MID = 21
-EMA_SLOW = 50
-
-ATR_PERIOD = 14
+MIN_BARS = 20
 
 # DESCANSO
 REST_MAX_BODY_RATIO = 0.50
 REST_MIN_PREVIOUS_BODY_RATIO = 0.55
+
+# INDECISIÓN
+INDECISION_MAX_BODY_RATIO = 0.30
+INDECISION_MIN_WICK_RATIO = 0.25
 
 
 # ============================================================
@@ -81,27 +77,6 @@ def _normalize(df: pd.DataFrame) -> pd.DataFrame:
 
 
 # ============================================================
-# INDICADORES
-# ============================================================
-
-def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
-    df = _normalize(df)
-    if df.empty:
-        return df
-
-    close = df["close"]
-
-    df["ema9"] = close.ewm(span=EMA_FAST).mean()
-    df["ema21"] = close.ewm(span=EMA_MID).mean()
-    df["ema50"] = close.ewm(span=EMA_SLOW).mean()
-
-    # ATR simple
-    df["atr"] = (df["high"] - df["low"]).rolling(ATR_PERIOD).mean()
-
-    return df
-
-
-# ============================================================
 # VELA
 # ============================================================
 
@@ -114,10 +89,15 @@ def candle_metrics(c):
     rng = max(h - l, 1e-12)
     body = abs(cl - o)
 
+    upper = max(h - max(o, cl), 0.0)
+    lower = max(min(o, cl) - l, 0.0)
+
     return {
         "open": o,
         "close": cl,
-        "body_ratio": body / rng
+        "body_ratio": body / rng,
+        "upper_ratio": upper / rng,
+        "lower_ratio": lower / rng
     }
 
 
@@ -130,46 +110,60 @@ def candle_direction(c):
 
 
 # ============================================================
+# ESTRUCTURA SIMPLE (SIN INDICADORES)
+# ============================================================
+
+def detect_structure(df: pd.DataFrame) -> str:
+    if len(df) < 6:
+        return "range"
+
+    highs = df["high"]
+    lows = df["low"]
+
+    # últimos swings simples
+    if highs.iloc[-1] > highs.iloc[-2] and lows.iloc[-1] > lows.iloc[-2]:
+        return "bullish"
+
+    if highs.iloc[-1] < highs.iloc[-2] and lows.iloc[-1] < lows.iloc[-2]:
+        return "bearish"
+
+    return "range"
+
+
+# ============================================================
 # DESCANSO
 # ============================================================
 
-def _is_rest_candle(current, previous, direction):
+def _is_rest_candle(c, p, direction):
 
-    # cuerpo pequeño en vela actual
-    if current["body_ratio"] > REST_MAX_BODY_RATIO:
+    if c["body_ratio"] > REST_MAX_BODY_RATIO:
         return False
 
-    # vela anterior debe ser fuerte
-    if previous["body_ratio"] < REST_MIN_PREVIOUS_BODY_RATIO:
+    if p["body_ratio"] < REST_MIN_PREVIOUS_BODY_RATIO:
         return False
 
-    # dirección correcta
     if direction == "bullish":
-        return previous["close"] > previous["open"]
+        return p["close"] > p["open"]
 
     if direction == "bearish":
-        return previous["close"] < previous["open"]
+        return p["close"] < p["open"]
 
     return False
 
 
 # ============================================================
-# ESTRUCTURA SIMPLE
+# INDECISIÓN
 # ============================================================
 
-def detect_structure(df):
-    if len(df) < 10:
-        return "range"
+def _is_indecision(c):
 
-    last = df.iloc[-1]
+    if c["body_ratio"] > INDECISION_MAX_BODY_RATIO:
+        return False
 
-    if last["ema9"] > last["ema21"] > last["ema50"]:
-        return "bullish"
-
-    if last["ema9"] < last["ema21"] < last["ema50"]:
-        return "bearish"
-
-    return "range"
+    return (
+        c["upper_ratio"] >= INDECISION_MIN_WICK_RATIO
+        or c["lower_ratio"] >= INDECISION_MIN_WICK_RATIO
+    )
 
 
 # ============================================================
@@ -180,7 +174,7 @@ def analyze_market(df: Optional[pd.DataFrame] = None, **kwargs) -> Dict[str, Any
 
     result = _empty_result()
 
-    df = add_indicators(df)
+    df = _normalize(df)
 
     if len(df) < MIN_BARS:
         result["reason"] = "historial insuficiente"
@@ -195,19 +189,15 @@ def analyze_market(df: Optional[pd.DataFrame] = None, **kwargs) -> Dict[str, Any
     p = candle_metrics(previous)
 
     # ========================================================
-    # SOLO DESCANSO
+    # 1. DESCANSO (PRIORIDAD)
     # ========================================================
 
     if _is_rest_candle(c, p, structure):
 
         if structure == "bullish":
             signal = "call"
-            zone = "descanso_alcista"
-
         elif structure == "bearish":
             signal = "put"
-            zone = "descanso_bajista"
-
         else:
             return result
 
@@ -217,12 +207,38 @@ def analyze_market(df: Optional[pd.DataFrame] = None, **kwargs) -> Dict[str, Any
             "blocked": False,
             "continuity": True,
             "entry_type": "rest",
-            "reason": f"{signal.upper()} | DESCANSO | entrada en N+1",
+            "reason": f"{signal.upper()} | DESCANSO | price action | N+1",
             "analysis": {
                 "structure": structure,
-                "current_candle": c,
-                "previous_candle": p,
-                "note": "vela de pausa tras impulso, esperar continuación"
+                "type": "rest"
+            }
+        })
+
+        return result
+
+    # ========================================================
+    # 2. INDECISIÓN
+    # ========================================================
+
+    if _is_indecision(c):
+
+        if structure == "bullish":
+            signal = "call"
+        elif structure == "bearish":
+            signal = "put"
+        else:
+            return result
+
+        result.update({
+            "signal": signal,
+            "score": 70,
+            "blocked": False,
+            "continuity": True,
+            "entry_type": "indecision",
+            "reason": f"{signal.upper()} | INDECISIÓN | price action | N+1",
+            "analysis": {
+                "structure": structure,
+                "type": "indecision"
             }
         })
 
@@ -244,4 +260,4 @@ def signal(df):
 
 
 if __name__ == "__main__":
-    print("Strategy SOLO DESCANSO lista.")
+    print("Strategy DESCANSO + INDECISIÓN (SIN INDICADORES) lista.")
