@@ -84,6 +84,8 @@ LIVE_STATE: Dict[str, Dict[str, Any]] = {}
 PENDING_ENTRY: Dict[str, Dict[str, Any]] = {}
 LAST_TRADE_TIME: Dict[str, float] = {}
 LAST_TRADE_CANDLE: Dict[str, int] = {}
+GLOBAL_LAST_EXECUTION_TS: Optional[int] = None
+GLOBAL_EXECUTION_LOCK = False
 
 STATE_LOCK = threading.RLock()
 
@@ -605,11 +607,8 @@ def analyze_closed_candle(pair: str, expected_closed_ts: int) -> bool:
         if state and int(state.get("analyzed_ts", -1)) == expected_closed_ts:
             return True
 
-    result = analyze_market(
-        candle_1m=closed_row.to_dict(),
-        previous_m1=df.iloc[:-1].copy(),
-        pair=pair,
-    )
+    # La interfaz pública de strategy.py recibe un DataFrame completo.
+    result = analyze_market(df)
 
     signal = result.get("signal")
     score = int(result.get("score", 0) or 0)
@@ -717,6 +716,7 @@ def buy_binary(pair: str, signal: str) -> Tuple[bool, Optional[Any]]:
 
 
 def execute_sniper(pair: str, pending: Dict[str, Any]) -> bool:
+    global GLOBAL_EXECUTION_LOCK, GLOBAL_LAST_EXECUTION_TS
     execution_ts = int(pending["execution_ts"])
     signal = str(pending["signal"])
 
@@ -735,6 +735,12 @@ def execute_sniper(pair: str, pending: Dict[str, Any]) -> bool:
     if LAST_TRADE_CANDLE.get(pair) == execution_ts:
         return False
 
+    with STATE_LOCK:
+        if GLOBAL_EXECUTION_LOCK or GLOBAL_LAST_EXECUTION_TS == execution_ts:
+            logger.info("%s | bloqueo global activo para N+1=%s", pair, execution_ts)
+            return False
+        GLOBAL_EXECUTION_LOCK = True
+
     if cooldown_active(pair):
         return False
 
@@ -752,6 +758,8 @@ def execute_sniper(pair: str, pending: Dict[str, Any]) -> bool:
             "El espacio disponible cambió antes de N+1.\n"
             "La entrada no se ejecutará."
         )
+        with STATE_LOCK:
+            GLOBAL_EXECUTION_LOCK = False
         return False
 
     sent_at = get_iq_server_timestamp()
@@ -768,10 +776,14 @@ def execute_sniper(pair: str, pending: Dict[str, Any]) -> bool:
             f"N+1: {execution_ts}\n"
             "La señal no se trasladará."
         )
+        with STATE_LOCK:
+            GLOBAL_EXECUTION_LOCK = False
         return False
 
     LAST_TRADE_TIME[pair] = time.time()
     LAST_TRADE_CANDLE[pair] = execution_ts
+    GLOBAL_LAST_EXECUTION_TS = execution_ts
+    GLOBAL_EXECUTION_LOCK = False
 
     with STATE_LOCK:
         PENDING_ENTRY.pop(pair, None)
@@ -816,14 +828,7 @@ def process_pair(pair: str) -> None:
     if analyzed_ts != closed_ts:
         analyze_closed_candle(pair, closed_ts)
 
-    pending = PENDING_ENTRY.get(pair)
-    if pending is None:
-        return
-
-    if int(pending.get("execution_ts", -1)) != current_ts:
-        return
-
-    execute_sniper(pair, pending)
+    # La ejecución global se realiza después de analizar todos los pares.
 
 
 def analyze_all_pairs() -> None:
@@ -840,6 +845,32 @@ def analyze_all_pairs() -> None:
             process_pair(pair)
         except Exception:
             logger.exception("Error procesando %s", pair)
+
+    # Selección global: una sola señal para la ventana N+1 actual.
+    current_ts = floor_candle_timestamp(get_iq_server_timestamp())
+    candidates = []
+    with STATE_LOCK:
+        for pair, pending in PENDING_ENTRY.items():
+            if int(pending.get("execution_ts", -1)) == current_ts:
+                candidates.append((pair, pending))
+
+    if candidates:
+        candidates.sort(
+            key=lambda item: (
+                int(item[1].get("score", 0) or 0),
+                float((item[1].get("analysis") or {}).get("entry_quality", 0) or 0),
+            ),
+            reverse=True,
+        )
+        winner_pair, winner_pending = candidates[0]
+        logger.info(
+            "SELECCION GLOBAL | candidatos=%s | elegido=%s | score=%s | N+1=%s",
+            len(candidates), winner_pair, winner_pending.get("score"), current_ts,
+        )
+        for loser_pair, _ in candidates[1:]:
+            with STATE_LOCK:
+                PENDING_ENTRY.pop(loser_pair, None)
+        execute_sniper(winner_pair, winner_pending)
 
 
 # ============================================================
