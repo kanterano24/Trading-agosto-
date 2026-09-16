@@ -164,7 +164,7 @@ PUT_RSI_MAX = 72.0
 
 MIN_STRUCTURE_SCORE = 3
 
-MIN_ENTRY_SCORE = 99
+MIN_ENTRY_SCORE = 87
 
 
 # ============================================================
@@ -182,9 +182,9 @@ MIN_DISTANCE_FROM_TRENDLINE_ATR = 0.30
 # INDECISIÓN
 # ============================================================
 
-INDECISION_MAX_BODY_RATIO = 0.30
+INDECISION_MAX_BODY_RATIO = 0.40
 
-INDECISION_MIN_WICK_RATIO = 0.25
+INDECISION_MIN_WICK_RATIO = 0.45
 
 
 # ============================================================
