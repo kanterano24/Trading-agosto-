@@ -88,7 +88,7 @@ ZONE_ATR = 0.28
 
 MAX_ENTRY_DISTANCE_ATR = 0.55
 
-MIN_ROOM_TO_OPPOSITE_ATR = 0.70
+MIN_ROOM_TO_OPPOSITE_ATR = 0.90
 
 
 # ============================================================
@@ -3053,6 +3053,35 @@ def _analyze_market_full(
     ][
         "room_to_opposite_atr"
     ] = room_atr
+
+    # ========================================================
+    # FILTRO DURO DE UBICACION Y ESPACIO
+    # ========================================================
+    # Ninguna familia de señal puede compensar una entrada que
+    # tenga poco recorrido disponible hasta el extremo opuesto.
+    # Esto se aplica antes de evaluar rechazo, continuidad,
+    # descanso, indecision, fuerza o divergencia.
+    if not room_ok:
+        result["reason"] = (
+            "Entrada bloqueada: espacio insuficiente hasta "
+            f"el extremo opuesto ({room_atr:.2f} ATR < "
+            f"{MIN_ROOM_TO_OPPOSITE_ATR:.2f} ATR)"
+        )
+        result["analysis"]["blocked_reason"] = (
+            "room_to_opposite insuficiente"
+        )
+        result["analysis"]["location_filter"] = {
+            "valid": False,
+            "room_atr": room_atr,
+            "required_room_atr": MIN_ROOM_TO_OPPOSITE_ATR,
+        }
+        return result
+
+    result["analysis"]["location_filter"] = {
+        "valid": True,
+        "room_atr": room_atr,
+        "required_room_atr": MIN_ROOM_TO_OPPOSITE_ATR,
+    }
 
     # ========================================================
     # ========================================================
