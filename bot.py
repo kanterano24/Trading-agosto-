@@ -85,9 +85,9 @@ EXPIRATION = int(os.getenv("EXPIRATION", "5"))
 
 # EJECUCIÓN REAL PROTEGIDA: requiere dos variables explícitas.
 # Por defecto permanece desactivada.
-OBSERVATION_MODE = os.getenv("OBSERVATION_MODE", "false").strip().lower() in {"1", "true", "yes", "si", "sí"}
-DEMO_MODE = True
-REAL_TRADING_CONFIRM = True  # Solo demo
+OBSERVATION_MODE = False  # ejecución DEMO habilitada; el control manual es /start y /stop
+DEMO_ONLY = True  # nunca operar en cuenta REAL
+REAL_TRADING_CONFIRM = True  # no se requiere confirmación para DEMO
 SIGNAL_LOG_PATH = os.getenv("SIGNAL_LOG_PATH", "signals_execution.csv")
 EXECUTABLE_ENTRY_TYPES = {
     item.strip() for item in os.getenv(
@@ -380,7 +380,7 @@ def telegram_command_loop() -> None:
                     telegram_send(
                         "📊 ESTADO\n\n"
                         f"Estado: {status}\n"
-                        "Modo: SNIPER\n"
+                        "Modo: MANUAL (/start y /stop) + SNIPER\n"
                         "Mercado: BINARY OTC\n"
                         "Estrategia: "
                         "ESTRUCTURA + RECHAZO\n"
@@ -708,12 +708,12 @@ def connect_iq() -> bool:
             f"IQ Option: {reason}"
         )
 
-    # Seguridad: seleccionar siempre la cuenta demo.
+    # Fuerza la cuenta de práctica antes de cualquier orden.
     try:
         IQ.change_balance("PRACTICE")
-        logger.info("Cuenta seleccionada: DEMO/PRACTICE")
+        logger.info("Cuenta IQ seleccionada: PRACTICE/DEMO")
     except Exception as exc:
-        raise RuntimeError("No se pudo seleccionar la cuenta demo; bot detenido.") from exc
+        raise ConnectionError(f"No se pudo seleccionar cuenta DEMO/PRACTICE: {exc}") from exc
 
     refresh_binary_otc_pairs(
         force=True
@@ -1153,7 +1153,7 @@ def analyze_closed_candle(
         return True
 
     side = "CALL 🟢" if signal == "call" else "PUT 🔴"
-    mode_label = "OBSERVACIÓN — SIN EJECUCIÓN" if OBSERVATION_MODE else "EJECUCIÓN DEMO/PRACTICE"
+    mode_label = "OBSERVACIÓN — SIN EJECUCIÓN" if OBSERVATION_MODE else "EJECUCIÓN HABILITADA"
     telegram_send(
         "🔎 SEÑAL CLASIFICADA\n\n"
         f"Modo: {mode_label}\n"
@@ -1171,7 +1171,7 @@ def analyze_closed_candle(
         f"{result.get('reason', '')}"
     )
 
-    if OBSERVATION_MODE:
+    if OBSERVATION_MODE or (not DEMO_ONLY and not REAL_TRADING_CONFIRM):
         logger.info(
             "%s | OBSERVACION/BLOQUEADO | familia=%s | señal=%s | no se arma entrada",
             pair, family, signal,
@@ -1243,7 +1243,7 @@ def buy_binary(
     pair: str,
     signal: str,
 ) -> Tuple[bool, Optional[Any]]:
-    if OBSERVATION_MODE:
+    if OBSERVATION_MODE or (not DEMO_ONLY and not REAL_TRADING_CONFIRM):
         logger.warning("%s | orden bloqueada: protección de ejecución activa", pair)
         return False, None
     if signal not in {"call", "put"}:
@@ -1336,7 +1336,7 @@ def execute_sniper(
         return False
 
     telegram_send(
-        "🧪 EJECUCIÓN DEMO/PRACTICE\n\n"
+        "🟢 EJECUCIÓN DEMO\n\n"
         f"Par: {pair}\n"
         f"Dirección: "
         f"{signal.upper()}\n\n"
@@ -1619,7 +1619,7 @@ def main() -> None:
 
     telegram_send(
         "🤖 BOT LISTO\n\n"
-        f"Modo: {'OBSERVACIÓN (sin operar)' if OBSERVATION_MODE else 'EJECUCIÓN'}\n"
+        f"Modo: DEMO + MANUAL (/start y /stop)\n"
         "🧠 TODAS LAS ESTRUCTURAS\n"
         "🔎 Analiza todos los "
         "OTC BINARY disponibles.\n\n"
