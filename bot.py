@@ -75,7 +75,7 @@ AUTO_START = os.getenv("AUTO_START", "true").strip().lower() in {
 
 # La API publica de strategy.py debe exponer solamente entry_type=force.
 REQUIRE_FORCE = False
-REQUIRE_N_PLUS_1 = False
+REQUIRE_N_PLUS_1 = True
 
 
 # ============================================================
@@ -937,7 +937,17 @@ def process_pair(pair: str) -> None:
         return
 
     current_ts = floor_candle_timestamp(get_iq_server_timestamp())
-    analyze_live_candle(pair, current_ts)
+
+    # Primero se ejecuta, si corresponde, la señal preparada en N
+    # durante la vela siguiente N+1.
+    with STATE_LOCK:
+        pending = PENDING_ENTRY.get(pair)
+    if pending is not None:
+        execute_sniper(pair, pending)
+
+    # Después se analiza únicamente la última vela completamente cerrada.
+    closed_ts = int(current_ts - TIMEFRAME)
+    analyze_closed_candle(pair, closed_ts)
 
 
 def analyze_all_pairs() -> None:
@@ -964,7 +974,7 @@ def main() -> None:
     global BOT_RUNNING, TOTAL_TRADES
 
     logger.info("========================================")
-    logger.info("BOT BINARY OTC | BB + ATR TRAILING + RSI | MISMA VELA")
+    logger.info("BOT BINARY OTC | BB + EMA + ATR + RSI | N+1")
     logger.info("TIMEFRAME=%s | EXPIRATION=%s", TIMEFRAME, EXPIRATION)
     logger.info("MAX OTC=%s | AMOUNT=%s | ACCOUNT=%s | MAX_TRADES=%s",
                 MAX_OTC_PAIRS, AMOUNT, ACCOUNT_TYPE, MAX_TOTAL_TRADES)
@@ -1002,7 +1012,7 @@ def main() -> None:
     telegram_send(
         "🤖 BOT LISTO\n\n"
         "📊 Filtro Bollinger + ATR Trailing Stops + RSI\n"
-        "⚡ Ejecuta durante la vela de señal\n"
+        "⚡ Analiza N cerrada y ejecuta en N+1\n"
         f"⏳ Expiración: {EXPIRATION} minuto(s)\n"
         f"🚀 Inicio automático: {'SI' if AUTO_START else 'NO'}\n\n"
         + (
