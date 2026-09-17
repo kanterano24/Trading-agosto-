@@ -50,7 +50,7 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 TIMEFRAME = 60
 EXPIRATION = int(os.getenv("EXPIRATION", "3"))
-AMOUNT = float(os.getenv("AMOUNT", "500"))
+AMOUNT = float(os.getenv("AMOUNT", "550"))
 CANDLE_COUNT = max(60, int(os.getenv("CANDLE_COUNT", "80")))
 MAX_OTC_PAIRS = max(1, int(os.getenv("MAX_OTC_PAIRS", "50")))
 
@@ -67,8 +67,8 @@ AUTO_START = os.getenv("AUTO_START", "true").strip().lower() in {
 }
 
 # La API publica de strategy.py debe exponer solamente entry_type=force.
-REQUIRE_FORCE = True
-REQUIRE_N_PLUS_1 = True
+REQUIRE_FORCE = False
+REQUIRE_N_PLUS_1 = False
 
 
 # ============================================================
@@ -353,8 +353,8 @@ def connect_iq() -> bool:
 
     telegram_send(
         "🟢 IQ OPTION CONECTADO\n\n"
-        "⚡ MODO FUERZA\n"
-        "📌 N cerrada → N+1\n"
+        "📊 BB + ATR Trailing Stops + RSI\n"
+        "⚡ Ejecución en la misma vela de señal\n"
         f"⏳ Expiración: {EXPIRATION} minuto(s)"
     )
 
@@ -470,6 +470,9 @@ def is_force_signal(result: Dict[str, Any], signal: Any) -> bool:
     analysis = result.get("analysis") or {}
 
     if REQUIRE_FORCE and entry_type != "force":
+        return False
+
+    if not REQUIRE_FORCE and entry_type not in {"force", "bb_atr_rsi"}:
         return False
 
     if REQUIRE_FORCE and analysis.get("force") is False:
@@ -689,6 +692,69 @@ def analyze_closed_candle(pair: str, expected_closed_ts: int) -> bool:
 
 
 # ============================================================
+# ANALISIS Y EJECUCION EN LA MISMA VELA
+# ============================================================
+
+def analyze_live_candle(pair: str, current_ts: int) -> bool:
+    """Analiza la vela activa y ejecuta una sola vez por vela de señal."""
+    df = get_closed_candles(pair)
+    if df is None or df.empty or "from" not in df.columns:
+        return False
+
+    df = df.sort_values("from").drop_duplicates("from", keep="last").reset_index(drop=True)
+    current_rows = df[df["from"].astype(int) == int(current_ts)]
+    if current_rows.empty:
+        return False
+
+    current_row = current_rows.iloc[-1]
+    history = df[df["from"].astype(int) < int(current_ts)].copy()
+    if len(history) < MIN_HISTORY - 1:
+        return False
+
+    result = analyze_market(
+        candle_1m=current_row.to_dict(),
+        previous_m1=history,
+        pair=pair,
+    )
+    signal = result.get("signal")
+    if not is_force_signal(result, signal):
+        return False
+
+    if LAST_TRADE_CANDLE.get(pair) == int(current_ts):
+        return False
+    if cooldown_active(pair):
+        return False
+
+    analysis = result.get("analysis") or {}
+    ok, order_id = buy_binary(pair, signal)
+    if not ok:
+        logger.warning("%s | orden rechazada | señal=%s", pair, signal)
+        return False
+
+    LAST_TRADE_TIME[pair] = time.time()
+    LAST_TRADE_CANDLE[pair] = int(current_ts)
+
+    telegram_send(
+        "✅ ENTRADA EJECUTADA EN VELA DE SEÑAL\n\n"
+        f"Par: {pair}\n"
+        f"Dirección: {signal.upper()}\n"
+        f"Tipo: {result.get('entry_type')}\n"
+        f"Score: {result.get('score', 0)}/100\n"
+        f"RSI: {analysis.get('rsi')}\n"
+        f"ATR posición: {analysis.get('atr_position')}\n"
+        f"Vela: {current_ts}\n"
+        f"ID: {order_id}\n\n"
+        f"⏳ Expiración: {EXPIRATION} minuto(s)\n\n"
+        f"{result.get('reason', '')}"
+    )
+    logger.info(
+        "%s | EJECUTADO MISMA VELA | %s | ts=%s | ID=%s",
+        pair, signal.upper(), current_ts, order_id,
+    )
+    return True
+
+
+# ============================================================
 # EJECUCION
 # ============================================================
 
@@ -808,22 +874,7 @@ def process_pair(pair: str) -> None:
         return
 
     current_ts = floor_candle_timestamp(get_iq_server_timestamp())
-    closed_ts = current_ts - TIMEFRAME
-
-    state = LIVE_STATE.get(pair)
-    analyzed_ts = int(state.get("analyzed_ts", -1)) if state else -1
-
-    if analyzed_ts != closed_ts:
-        analyze_closed_candle(pair, closed_ts)
-
-    pending = PENDING_ENTRY.get(pair)
-    if pending is None:
-        return
-
-    if int(pending.get("execution_ts", -1)) != current_ts:
-        return
-
-    execute_sniper(pair, pending)
+    analyze_live_candle(pair, current_ts)
 
 
 def analyze_all_pairs() -> None:
@@ -850,7 +901,7 @@ def main() -> None:
     global BOT_RUNNING
 
     logger.info("========================================")
-    logger.info("BOT BINARY OTC | FUERZA | N+1")
+    logger.info("BOT BINARY OTC | BB + ATR TRAILING + RSI | MISMA VELA")
     logger.info("TIMEFRAME=%s | EXPIRATION=%s", TIMEFRAME, EXPIRATION)
     logger.info("MAX OTC=%s | AMOUNT=%s", MAX_OTC_PAIRS, AMOUNT)
     logger.info("========================================")
@@ -882,10 +933,8 @@ def main() -> None:
 
     telegram_send(
         "🤖 BOT LISTO\n\n"
-        "⚡ Solo señales de FUERZA\n"
-        "📌 Analiza N cerrada\n"
-        "🚫 No opera N\n"
-        "⚡ Ejecuta en N+1\n"
+        "📊 Filtro Bollinger + ATR Trailing Stops + RSI\n"
+        "⚡ Ejecuta durante la vela de señal\n"
         f"⏳ Expiración: {EXPIRATION} minuto(s)\n"
         f"🚀 Inicio automático: {'SI' if AUTO_START else 'NO'}\n\n"
         + (
