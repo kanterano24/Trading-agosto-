@@ -50,11 +50,9 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 TIMEFRAME = 60
 EXPIRATION = int(os.getenv("EXPIRATION", "3"))
-AMOUNT = float(os.getenv("AMOUNT", "2"))
-ACCOUNT_MODE = os.getenv("IQ_ACCOUNT", "PRACTICE").strip().upper()
+AMOUNT = float(os.getenv("AMOUNT", "550"))
 CANDLE_COUNT = max(60, int(os.getenv("CANDLE_COUNT", "80")))
 MAX_OTC_PAIRS = max(1, int(os.getenv("MAX_OTC_PAIRS", "50")))
-MAX_ENTRIES = max(1, int(os.getenv("MAX_ENTRIES", "2")))
 
 PAIR_REFRESH_SECONDS = 60.0
 SNIPER_POLL = 0.06
@@ -69,8 +67,8 @@ AUTO_START = os.getenv("AUTO_START", "true").strip().lower() in {
 }
 
 # La API publica de strategy.py debe exponer solamente entry_type=force.
-REQUIRE_FORCE = True
-REQUIRE_N_PLUS_1 = True
+REQUIRE_FORCE = False
+REQUIRE_N_PLUS_1 = False
 
 
 # ============================================================
@@ -78,7 +76,6 @@ REQUIRE_N_PLUS_1 = True
 # ============================================================
 
 BOT_RUNNING = False
-EXECUTED_ENTRIES = 0
 IQ: Optional[IQ_Option] = None
 PAIRS: list[str] = []
 LAST_PAIR_REFRESH = 0.0
@@ -140,7 +137,7 @@ def telegram_send(message: str) -> None:
 
 
 def telegram_command_loop() -> None:
-    global BOT_RUNNING, EXECUTED_ENTRIES
+    global BOT_RUNNING
 
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         return
@@ -174,9 +171,6 @@ def telegram_command_loop() -> None:
                 text = str(message.get("text", "")).strip().lower()
 
                 if text == "/start":
-                    with STATE_LOCK:
-                        EXECUTED_ENTRIES = 0
-                        PENDING_ENTRY.clear()
                     BOT_RUNNING = True
                     telegram_send(
                         "🟢 BOT ACTIVADO\n\n"
@@ -184,8 +178,7 @@ def telegram_command_loop() -> None:
                         "📌 Análisis en N y ejecución en N+1\n"
                         f"⏱ Temporalidad: {TIMEFRAME // 60} minuto(s)\n"
                         f"⏳ Expiración: {EXPIRATION} minuto(s)\n"
-                        f"💵 Importe: {AMOUNT:g}\n"
-                        f"🎯 Límite: {MAX_ENTRIES} entradas"
+                        f"💵 Importe: {AMOUNT:g}"
                     )
 
                 elif text == "/stop":
@@ -207,7 +200,6 @@ def telegram_command_loop() -> None:
                         "Entrada: N+1\n"
                         f"Expiración: {EXPIRATION} minuto(s)\n"
                         f"Importe: {AMOUNT:g}\n"
-                        f"Entradas: {EXECUTED_ENTRIES}/{MAX_ENTRIES}\n"
                         f"Pares OTC: {len(PAIRS)}"
                     )
 
@@ -357,20 +349,12 @@ def connect_iq() -> bool:
     if not connected:
         raise ConnectionError(f"No se pudo conectar a IQ Option: {reason}")
 
-    if ACCOUNT_MODE not in {"REAL", "PRACTICE"}:
-        raise ValueError("IQ_ACCOUNT debe ser REAL o PRACTICE")
-
-    if not IQ.change_balance(ACCOUNT_MODE):
-        raise ConnectionError(f"No se pudo seleccionar la cuenta {ACCOUNT_MODE}")
-
-    logger.info("Cuenta IQ Option seleccionada: %s", ACCOUNT_MODE)
-
     refresh_binary_otc_pairs(force=True)
 
     telegram_send(
         "🟢 IQ OPTION CONECTADO\n\n"
-        "⚡ MODO FUERZA\n"
-        "📌 N cerrada → N+1\n"
+        "📊 BB + ATR Trailing Stops + RSI\n"
+        "⚡ Ejecución en la misma vela de señal\n"
         f"⏳ Expiración: {EXPIRATION} minuto(s)"
     )
 
@@ -395,11 +379,6 @@ def ensure_connection() -> bool:
             logger.error("No se pudo reconectar: %s", reason)
             return False
 
-        if not IQ.change_balance(ACCOUNT_MODE):
-            logger.error("No se pudo seleccionar la cuenta %s tras reconectar", ACCOUNT_MODE)
-            return False
-
-        logger.info("Cuenta IQ Option seleccionada tras reconectar: %s", ACCOUNT_MODE)
         refresh_binary_otc_pairs(force=True)
         telegram_send("🟢 IQ OPTION RECONECTADO")
         return True
@@ -491,6 +470,9 @@ def is_force_signal(result: Dict[str, Any], signal: Any) -> bool:
     analysis = result.get("analysis") or {}
 
     if REQUIRE_FORCE and entry_type != "force":
+        return False
+
+    if not REQUIRE_FORCE and entry_type not in {"force", "bb_atr_rsi"}:
         return False
 
     if REQUIRE_FORCE and analysis.get("force") is False:
@@ -710,6 +692,69 @@ def analyze_closed_candle(pair: str, expected_closed_ts: int) -> bool:
 
 
 # ============================================================
+# ANALISIS Y EJECUCION EN LA MISMA VELA
+# ============================================================
+
+def analyze_live_candle(pair: str, current_ts: int) -> bool:
+    """Analiza la vela activa y ejecuta una sola vez por vela de señal."""
+    df = get_closed_candles(pair)
+    if df is None or df.empty or "from" not in df.columns:
+        return False
+
+    df = df.sort_values("from").drop_duplicates("from", keep="last").reset_index(drop=True)
+    current_rows = df[df["from"].astype(int) == int(current_ts)]
+    if current_rows.empty:
+        return False
+
+    current_row = current_rows.iloc[-1]
+    history = df[df["from"].astype(int) < int(current_ts)].copy()
+    if len(history) < MIN_HISTORY - 1:
+        return False
+
+    result = analyze_market(
+        candle_1m=current_row.to_dict(),
+        previous_m1=history,
+        pair=pair,
+    )
+    signal = result.get("signal")
+    if not is_force_signal(result, signal):
+        return False
+
+    if LAST_TRADE_CANDLE.get(pair) == int(current_ts):
+        return False
+    if cooldown_active(pair):
+        return False
+
+    analysis = result.get("analysis") or {}
+    ok, order_id = buy_binary(pair, signal)
+    if not ok:
+        logger.warning("%s | orden rechazada | señal=%s", pair, signal)
+        return False
+
+    LAST_TRADE_TIME[pair] = time.time()
+    LAST_TRADE_CANDLE[pair] = int(current_ts)
+
+    telegram_send(
+        "✅ ENTRADA EJECUTADA EN VELA DE SEÑAL\n\n"
+        f"Par: {pair}\n"
+        f"Dirección: {signal.upper()}\n"
+        f"Tipo: {result.get('entry_type')}\n"
+        f"Score: {result.get('score', 0)}/100\n"
+        f"RSI: {analysis.get('rsi')}\n"
+        f"ATR posición: {analysis.get('atr_position')}\n"
+        f"Vela: {current_ts}\n"
+        f"ID: {order_id}\n\n"
+        f"⏳ Expiración: {EXPIRATION} minuto(s)\n\n"
+        f"{result.get('reason', '')}"
+    )
+    logger.info(
+        "%s | EJECUTADO MISMA VELA | %s | ts=%s | ID=%s",
+        pair, signal.upper(), current_ts, order_id,
+    )
+    return True
+
+
+# ============================================================
 # EJECUCION
 # ============================================================
 
@@ -738,13 +783,6 @@ def buy_binary(pair: str, signal: str) -> Tuple[bool, Optional[Any]]:
 
 
 def execute_sniper(pair: str, pending: Dict[str, Any]) -> bool:
-    global BOT_RUNNING, EXECUTED_ENTRIES
-
-    if EXECUTED_ENTRIES >= MAX_ENTRIES:
-        with STATE_LOCK:
-            PENDING_ENTRY.clear()
-        return False
-
     execution_ts = int(pending["execution_ts"])
     signal = str(pending["signal"])
 
@@ -802,20 +840,7 @@ def execute_sniper(pair: str, pending: Dict[str, Any]) -> bool:
     LAST_TRADE_CANDLE[pair] = execution_ts
 
     with STATE_LOCK:
-        EXECUTED_ENTRIES += 1
         PENDING_ENTRY.pop(pair, None)
-        reached_limit = EXECUTED_ENTRIES >= MAX_ENTRIES
-        if reached_limit:
-            BOT_RUNNING = False
-            PENDING_ENTRY.clear()
-
-    if reached_limit:
-        telegram_send(
-            "🛑 LÍMITE ALCANZADO\n\n"
-            f"Se ejecutaron {EXECUTED_ENTRIES}/{MAX_ENTRIES} entradas.\n"
-            "El bot se detuvo automáticamente.\n"
-            "Usa /start para reiniciar el contador y comenzar otra sesión."
-        )
 
     telegram_send(
         "✅ FUERZA EJECUTADA\n\n"
@@ -849,22 +874,7 @@ def process_pair(pair: str) -> None:
         return
 
     current_ts = floor_candle_timestamp(get_iq_server_timestamp())
-    closed_ts = current_ts - TIMEFRAME
-
-    state = LIVE_STATE.get(pair)
-    analyzed_ts = int(state.get("analyzed_ts", -1)) if state else -1
-
-    if analyzed_ts != closed_ts:
-        analyze_closed_candle(pair, closed_ts)
-
-    pending = PENDING_ENTRY.get(pair)
-    if pending is None:
-        return
-
-    if int(pending.get("execution_ts", -1)) != current_ts:
-        return
-
-    execute_sniper(pair, pending)
+    analyze_live_candle(pair, current_ts)
 
 
 def analyze_all_pairs() -> None:
@@ -888,12 +898,12 @@ def analyze_all_pairs() -> None:
 # ============================================================
 
 def main() -> None:
-    global BOT_RUNNING, EXECUTED_ENTRIES
+    global BOT_RUNNING
 
     logger.info("========================================")
-    logger.info("BOT BINARY OTC | FUERZA | N+1")
+    logger.info("BOT BINARY OTC | BB + ATR TRAILING + RSI | MISMA VELA")
     logger.info("TIMEFRAME=%s | EXPIRATION=%s", TIMEFRAME, EXPIRATION)
-    logger.info("CUENTA=%s | MAX OTC=%s | AMOUNT=%s | MAX ENTRIES=%s", ACCOUNT_MODE, MAX_OTC_PAIRS, AMOUNT, MAX_ENTRIES)
+    logger.info("MAX OTC=%s | AMOUNT=%s", MAX_OTC_PAIRS, AMOUNT)
     logger.info("========================================")
 
     required = {
@@ -923,12 +933,9 @@ def main() -> None:
 
     telegram_send(
         "🤖 BOT LISTO\n\n"
-        "⚡ Solo señales de FUERZA\n"
-        "📌 Analiza N cerrada\n"
-        "🚫 No opera N\n"
-        "⚡ Ejecuta en N+1\n"
+        "📊 Filtro Bollinger + ATR Trailing Stops + RSI\n"
+        "⚡ Ejecuta durante la vela de señal\n"
         f"⏳ Expiración: {EXPIRATION} minuto(s)\n"
-        f"🎯 Máximo de entradas: {MAX_ENTRIES}\n"
         f"🚀 Inicio automático: {'SI' if AUTO_START else 'NO'}\n\n"
         + (
             "🟢 Análisis automático activado."
