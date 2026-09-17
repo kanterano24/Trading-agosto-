@@ -23,6 +23,7 @@ MIN_REJECTION_WICK_RATIO = 0.25
 MIN_CLOSE_POSITION = 0.60
 MIN_ROOM_ATR = 0.90
 SWING_LOOKBACK = 8
+ZONE_TOLERANCE_ATR = 0.35
 MAX_SIGNAL_BODY_ATR = 1.35
 EPS = 1e-10
 
@@ -153,6 +154,37 @@ def _rejection(metrics: Dict[str, float], side: str) -> bool:
     )
 
 
+
+def _touches_zone(metrics: Dict[str, float], level: float, atr: float) -> bool:
+    if atr <= 0.0 or not math.isfinite(level):
+        return False
+    tolerance = atr * ZONE_TOLERANCE_ATR
+    return metrics["low"] <= level + tolerance and metrics["high"] >= level - tolerance
+
+
+def _zone_rejection(
+    metrics: Dict[str, float], side: str, level: float, atr: float
+) -> bool:
+    """Confirma rechazo en una zona, no una mecha aislada en cualquier lugar."""
+    if not _touches_zone(metrics, level, atr):
+        return False
+    if side == "call":
+        return (
+            metrics["low"] <= level + atr * ZONE_TOLERANCE_ATR
+            and metrics["lower"] / metrics["range"] >= MIN_REJECTION_WICK_RATIO
+            and metrics["close_position"] >= MIN_CLOSE_POSITION
+            and metrics["close"] > level
+            and metrics["close"] >= metrics["open"]
+        )
+    return (
+        metrics["high"] >= level - atr * ZONE_TOLERANCE_ATR
+        and metrics["upper"] / metrics["range"] >= MIN_REJECTION_WICK_RATIO
+        and metrics["close_position"] <= 1.0 - MIN_CLOSE_POSITION
+        and metrics["close"] < level
+        and metrics["close"] <= metrics["open"]
+    )
+
+
 def _empty(reason: str, analysis: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     return {
         "signal": None,
@@ -206,8 +238,19 @@ def analyze_market(
     swing_high = float(lookback["high"].max())
     swing_low = float(lookback["low"].min())
 
-    call_rejection = _rejection(c2, "call") or _rejection(c3, "call")
-    put_rejection = _rejection(c2, "put") or _rejection(c3, "put")
+    # Las zonas se calculan antes del patrón para evitar usar información futura.
+    support_level = swing_low
+    resistance_level = swing_high
+    # El rechazo debe ocurrir ANTES de la vela de confirmación (c3).
+    # Un rechazo que aparece únicamente en c3 no habilita la entrada.
+    call_rejection_c2 = _zone_rejection(c2, "call", support_level, atr)
+    put_rejection_c2 = _zone_rejection(c2, "put", resistance_level, atr)
+    call_rejection_c3 = _zone_rejection(c3, "call", support_level, atr)
+    put_rejection_c3 = _zone_rejection(c3, "put", resistance_level, atr)
+
+    # Solo se consideran válidos los rechazos de la vela 2.
+    call_rejection = call_rejection_c2
+    put_rejection = put_rejection_c2
     call_room = (swing_high - c3["close"]) / atr if atr > 0 else 0.0
     put_room = (c3["close"] - swing_low) / atr if atr > 0 else 0.0
     not_extended = c3["body"] / atr <= MAX_SIGNAL_BODY_ATR if atr > 0 else False
@@ -221,6 +264,9 @@ def analyze_market(
         "atr": atr,
         "last_swing_high": swing_high,
         "last_swing_low": swing_low,
+        "support_zone": support_level,
+        "resistance_zone": resistance_level,
+        "zone_tolerance_atr": ZONE_TOLERANCE_ATR,
         "candle_1": c1,
         "candle_2": c2,
         "candle_3": c3,
@@ -231,6 +277,14 @@ def analyze_market(
         "c3_buy_continuation": c3_buy,
         "call_rejection": call_rejection,
         "put_rejection": put_rejection,
+        "call_rejection_c2": call_rejection_c2,
+        "put_rejection_c2": put_rejection_c2,
+        "call_rejection_c3": call_rejection_c3,
+        "put_rejection_c3": put_rejection_c3,
+        "rejection_before_confirmation": bool(call_rejection_c2 or put_rejection_c2),
+        "rejection_candle": 2 if (call_rejection_c2 or put_rejection_c2) else None,
+        "call_rejection_in_zone": call_rejection,
+        "put_rejection_in_zone": put_rejection,
         "call_room_atr": call_room,
         "put_room_atr": put_room,
         "body_atr_ratio": c3["body"] / atr if atr > 0 else math.inf,
@@ -283,3 +337,61 @@ def signal(df: pd.DataFrame) -> Optional[str]:
 
 if __name__ == "__main__":
     print("strategy.py cargado correctamente: continuidad filtrada + rechazo + espacio")
+
+
+def backtest_strategy(
+    df: pd.DataFrame,
+    pair: Optional[str] = None,
+    expiration_candles: int = 3,
+) -> pd.DataFrame:
+    """Recorre velas cerradas y registra señales aceptadas y rechazadas.
+
+    Requiere OHLC y, opcionalmente, una columna ``from``/``timestamp``.
+    El resultado es diagnóstico; no simula deslizamiento ni el precio real
+    de ejecución del broker.
+    """
+    data = _normalize(df)
+    records = []
+    if len(data) < MIN_BARS:
+        return pd.DataFrame(records)
+
+    for end in range(MIN_BARS, len(data) + 1):
+        window = data.iloc[:end].copy()
+        result = analyze_market(df=window, pair=pair)
+        analysis = result.get("analysis") or {}
+        signal = result.get("signal")
+        row = {
+            "index": end - 1,
+            "timestamp": window.iloc[-1].get("from") if "from" in window.columns else None,
+            "pair": pair,
+            "signal": signal,
+            "accepted": bool(signal in ("call", "put") and not result.get("blocked", True)),
+            "score": result.get("score", 0),
+            "reason": result.get("reason", ""),
+            "support_zone": analysis.get("support_zone"),
+            "resistance_zone": analysis.get("resistance_zone"),
+            "call_room_atr": analysis.get("call_room_atr"),
+            "put_room_atr": analysis.get("put_room_atr"),
+        }
+
+        # Resultado orientativo a partir del cierre de entrada y del cierre
+        # posterior. No se etiqueta como ganancia si hubo empate.
+        expiry_index = end - 1 + max(int(expiration_candles), 1)
+        if signal in ("call", "put") and expiry_index < len(data):
+            entry_price = _safe_float(window.iloc[-1]["close"])
+            expiry_price = _safe_float(data.iloc[expiry_index]["close"])
+            row["entry_price"] = entry_price
+            row["expiry_price"] = expiry_price
+            if expiry_price > entry_price:
+                row["outcome"] = "win" if signal == "call" else "loss"
+            elif expiry_price < entry_price:
+                row["outcome"] = "loss" if signal == "call" else "win"
+            else:
+                row["outcome"] = "tie"
+        else:
+            row["entry_price"] = None
+            row["expiry_price"] = None
+            row["outcome"] = "unavailable"
+        records.append(row)
+
+    return pd.DataFrame(records)
