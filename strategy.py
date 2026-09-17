@@ -4,7 +4,7 @@ strategy.py
 Estrategia para Binary OTC M1:
 Bollinger Bands + RSI + ATR Trailing Stops.
 
-Regla de entrada en la MISMA vela de señal:
+Regla de entrada: analizar la vela N cerrada y ejecutar en N+1:
 CALL:
   1) La vela toca/cruza la banda inferior de Bollinger.
   2) La vela muestra rechazo inferior y cierra por encima de la banda.
@@ -36,10 +36,13 @@ RSI_OVERBOUGHT = 70.0
 ATR_PERIOD = 14
 ATR_TRAILING_MULTIPLIER = 2.0
 
-MIN_REJECTION_WICK_RATIO = 0.25
-MIN_CLOSE_POSITION_CALL = 0.55
-MAX_CLOSE_POSITION_PUT = 0.45
-MIN_SCORE = 70
+MIN_REJECTION_WICK_RATIO = 0.30
+MIN_CLOSE_POSITION_CALL = 0.60
+MAX_CLOSE_POSITION_PUT = 0.40
+MIN_SCORE = 85
+MAX_BODY_ATR_RATIO = 1.35
+MIN_TREND_SEPARATION_ATR = 0.05
+SWING_LOOKBACK = 8
 
 EPS = 1e-10
 
@@ -185,6 +188,9 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     out["bb_upper"] = out["bb_mid"] + BB_STD * out["bb_std"]
     out["bb_lower"] = out["bb_mid"] - BB_STD * out["bb_std"]
     out["rsi"] = _rsi(out["close"])
+    out["ema9"] = out["close"].ewm(span=9, adjust=False, min_periods=9).mean()
+    out["ema21"] = out["close"].ewm(span=21, adjust=False, min_periods=21).mean()
+    out["ema50"] = out["close"].ewm(span=50, adjust=False, min_periods=50).mean()
     out["atr_stop"], out["atr_position"] = _atr_trailing_stop(out)
     return out
 
@@ -208,6 +214,29 @@ def _candle_metrics(row: pd.Series) -> Dict[str, float]:
         "body_ratio": body / rng,
         "close_position": (c - l) / rng,
     }
+
+
+def _trend_state(current: pd.Series, atr: float) -> str:
+    ema9 = _safe_float(current.get("ema9"), np.nan)
+    ema21 = _safe_float(current.get("ema21"), np.nan)
+    ema50 = _safe_float(current.get("ema50"), np.nan)
+    if not all(math.isfinite(v) for v in (ema9, ema21, ema50)) or atr <= 0:
+        return "unknown"
+    separation = abs(ema9 - ema21) / atr
+    if separation < MIN_TREND_SEPARATION_ATR:
+        return "range"
+    if ema9 > ema21 > ema50:
+        return "bullish"
+    if ema9 < ema21 < ema50:
+        return "bearish"
+    return "mixed"
+
+
+def _recent_levels(ind: pd.DataFrame) -> tuple[float, float]:
+    window = ind.tail(SWING_LOOKBACK + 1).iloc[:-1]
+    if window.empty:
+        return np.nan, np.nan
+    return float(window["high"].max()), float(window["low"].min())
 
 
 def _empty_result(reason: str = "Sin señal") -> Dict[str, Any]:
@@ -271,6 +300,9 @@ def analyze_market(
     atr = _safe_float(current.get("atr"), 0.0)
     atr_stop = _safe_float(current.get("atr_stop"), np.nan)
     atr_position = int(_safe_float(current.get("atr_position"), 0))
+    trend = _trend_state(current, atr)
+    last_swing_high, last_swing_low = _recent_levels(ind)
+    body_atr_ratio = cm["body"] / atr if atr > 0 else np.inf
 
     base_analysis = {
         "pair": pair,
@@ -284,8 +316,15 @@ def analyze_market(
         "bb_upper": upper,
         "candle": cm,
         "signal_candle": True,
-        "execution_mode": "same_candle",
+        "execution_mode": "next_candle",
         "expiration_minutes": 3,
+        "trend": trend,
+        "ema9": _safe_float(current.get("ema9"), np.nan),
+        "ema21": _safe_float(current.get("ema21"), np.nan),
+        "ema50": _safe_float(current.get("ema50"), np.nan),
+        "last_swing_high": last_swing_high,
+        "last_swing_low": last_swing_low,
+        "body_atr_ratio": body_atr_ratio,
     }
 
     if not all(math.isfinite(v) for v in [lower, upper, rsi, previous_rsi, atr]) or atr <= 0:
@@ -323,13 +362,16 @@ def analyze_market(
     })
 
     candidates = []
-    if call_rejection and atr_position == 1 and rsi > previous_rsi and rsi < 55:
-        candidates.append((call_score, "call", "CALL | rechazo banda inferior + ATR alcista + RSI recuperando"))
-    if put_rejection and atr_position == -1 and rsi < previous_rsi and rsi > 45:
-        candidates.append((put_score, "put", "PUT | rechazo banda superior + ATR bajista + RSI debilitándose"))
+    not_extended = body_atr_ratio <= MAX_BODY_ATR_RATIO
+    if (call_rejection and atr_position == 1 and trend == "bullish"
+            and rsi > previous_rsi and rsi < 55 and not_extended):
+        candidates.append((min(100, call_score + 10), "call", "CALL | rechazo inferior + tendencia alcista + RSI recuperando"))
+    if (put_rejection and atr_position == -1 and trend == "bearish"
+            and rsi < previous_rsi and rsi > 45 and not_extended):
+        candidates.append((min(100, put_score + 10), "put", "PUT | rechazo superior + tendencia bajista + RSI debilitándose"))
 
     if not candidates:
-        result = _empty_result("Sin confirmación BB + ATR Trailing Stop + RSI")
+        result = _empty_result("Sin confirmación: rechazo + tendencia + RSI + extensión")
         result["analysis"] = base_analysis
         return result
 
@@ -346,7 +388,7 @@ def analyze_market(
         "entry_quality": int(score),
         "entry_type": "bb_atr_rsi",
         "blocked": False,
-        "reason": reason + " | ejecución durante la vela de señal | expiración 3 minutos",
+        "reason": reason + " | análisis N cerrada / ejecución N+1 | expiración 3 minutos",
         "signal_price": price,
         "candle_timestamp": int(current["from"]) if "from" in current and pd.notna(current["from"]) else None,
         "analysis": base_analysis,
