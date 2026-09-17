@@ -1,18 +1,25 @@
 """
 strategy.py
 
-Estrategia para Binary OTC M1:
-Bollinger Bands + RSI + ATR Trailing Stops.
+Estrategia CONTINUIDAD FILTRADA + SECUENCIA DE ENTRADA:
 
-Regla de entrada: analizar la vela N cerrada y ejecutar en N+1:
 CALL:
-  1) La vela toca/cruza la banda inferior de Bollinger.
-  2) La vela muestra rechazo inferior y cierra por encima de la banda.
-  3) El ATR Trailing Stop está en modo alcista.
-  4) El RSI sale de sobreventa o confirma recuperación desde la zona baja.
+    1) Vela roja con señal de continuidad bajista.
+    2) Una vela sin señal de continuidad.
+    3) Vela verde con señal de continuidad alcista.
+    4) El bot prepara CALL para la apertura de la siguiente vela (N+1).
 
-PUT: reglas inversas con la banda superior, rechazo superior,
-ATR Trailing Stop bajista y salida de sobrecompra.
+PUT:
+    1) Vela verde con señal de continuidad alcista.
+    2) Una vela sin señal de continuidad.
+    3) Vela roja con señal de continuidad bajista.
+    4) El bot prepara PUT para la apertura de la siguiente vela (N+1).
+
+La lógica de continuidad replica el script:
+    - Periodo promedio de cuerpos: 10
+    - Fuerza mínima: 120% del promedio
+    - Mecha máxima: 50% del cuerpo
+    - Ruptura del máximo/mínimo de la vela anterior
 
 Este módulo solamente analiza; no ejecuta operaciones ni decide la expiración.
 """
@@ -28,22 +35,12 @@ import pandas as pd
 MIN_BARS = 35
 MAX_CANDLES = 120
 
-BB_PERIOD = 20
-BB_STD = 2.0
-RSI_PERIOD = 14
-RSI_OVERSOLD = 30.0
-RSI_OVERBOUGHT = 70.0
+FORCE_PERIOD = 10
+FORCE_PERCENT = 120.0
+WICK_PERCENT = 50.0
+
 ATR_PERIOD = 14
-ATR_TRAILING_MULTIPLIER = 2.0
-
-MIN_REJECTION_WICK_RATIO = 0.30
-MIN_CLOSE_POSITION_CALL = 0.60
-MAX_CLOSE_POSITION_PUT = 0.40
-MIN_SCORE = 85
-MAX_BODY_ATR_RATIO = 1.35
-MIN_TREND_SEPARATION_ATR = 0.05
 SWING_LOOKBACK = 8
-
 EPS = 1e-10
 
 
@@ -60,14 +57,18 @@ def _normalize(df: Optional[pd.DataFrame]) -> pd.DataFrame:
         return pd.DataFrame()
 
     out = df.copy()
-    aliases = {"max": "high", "min": "low", "timestamp": "from"}
-    out.rename(columns=aliases, inplace=True)
+    out.rename(
+        columns={"max": "high", "min": "low", "timestamp": "from"},
+        inplace=True,
+    )
+
     required = ["open", "high", "low", "close"]
-    if any(col not in out.columns for col in required):
+    if any(column not in out.columns for column in required):
         return pd.DataFrame()
 
-    for col in required:
-        out[col] = pd.to_numeric(out[col], errors="coerce")
+    for column in required:
+        out[column] = pd.to_numeric(out[column], errors="coerce")
+
     if "from" in out.columns:
         out["from"] = pd.to_numeric(out["from"], errors="coerce")
         out.dropna(subset=["from"], inplace=True)
@@ -89,6 +90,7 @@ def _build_dataframe(
         return _normalize(df)
 
     history = _normalize(previous_m1)
+
     if isinstance(candle_1m, pd.Series):
         current = candle_1m.to_dict()
     elif isinstance(candle_1m, dict):
@@ -99,6 +101,7 @@ def _build_dataframe(
     current_df = _normalize(pd.DataFrame([current]))
     if current_df.empty:
         return history
+
     return _normalize(pd.concat([history, current_df], ignore_index=True))
 
 
@@ -114,126 +117,86 @@ def _true_range(data: pd.DataFrame) -> pd.Series:
     ).max(axis=1)
 
 
-def _rsi(close: pd.Series) -> pd.Series:
-    delta = close.diff()
-    gain = delta.clip(lower=0.0)
-    loss = -delta.clip(upper=0.0)
-    avg_gain = gain.ewm(alpha=1 / RSI_PERIOD, adjust=False, min_periods=RSI_PERIOD).mean()
-    avg_loss = loss.ewm(alpha=1 / RSI_PERIOD, adjust=False, min_periods=RSI_PERIOD).mean()
-    rs = avg_gain / avg_loss.replace(0, np.nan)
-    result = 100.0 - (100.0 / (1.0 + rs))
-    result.loc[(avg_loss == 0) & (avg_gain > 0)] = 100.0
-    result.loc[(avg_gain == 0) & (avg_loss > 0)] = 0.0
-    return result
-
-
-def _atr_trailing_stop(data: pd.DataFrame) -> tuple[pd.Series, pd.Series]:
-    """Equivalente funcional del script ATR Trailing Stops mostrado."""
-    tr = _true_range(data)
-    atr = tr.rolling(ATR_PERIOD, min_periods=ATR_PERIOD).mean()
-    distance = atr * ATR_TRAILING_MULTIPLIER
-
-    stops: list[float] = []
-    positions: list[int] = []
-    previous_stop = 0.0
-    previous_position = 0
-
-    for i, row in data.iterrows():
-        close = _safe_float(row["close"])
-        high = _safe_float(row["high"])
-        low = _safe_float(row["low"])
-        d = _safe_float(distance.iloc[i], 0.0)
-
-        if d <= 0:
-            stops.append(np.nan)
-            positions.append(0)
-            continue
-
-        upper_base = high - d
-        lower_base = low + d
-
-        if previous_stop <= 0:
-            stop = upper_base if previous_position >= 0 else lower_base
-            position = 1 if close >= stop else -1
-        elif close > previous_stop and data["close"].iloc[i - 1] > previous_stop:
-            stop = max(previous_stop, upper_base)
-            position = 1
-        elif close < previous_stop and data["close"].iloc[i - 1] < previous_stop:
-            stop = min(previous_stop, lower_base)
-            position = -1
-        elif close > previous_stop:
-            stop = upper_base
-            position = 1
-        else:
-            stop = lower_base
-            position = -1
-
-        previous_stop = stop
-        previous_position = position
-        stops.append(stop)
-        positions.append(position)
-
-    return pd.Series(stops, index=data.index), pd.Series(positions, index=data.index)
-
-
-def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
-    out = _normalize(df)
-    if out.empty:
-        return out
-
-    out["tr"] = _true_range(out)
-    out["atr"] = out["tr"].rolling(ATR_PERIOD, min_periods=ATR_PERIOD).mean()
-    out["bb_mid"] = out["close"].rolling(BB_PERIOD, min_periods=BB_PERIOD).mean()
-    out["bb_std"] = out["close"].rolling(BB_PERIOD, min_periods=BB_PERIOD).std(ddof=0)
-    out["bb_upper"] = out["bb_mid"] + BB_STD * out["bb_std"]
-    out["bb_lower"] = out["bb_mid"] - BB_STD * out["bb_std"]
-    out["rsi"] = _rsi(out["close"])
-    out["ema9"] = out["close"].ewm(span=9, adjust=False, min_periods=9).mean()
-    out["ema21"] = out["close"].ewm(span=21, adjust=False, min_periods=21).mean()
-    out["ema50"] = out["close"].ewm(span=50, adjust=False, min_periods=50).mean()
-    out["atr_stop"], out["atr_position"] = _atr_trailing_stop(out)
-    return out
+def _atr(data: pd.DataFrame) -> pd.Series:
+    return _true_range(data).rolling(ATR_PERIOD, min_periods=1).mean()
 
 
 def _candle_metrics(row: pd.Series) -> Dict[str, float]:
-    o = _safe_float(row.get("open"))
-    h = _safe_float(row.get("high"))
-    l = _safe_float(row.get("low"))
-    c = _safe_float(row.get("close"))
-    rng = max(h - l, EPS)
-    body = abs(c - o)
+    open_price = _safe_float(row.get("open"))
+    high = _safe_float(row.get("high"))
+    low = _safe_float(row.get("low"))
+    close = _safe_float(row.get("close"))
+
+    candle_range = max(high - low, EPS)
+    body = abs(close - open_price)
+    upper_wick = max(high - max(close, open_price), 0.0)
+    lower_wick = max(min(close, open_price) - low, 0.0)
+
     return {
-        "open": o,
-        "high": h,
-        "low": l,
-        "close": c,
-        "range": rng,
+        "open": open_price,
+        "high": high,
+        "low": low,
+        "close": close,
+        "range": candle_range,
         "body": body,
-        "upper": max(h - max(o, c), 0.0),
-        "lower": max(min(o, c) - l, 0.0),
-        "body_ratio": body / rng,
-        "close_position": (c - l) / rng,
+        "upper": upper_wick,
+        "lower": lower_wick,
+        "body_ratio": body / candle_range,
+        "close_position": (close - low) / candle_range,
     }
 
 
-def _trend_state(current: pd.Series, atr: float) -> str:
-    ema9 = _safe_float(current.get("ema9"), np.nan)
-    ema21 = _safe_float(current.get("ema21"), np.nan)
-    ema50 = _safe_float(current.get("ema50"), np.nan)
-    if not all(math.isfinite(v) for v in (ema9, ema21, ema50)) or atr <= 0:
-        return "unknown"
-    separation = abs(ema9 - ema21) / atr
-    if separation < MIN_TREND_SEPARATION_ATR:
-        return "range"
-    if ema9 > ema21 > ema50:
-        return "bullish"
-    if ema9 < ema21 < ema50:
-        return "bearish"
-    return "mixed"
+def _add_continuity_columns(data: pd.DataFrame) -> pd.DataFrame:
+    out = data.copy()
+    out["candle_body"] = (out["close"] - out["open"]).abs()
+    out["average_body"] = out["candle_body"].rolling(
+        FORCE_PERIOD, min_periods=FORCE_PERIOD
+    ).mean()
+    out["upper_wick"] = out["high"] - out[["close", "open"]].max(axis=1)
+    out["lower_wick"] = out[["close", "open"]].min(axis=1) - out["low"]
+
+    out["strong_candle"] = (
+        out["average_body"].notna()
+        & (out["candle_body"] >= out["average_body"] * FORCE_PERCENT / 100.0)
+    )
+    out["small_upper_wick"] = (
+        out["candle_body"] > EPS
+    ) & (out["upper_wick"] <= out["candle_body"] * WICK_PERCENT / 100.0)
+    out["small_lower_wick"] = (
+        out["candle_body"] > EPS
+    ) & (out["lower_wick"] <= out["candle_body"] * WICK_PERCENT / 100.0)
+
+    previous_open = out["open"].shift(1)
+    previous_close = out["close"].shift(1)
+    previous_high = out["high"].shift(1)
+    previous_low = out["low"].shift(1)
+
+    out["buy_continuation"] = (
+        (out["close"] > out["open"])
+        & (previous_close > previous_open)
+        & out["strong_candle"]
+        & (out["close"] > previous_high)
+        & out["small_upper_wick"]
+    )
+
+    out["sell_continuation"] = (
+        (out["close"] < out["open"])
+        & (previous_close < previous_open)
+        & out["strong_candle"]
+        & (out["close"] < previous_low)
+        & out["small_lower_wick"]
+    )
+
+    out["continuation_signal"] = np.select(
+        [out["buy_continuation"], out["sell_continuation"]],
+        ["call", "put"],
+        default=None,
+    )
+    return out
 
 
-def _recent_levels(ind: pd.DataFrame) -> tuple[float, float]:
-    window = ind.tail(SWING_LOOKBACK + 1).iloc[:-1]
+def _recent_levels(data: pd.DataFrame) -> tuple[float, float]:
+    window = data.tail(SWING_LOOKBACK + 1).iloc[:-1]
     if window.empty:
         return np.nan, np.nan
     return float(window["high"].max()), float(window["low"].min())
@@ -252,26 +215,10 @@ def _empty_result(reason: str = "Sin señal") -> Dict[str, Any]:
     }
 
 
-def _signal_score(
-    side: str,
-    candle: Dict[str, float],
-    rsi: float,
-    previous_rsi: float,
-    atr_position: int,
-    touched_band: bool,
-    rejection: bool,
-) -> int:
-    score = 0
-    score += 25 if touched_band else 0
-    score += 25 if rejection else 0
-    score += 20 if (side == "call" and atr_position == 1) or (side == "put" and atr_position == -1) else 0
-    if side == "call":
-        score += 20 if previous_rsi <= RSI_OVERSOLD < rsi else 10 if rsi > previous_rsi and rsi <= 45 else 0
-        score += 10 if candle["close_position"] >= MIN_CLOSE_POSITION_CALL else 0
-    else:
-        score += 20 if previous_rsi >= RSI_OVERBOUGHT > rsi else 10 if rsi < previous_rsi and rsi >= 55 else 0
-        score += 10 if candle["close_position"] <= MAX_CLOSE_POSITION_PUT else 0
-    return min(100, score)
+def _pattern_description(signal: str) -> str:
+    if signal == "call":
+        return "PUT continuidad → vela sin señal → CALL continuidad → entrada CALL en N+1"
+    return "CALL continuidad → vela sin señal → PUT continuidad → entrada PUT en N+1"
 
 
 def analyze_market(
@@ -281,119 +228,104 @@ def analyze_market(
     previous_m1: Optional[pd.DataFrame] = None,
     pair: Optional[str] = None,
 ) -> Dict[str, Any]:
-    data = _build_dataframe(df=df, candle_1m=candle_1m, previous_m1=previous_m1)
+    data = _build_dataframe(
+        df=df,
+        candle_1m=candle_1m,
+        previous_m1=previous_m1,
+    )
+
     if len(data) < MIN_BARS:
         return _empty_result(f"Historial insuficiente {len(data)}/{MIN_BARS}")
 
-    ind = add_indicators(data)
-    if len(ind) < max(MIN_BARS, BB_PERIOD + 2):
-        return _empty_result("Indicadores insuficientes")
+    ind = _add_continuity_columns(data)
+    if len(ind) < 3:
+        return _empty_result("Se necesitan 3 velas para validar la secuencia")
 
     current = ind.iloc[-1]
-    previous = ind.iloc[-2]
-    cm = _candle_metrics(current)
-    price = cm["close"]
-    lower = _safe_float(current.get("bb_lower"), np.nan)
-    upper = _safe_float(current.get("bb_upper"), np.nan)
-    rsi = _safe_float(current.get("rsi"), np.nan)
-    previous_rsi = _safe_float(previous.get("rsi"), np.nan)
-    atr = _safe_float(current.get("atr"), 0.0)
-    atr_stop = _safe_float(current.get("atr_stop"), np.nan)
-    atr_position = int(_safe_float(current.get("atr_position"), 0))
-    trend = _trend_state(current, atr)
-    last_swing_high, last_swing_low = _recent_levels(ind)
-    body_atr_ratio = cm["body"] / atr if atr > 0 else np.inf
+    middle = ind.iloc[-2]
+    first = ind.iloc[-3]
 
-    base_analysis = {
+    current_metrics = _candle_metrics(current)
+    atr_series = _atr(ind)
+    atr = _safe_float(atr_series.iloc[-1], 0.0)
+    last_swing_high, last_swing_low = _recent_levels(ind)
+
+    first_signal = first.get("continuation_signal")
+    middle_signal = middle.get("continuation_signal")
+    current_signal = current.get("continuation_signal")
+
+    # La segunda vela debe estar completamente libre de señal.
+    middle_without_signal = pd.isna(middle_signal) or middle_signal is None
+
+    call_sequence = (
+        first_signal == "put"
+        and middle_without_signal
+        and current_signal == "call"
+    )
+    put_sequence = (
+        first_signal == "call"
+        and middle_without_signal
+        and current_signal == "put"
+    )
+
+    signal: Optional[str] = None
+    if call_sequence:
+        signal = "call"
+    elif put_sequence:
+        signal = "put"
+
+    base_analysis: Dict[str, Any] = {
         "pair": pair,
-        "atr": atr,
-        "atr_stop": atr_stop,
-        "atr_position": atr_position,
-        "rsi": rsi,
-        "previous_rsi": previous_rsi,
-        "bb_lower": lower,
-        "bb_mid": _safe_float(current.get("bb_mid"), np.nan),
-        "bb_upper": upper,
-        "candle": cm,
-        "signal_candle": True,
-        "execution_mode": "next_candle",
+        "force": True,
+        "structure": "continuidad_filtrada",
+        "impulse_phase": "secuencia_confirmada" if signal else "sin_secuencia",
+        "execution_mode": "next_candle_sniper",
         "expiration_minutes": 3,
-        "trend": trend,
-        "ema9": _safe_float(current.get("ema9"), np.nan),
-        "ema21": _safe_float(current.get("ema21"), np.nan),
-        "ema50": _safe_float(current.get("ema50"), np.nan),
+        "atr": atr,
         "last_swing_high": last_swing_high,
         "last_swing_low": last_swing_low,
-        "body_atr_ratio": body_atr_ratio,
+        "signal_candle": bool(current_signal),
+        "first_candle_signal": first_signal,
+        "middle_candle_signal": middle_signal,
+        "current_candle_signal": current_signal,
+        "middle_without_signal": bool(middle_without_signal),
+        "sequence_confirmed": bool(signal),
+        "first_candle": _candle_metrics(first),
+        "middle_candle": _candle_metrics(middle),
+        "candle": current_metrics,
+        "force_period": FORCE_PERIOD,
+        "force_percent": FORCE_PERCENT,
+        "wick_percent": WICK_PERCENT,
     }
 
-    if not all(math.isfinite(v) for v in [lower, upper, rsi, previous_rsi, atr]) or atr <= 0:
-        result = _empty_result("Valores de indicadores inválidos")
+    if signal is None:
+        result = _empty_result(
+            "Sin secuencia: continuidad inicial + vela sin señal + continuidad contraria"
+        )
         result["analysis"] = base_analysis
         return result
 
-    call_touch = cm["low"] <= lower
-    call_rejection = (
-        call_touch
-        and price > lower
-        and cm["close_position"] >= MIN_CLOSE_POSITION_CALL
-        and cm["lower"] / cm["range"] >= MIN_REJECTION_WICK_RATIO
-        and price >= cm["open"]
-    )
-    put_touch = cm["high"] >= upper
-    put_rejection = (
-        put_touch
-        and price < upper
-        and cm["close_position"] <= MAX_CLOSE_POSITION_PUT
-        and cm["upper"] / cm["range"] >= MIN_REJECTION_WICK_RATIO
-        and price <= cm["open"]
+    reason = (
+        f"{_pattern_description(signal)} | "
+        "entrada en apertura de la cuarta vela (00)"
     )
 
-    call_score = _signal_score("call", cm, rsi, previous_rsi, atr_position, call_touch, call_rejection)
-    put_score = _signal_score("put", cm, rsi, previous_rsi, atr_position, put_touch, put_rejection)
-
-    base_analysis.update({
-        "call_touch": call_touch,
-        "call_rejection": call_rejection,
-        "put_touch": put_touch,
-        "put_rejection": put_rejection,
-        "call_score": call_score,
-        "put_score": put_score,
-    })
-
-    candidates = []
-    not_extended = body_atr_ratio <= MAX_BODY_ATR_RATIO
-    if (call_rejection and atr_position == 1 and trend == "bullish"
-            and rsi > previous_rsi and rsi < 55 and not_extended):
-        candidates.append((min(100, call_score + 10), "call", "CALL | rechazo inferior + tendencia alcista + RSI recuperando"))
-    if (put_rejection and atr_position == -1 and trend == "bearish"
-            and rsi < previous_rsi and rsi > 45 and not_extended):
-        candidates.append((min(100, put_score + 10), "put", "PUT | rechazo superior + tendencia bajista + RSI debilitándose"))
-
-    if not candidates:
-        result = _empty_result("Sin confirmación: rechazo + tendencia + RSI + extensión")
-        result["analysis"] = base_analysis
-        return result
-
-    score, signal, reason = max(candidates, key=lambda item: item[0])
-    if score < MIN_SCORE:
-        result = _empty_result(f"Señal descartada por score {score}/{MIN_SCORE}")
-        result["analysis"] = base_analysis
-        return result
-
-    result = {
+    return {
         "signal": signal,
         "direction": "bullish" if signal == "call" else "bearish",
-        "score": int(score),
-        "entry_quality": int(score),
-        "entry_type": "bb_atr_rsi",
+        "score": 100,
+        "entry_quality": 100,
+        "entry_type": "force",
         "blocked": False,
-        "reason": reason + " | análisis N cerrada / ejecución N+1 | expiración 3 minutos",
-        "signal_price": price,
-        "candle_timestamp": int(current["from"]) if "from" in current and pd.notna(current["from"]) else None,
+        "reason": reason,
+        "signal_price": current_metrics["close"],
+        "candle_timestamp": (
+            int(current["from"])
+            if "from" in current and pd.notna(current["from"])
+            else None
+        ),
         "analysis": base_analysis,
     }
-    return result
 
 
 def get_signal(df: pd.DataFrame) -> Optional[str]:
@@ -405,4 +337,4 @@ def signal(df: pd.DataFrame) -> Optional[str]:
 
 
 if __name__ == "__main__":
-    print("strategy.py cargado correctamente: BB + ATR Trailing Stops + RSI")
+    print("strategy.py cargado correctamente: CONTINUIDAD FILTRADA + SECUENCIA N+1")
