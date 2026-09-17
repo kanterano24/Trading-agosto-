@@ -49,8 +49,8 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 TIMEFRAME = 60
-EXPIRATION = int(os.getenv("EXPIRATION", "3"))
-AMOUNT = float(os.getenv("AMOUNT", "2"))
+EXPIRATION = int(os.getenv("EXPIRATION", "1"))
+AMOUNT = float(os.getenv("AMOUNT", "550"))
 
 # Cuenta de IQ Option: PRACTICE o REAL
 ACCOUNT_TYPE = os.getenv("ACCOUNT_TYPE", "PRACTICE").strip().upper()
@@ -74,7 +74,7 @@ AUTO_START = os.getenv("AUTO_START", "true").strip().lower() in {
 }
 
 # La API publica de strategy.py debe exponer solamente entry_type=force.
-REQUIRE_FORCE = False
+REQUIRE_FORCE = True
 REQUIRE_N_PLUS_1 = True
 
 
