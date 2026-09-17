@@ -50,7 +50,14 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 TIMEFRAME = 60
 EXPIRATION = int(os.getenv("EXPIRATION", "2"))
-AMOUNT = float(os.getenv("AMOUNT", "550"))
+AMOUNT = float(os.getenv("AMOUNT", "2"))
+
+# Cuenta de IQ Option: PRACTICE o REAL
+ACCOUNT_TYPE = os.getenv("ACCOUNT_TYPE", "PRACTICE").strip().upper()
+
+# Límite total de entradas por ejecución del bot
+MAX_TOTAL_TRADES = 2
+TOTAL_TRADES = 0
 CANDLE_COUNT = max(60, int(os.getenv("CANDLE_COUNT", "80")))
 MAX_OTC_PAIRS = max(1, int(os.getenv("MAX_OTC_PAIRS", "50")))
 
@@ -137,7 +144,7 @@ def telegram_send(message: str) -> None:
 
 
 def telegram_command_loop() -> None:
-    global BOT_RUNNING
+    global BOT_RUNNING, TOTAL_TRADES
 
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         return
@@ -171,13 +178,18 @@ def telegram_command_loop() -> None:
                 text = str(message.get("text", "")).strip().lower()
 
                 if text == "/start":
+                    with STATE_LOCK:
+                        TOTAL_TRADES = 0
+                        PENDING_ENTRY.clear()
                     BOT_RUNNING = True
                     telegram_send(
-                        "🟢 BOT ACTIVADO\n\n"
-                        "⚡ BINARY OTC | FUERZA\n"
-                        "📌 Análisis en N y ejecución en N+1\n"
-                        f"⏱ Temporalidad: {TIMEFRAME // 60} minuto(s)\n"
-                        f"⏳ Expiración: {EXPIRATION} minuto(s)\n"
+                        "🟢 BOT ACTIVADO\\n\\n"
+                        "⚡ BINARY OTC | FUERZA\\n"
+                        f"Cuenta: {ACCOUNT_TYPE}\\n"
+                        f"Entradas: 0/{MAX_TOTAL_TRADES}\\n"
+                        "📌 Análisis en N y ejecución en N+1\\n"
+                        f"⏱ Temporalidad: {TIMEFRAME // 60} minuto(s)\\n"
+                        f"⏳ Expiración: {EXPIRATION} minuto(s)\\n"
                         f"💵 Importe: {AMOUNT:g}"
                     )
 
@@ -199,7 +211,9 @@ def telegram_command_loop() -> None:
                         "Filtro: FUERZA\n"
                         "Entrada: N+1\n"
                         f"Expiración: {EXPIRATION} minuto(s)\n"
-                        f"Importe: {AMOUNT:g}\n"
+                        f"Importe: {AMOUNT:g}\\n"
+                        f"Cuenta: {ACCOUNT_TYPE}\\n"
+                        f"Entradas: {TOTAL_TRADES}/{MAX_TOTAL_TRADES}\\n"
                         f"Pares OTC: {len(PAIRS)}"
                     )
 
@@ -348,6 +362,12 @@ def connect_iq() -> bool:
     connected, reason = IQ.connect()
     if not connected:
         raise ConnectionError(f"No se pudo conectar a IQ Option: {reason}")
+
+    if ACCOUNT_TYPE not in {"PRACTICE", "REAL"}:
+        raise ValueError("ACCOUNT_TYPE debe ser PRACTICE o REAL")
+
+    IQ.change_balance(ACCOUNT_TYPE)
+    logger.info("Cuenta seleccionada: %s", ACCOUNT_TYPE)
 
     refresh_binary_otc_pairs(force=True)
 
@@ -697,6 +717,8 @@ def analyze_closed_candle(pair: str, expected_closed_ts: int) -> bool:
 
 def analyze_live_candle(pair: str, current_ts: int) -> bool:
     """Analiza la vela activa y ejecuta una sola vez por vela de señal."""
+    if trade_limit_reached():
+        return False
     df = get_closed_candles(pair)
     if df is None or df.empty or "from" not in df.columns:
         return False
@@ -762,24 +784,65 @@ def cooldown_active(pair: str) -> bool:
     return time.time() - LAST_TRADE_TIME.get(pair, 0.0) < TRADE_COOLDOWN
 
 
+def trade_limit_reached() -> bool:
+    with STATE_LOCK:
+        return TOTAL_TRADES >= MAX_TOTAL_TRADES
+
+
 def buy_binary(pair: str, signal: str) -> Tuple[bool, Optional[Any]]:
+    global TOTAL_TRADES, BOT_RUNNING
+
     if IQ is None or signal not in ("call", "put"):
         return False, None
 
-    try:
-        result = IQ.buy(AMOUNT, pair, signal, EXPIRATION)
+    # El bloqueo cubre la comprobación y el envío para evitar
+    # que dos hilos consuman el mismo cupo simultáneamente.
+    with STATE_LOCK:
+        if TOTAL_TRADES >= MAX_TOTAL_TRADES:
+            return False, None
 
-        if isinstance(result, tuple):
-            return bool(result[0]), result[1] if len(result) > 1 else None
+        try:
+            result = IQ.buy(AMOUNT, pair, signal, EXPIRATION)
 
-        if result not in (None, False, "error", -1):
-            return True, result
+            if isinstance(result, tuple):
+                ok = bool(result[0])
+                order_id = result[1] if len(result) > 1 else None
+            else:
+                ok = result not in (None, False, "error", -1)
+                order_id = result
 
-        return False, result
+            if not ok:
+                return False, order_id
 
-    except Exception as exc:
-        logger.error("%s | buy error: %s", pair, exc)
-        return False, None
+            TOTAL_TRADES += 1
+            current_trades = TOTAL_TRADES
+
+            if TOTAL_TRADES >= MAX_TOTAL_TRADES:
+                BOT_RUNNING = False
+                PENDING_ENTRY.clear()
+
+        except Exception as exc:
+            logger.error("%s | buy error: %s", pair, exc)
+            return False, None
+
+    logger.info(
+        "%s | ENTRADA %s/%s | cuenta=%s",
+        pair,
+        current_trades,
+        MAX_TOTAL_TRADES,
+        ACCOUNT_TYPE,
+    )
+
+    if current_trades >= MAX_TOTAL_TRADES:
+        telegram_send(
+            "🛑 LIMITE DE ENTRADAS ALCANZADO\\n\\n"
+            f"Entradas ejecutadas: {current_trades}/{MAX_TOTAL_TRADES}\\n"
+            f"Cuenta: {ACCOUNT_TYPE}\\n"
+            "El bot se detuvo automáticamente.\\n"
+            "No se abrirán nuevas operaciones."
+        )
+
+    return True, order_id
 
 
 def execute_sniper(pair: str, pending: Dict[str, Any]) -> bool:
@@ -878,13 +941,13 @@ def process_pair(pair: str) -> None:
 
 
 def analyze_all_pairs() -> None:
-    if not BOT_RUNNING:
+    if not BOT_RUNNING or trade_limit_reached():
         return
 
     refresh_binary_otc_pairs()
 
     for pair in list(PAIRS):
-        if not BOT_RUNNING:
+        if not BOT_RUNNING or trade_limit_reached():
             return
 
         try:
@@ -898,12 +961,13 @@ def analyze_all_pairs() -> None:
 # ============================================================
 
 def main() -> None:
-    global BOT_RUNNING
+    global BOT_RUNNING, TOTAL_TRADES
 
     logger.info("========================================")
     logger.info("BOT BINARY OTC | BB + ATR TRAILING + RSI | MISMA VELA")
     logger.info("TIMEFRAME=%s | EXPIRATION=%s", TIMEFRAME, EXPIRATION)
-    logger.info("MAX OTC=%s | AMOUNT=%s", MAX_OTC_PAIRS, AMOUNT)
+    logger.info("MAX OTC=%s | AMOUNT=%s | ACCOUNT=%s | MAX_TRADES=%s",
+                MAX_OTC_PAIRS, AMOUNT, ACCOUNT_TYPE, MAX_TOTAL_TRADES)
     logger.info("========================================")
 
     required = {
@@ -929,6 +993,10 @@ def main() -> None:
 
     # En Railway el proceso debe comenzar a trabajar sin depender de
     # un comando manual de Telegram. /stop sigue permitiendo detenerlo.
+    with STATE_LOCK:
+        TOTAL_TRADES = 0
+        PENDING_ENTRY.clear()
+
     BOT_RUNNING = AUTO_START
 
     telegram_send(
