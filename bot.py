@@ -50,7 +50,7 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 TIMEFRAME = 60
 EXPIRATION = int(os.getenv("EXPIRATION", "1"))
-AMOUNT = float(os.getenv("AMOUNT", "150"))
+AMOUNT = float(os.getenv("AMOUNT", "333"))
 
 # Cuenta de IQ Option: PRACTICE o REAL
 ACCOUNT_TYPE = os.getenv("ACCOUNT_TYPE", "PRACTICE").strip().upper()
@@ -380,7 +380,7 @@ def connect_iq() -> bool:
     telegram_send(
         "🟢 IQ OPTION CONECTADO\n\n"
         "📊 BB + ATR Trailing Stops + RSI\n"
-        "⚡ Analiza N cerrada y ejecuta en N+1\n"
+        "⚡ Rechazo N + confirmación N+1; ejecución en N+2\n"
         f"⏳ Expiración: {EXPIRATION} minuto(s)"
     )
 
@@ -549,8 +549,14 @@ def revalidate_pending_location(
     if atr <= 0.0 or IQ is None:
         return False
 
+    # strategy.py vv2 expone los pivotes; si un pivote no existe,
+    # usamos la resistencia/soporte calculados como respaldo.
     last_high = analysis.get("last_swing_high")
     last_low = analysis.get("last_swing_low")
+    if last_high is None:
+        last_high = analysis.get("resistance")
+    if last_low is None:
+        last_low = analysis.get("support")
 
     def level_value(value: Any) -> Optional[float]:
         if isinstance(value, (tuple, list)) and len(value) >= 2:
@@ -715,7 +721,7 @@ def analyze_closed_candle(pair: str, expected_closed_ts: int) -> bool:
         f"N cierre: {expected_closed_ts}\n"
         f"N+1: {execution_ts}\n\n"
         "🚫 N no se opera.\n"
-        "⚡ Ejecutar únicamente en N+1.\n"
+        "⚡ Ejecutar únicamente en la siguiente vela disponible (N+2 respecto al rechazo).\n"
         f"⏳ Expiración: {EXPIRATION} minuto(s)\n\n"
         f"{result.get('reason', '')}"
     )
@@ -1024,7 +1030,7 @@ def main() -> None:
     telegram_send(
         "🤖 BOT LISTO\n\n"
         "📊 Filtro Bollinger + ATR Trailing Stops + RSI\n"
-        "⚡ Analiza N cerrada y ejecuta en N+1\n"
+        "⚡ Rechazo N + confirmación N+1; ejecución en N+2\n"
         f"⏳ Expiración: {EXPIRATION} minuto(s)\n"
         f"🚀 Inicio automático: {'SI' if AUTO_START else 'NO'}\n\n"
         + (
