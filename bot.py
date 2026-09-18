@@ -1,24 +1,6 @@
 """
 bot.py
 Bot IQ Option + Telegram con análisis de rechazos.
-
-Mejoras:
-- Lista de hasta 50 pares.
-- Selección de la señal con mayor score.
-- Deducción de señales repetidas usando timestamp de vela.
-- Comandos Telegram: /start, /stop, /status, /scan, /help.
-- Registro de resultados virtuales en DRY_RUN.
-- Cuenta PRACTICE y DRY_RUN activados por defecto.
-
-Variables Railway:
-    IQ_EMAIL
-    IQ_PASSWORD
-    TELEGRAM_BOT_TOKEN (o TELEGRAM_TOKEN)
-    TELEGRAM_CHAT_ID
-
-Instalación:
-    pip install requests
-    pip install -U git+https://github.com/iqoptionapi/iqoptionapi.git
 """
 
 from __future__ import annotations
@@ -56,7 +38,6 @@ TELEGRAM_CHAT_ID = (
 ).strip()
 
 ACCOUNT_TYPE = os.getenv("IQ_ACCOUNT_TYPE", "PRACTICE").upper()
-# La ejecución solo se permite explícitamente en cuenta PRACTICE/DEMO.
 EXECUTE_DEMO = os.getenv("EXECUTE_DEMO", "false").strip().lower() == "true"
 DRY_RUN = not EXECUTE_DEMO
 
@@ -68,6 +49,7 @@ MIN_SCORE = int(os.getenv("MIN_SCORE", "80"))
 
 SCAN_INTERVAL_SECONDS = 5
 TELEGRAM_POLL_INTERVAL = 2
+
 
 ASSETS: List[str] = [
     "EURUSD", "GBPUSD", "USDJPY", "AUDUSD", "USDCAD",
@@ -91,14 +73,23 @@ ASSETS: List[str] = [
 bot_running = True
 force_scan = False
 last_scan_time: Optional[str] = None
+
 last_processed_candle: Dict[str, int] = {}
 pending_paper_trades: Dict[str, Dict[str, Any]] = {}
+
 wins = 0
 losses = 0
 draws = 0
 signals_sent = 0
+
 lock = threading.Lock()
-adaptive_assistant = AdaptiveAssistant(os.getenv("ADAPTIVE_HISTORY_PATH", "adaptive_history.jsonl"))
+
+adaptive_assistant = AdaptiveAssistant(
+    os.getenv(
+        "ADAPTIVE_HISTORY_PATH",
+        "adaptive_history.jsonl"
+    )
+)
 
 
 # =========================
@@ -109,7 +100,11 @@ def telegram_url(method: str) -> str:
     return f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/{method}"
 
 
-def send_telegram(message: str, chat_id: Optional[str] = None) -> bool:
+def send_telegram(
+    message: str,
+    chat_id: Optional[str] = None
+) -> bool:
+
     destination = chat_id or TELEGRAM_CHAT_ID
 
     if not TELEGRAM_BOT_TOKEN or not destination:
@@ -127,14 +122,20 @@ def send_telegram(message: str, chat_id: Optional[str] = None) -> bool:
             },
             timeout=15,
         )
+
         response.raise_for_status()
+
         return bool(response.json().get("ok"))
+
     except (requests.RequestException, ValueError) as exc:
         print(f"[TELEGRAM] Error: {exc}")
         return False
 
 
-def get_telegram_updates(offset: Optional[int]) -> List[Dict[str, Any]]:
+def get_telegram_updates(
+    offset: Optional[int]
+) -> List[Dict[str, Any]]:
+
     if not TELEGRAM_BOT_TOKEN:
         return []
 
@@ -142,6 +143,7 @@ def get_telegram_updates(offset: Optional[int]) -> List[Dict[str, Any]]:
         "timeout": 10,
         "allowed_updates": ["message"],
     }
+
     if offset is not None:
         params["offset"] = offset
 
@@ -151,9 +153,17 @@ def get_telegram_updates(offset: Optional[int]) -> List[Dict[str, Any]]:
             params=params,
             timeout=15,
         )
+
         response.raise_for_status()
+
         data = response.json()
-        return data.get("result", []) if data.get("ok") else []
+
+        return (
+            data.get("result", [])
+            if data.get("ok")
+            else []
+        )
+
     except (requests.RequestException, ValueError) as exc:
         print(f"[TELEGRAM] Lectura de comandos falló: {exc}")
         return []
@@ -169,11 +179,20 @@ def telegram_command_loop() -> None:
     offset: Optional[int] = None
 
     while True:
+
         for update in get_telegram_updates(offset):
+
             offset = int(update["update_id"]) + 1
+
             message = update.get("message", {})
-            chat_id = str(message.get("chat", {}).get("id", ""))
-            text = (message.get("text") or "").strip().lower()
+
+            chat_id = str(
+                message.get("chat", {}).get("id", "")
+            )
+
+            text = (
+                message.get("text") or ""
+            ).strip().lower()
 
             if not authorized_chat(chat_id):
                 continue
@@ -181,24 +200,49 @@ def telegram_command_loop() -> None:
             command = text.split()[0] if text else ""
 
             if command in ("/start", "/resume"):
+
                 with lock:
                     bot_running = True
-                send_telegram("✅ <b>Bot activado</b>. Análisis habilitado en DEMO.")
+
+                send_telegram(
+                    "✅ <b>Bot activado</b>. "
+                    "Análisis habilitado en DEMO."
+                )
 
             elif command == "/stop":
+
                 with lock:
                     bot_running = False
-                send_telegram("🛑 <b>Bot detenido</b>. No se procesarán nuevas señales.")
+
+                send_telegram(
+                    "🛑 <b>Bot detenido</b>. "
+                    "No se procesarán nuevas señales."
+                )
 
             elif command == "/scan":
+
                 with lock:
                     force_scan = True
-                send_telegram("🔎 Escaneo solicitado. Se procesará en el próximo ciclo.")
+
+                send_telegram(
+                    "🔎 Escaneo solicitado. "
+                    "Se procesará en el próximo ciclo."
+                )
 
             elif command == "/status":
+
                 with lock:
-                    state = "ACTIVO" if bot_running else "DETENIDO"
-                    last_scan = last_scan_time or "sin escaneos"
+                    state = (
+                        "ACTIVO"
+                        if bot_running
+                        else "DETENIDO"
+                    )
+
+                    last_scan = (
+                        last_scan_time
+                        or "sin escaneos"
+                    )
+
                     current_wins = wins
                     current_losses = losses
                     current_draws = draws
@@ -211,10 +255,13 @@ def telegram_command_loop() -> None:
                     f"DRY_RUN: <b>{DRY_RUN}</b>\n"
                     f"Último escaneo: <b>{last_scan}</b>\n"
                     f"Señales: <b>{current_signals}</b>\n"
-                    f"WIN: <b>{current_wins}</b> | LOSS: <b>{current_losses}</b> | DRAW: <b>{current_draws}</b>"
+                    f"WIN: <b>{current_wins}</b> | "
+                    f"LOSS: <b>{current_losses}</b> | "
+                    f"DRAW: <b>{current_draws}</b>"
                 )
 
             elif command == "/help":
+
                 send_telegram(
                     "<b>Comandos</b>\n"
                     "/start - Activar\n"
@@ -232,27 +279,45 @@ def telegram_command_loop() -> None:
 # =========================
 
 def connect_iqoption():
+
     try:
         from iqoptionapi.stable_api import IQ_Option
+
     except ImportError as exc:
+
         raise RuntimeError(
-            "Instala iqoptionapi con: pip install -U git+https://github.com/iqoptionapi/iqoptionapi.git"
+            "Instala iqoptionapi con: "
+            "pip install -U "
+            "git+https://github.com/iqoptionapi/iqoptionapi.git"
         ) from exc
 
     if not IQ_EMAIL or not IQ_PASSWORD:
-        raise RuntimeError("Configura IQ_EMAIL e IQ_PASSWORD.")
+        raise RuntimeError(
+            "Configura IQ_EMAIL e IQ_PASSWORD."
+        )
 
-    api = IQ_Option(IQ_EMAIL, IQ_PASSWORD)
+    api = IQ_Option(
+        IQ_EMAIL,
+        IQ_PASSWORD
+    )
+
     connected, reason = api.connect()
 
     if not connected:
-        raise RuntimeError(f"No se pudo conectar a IQ Option: {reason}")
+        raise RuntimeError(
+            f"No se pudo conectar a IQ Option: {reason}"
+        )
 
     api.change_balance(ACCOUNT_TYPE)
+
     return api
 
 
-def get_closed_candles(api, asset: str) -> List[Dict[str, Any]]:
+def get_closed_candles(
+    api,
+    asset: str
+) -> List[Dict[str, Any]]:
+
     candles = api.get_candles(
         asset,
         TIMEFRAME_SECONDS,
@@ -263,41 +328,73 @@ def get_closed_candles(api, asset: str) -> List[Dict[str, Any]]:
     if not candles:
         return []
 
-    ordered = sorted(candles, key=lambda item: item.get("from", 0))
+    ordered = sorted(
+        candles,
+        key=lambda item: item.get("from", 0)
+    )
 
-    # Se descartan las dos últimas por seguridad: la última puede estar
-    # abierta y la anterior puede no estar completamente confirmada
-    # dependiendo del retraso de la API.
     return ordered[:-1]
 
 
-def candle_time(candle: Dict[str, Any]) -> Optional[int]:
-    value = candle.get("from", candle.get("at", candle.get("timestamp")))
+def candle_time(
+    candle: Dict[str, Any]
+) -> Optional[int]:
+
+    value = candle.get(
+        "from",
+        candle.get(
+            "at",
+            candle.get("timestamp")
+        )
+    )
+
     try:
-        return int(value) if value is not None else None
+        return (
+            int(value)
+            if value is not None
+            else None
+        )
+
     except (TypeError, ValueError):
         return None
 
 
-def candle_close(candle: Dict[str, Any]) -> float:
+def candle_close(
+    candle: Dict[str, Any]
+) -> float:
+
     if candle.get("close") is not None:
         return float(candle["close"])
+
     return float(candle["close_price"])
 
 
-def candle_open(candle: Dict[str, Any]) -> float:
+def candle_open(
+    candle: Dict[str, Any]
+) -> float:
+
     if candle.get("open") is not None:
         return float(candle["open"])
+
     return float(candle["open_price"])
 
 
-def settle_paper_trades(asset: str, candles: List[Dict[str, Any]]) -> None:
+# =========================
+# RESULTADOS VIRTUALES
+# =========================
+
+def settle_paper_trades(
+    asset: str,
+    candles: List[Dict[str, Any]]
+) -> None:
+
     global wins, losses, draws
 
     if not candles:
         return
 
     latest_time = candle_time(candles[-1])
+
     if latest_time is None:
         return
 
@@ -307,7 +404,11 @@ def settle_paper_trades(asset: str, candles: List[Dict[str, Any]]) -> None:
     if not trade:
         return
 
-    expiry_time = int(trade["candle_time"]) + EXPIRATION_MINUTES * 60
+    expiry_time = (
+        int(trade["candle_time"])
+        + EXPIRATION_MINUTES * 60
+    )
+
     if latest_time < expiry_time:
         return
 
@@ -316,23 +417,58 @@ def settle_paper_trades(asset: str, candles: List[Dict[str, Any]]) -> None:
     action = trade["action"]
 
     if exit_price == entry:
+
         result = "DRAW"
+
     elif action == "call":
-        result = "WIN" if exit_price > entry else "LOSS"
+
+        result = (
+            "WIN"
+            if exit_price > entry
+            else "LOSS"
+        )
+
     else:
-        result = "WIN" if exit_price < entry else "LOSS"
+
+        result = (
+            "WIN"
+            if exit_price < entry
+            else "LOSS"
+        )
 
     with lock:
-        pending_paper_trades.pop(asset, None)
+
+        pending_paper_trades.pop(
+            asset,
+            None
+        )
+
         if result == "WIN":
             wins += 1
+
         elif result == "LOSS":
             losses += 1
+
         else:
             draws += 1
-    adaptive_assistant.record_result(asset, action, trade.get("candle_time"), result, entry, exit_price)
 
-    emoji = "✅" if result == "WIN" else "❌" if result == "LOSS" else "➖"
+    adaptive_assistant.record_result(
+        asset,
+        action,
+        trade.get("candle_time"),
+        result,
+        entry,
+        exit_price,
+    )
+
+    emoji = (
+        "✅"
+        if result == "WIN"
+        else "❌"
+        if result == "LOSS"
+        else "➖"
+    )
+
     send_telegram(
         f"{emoji} <b>Resultado DEMO / VIRTUAL</b>\n"
         f"Par: <b>{html.escape(asset)}</b>\n"
@@ -343,26 +479,48 @@ def settle_paper_trades(asset: str, candles: List[Dict[str, Any]]) -> None:
     )
 
 
-def execute_signal(api, asset: str, signal: Signal) -> Tuple[bool, Any]:
-    # Bloqueo de seguridad: nunca permite ejecución desde una cuenta real.
+# =========================
+# EJECUCIÓN
+# =========================
+
+def execute_signal(
+    api,
+    asset: str,
+    signal: Signal
+) -> Tuple[bool, Any]:
+
     if ACCOUNT_TYPE != "PRACTICE":
+
         raise RuntimeError(
-            "Ejecución bloqueada: usa IQ_ACCOUNT_TYPE=PRACTICE."
+            "Ejecución bloqueada: "
+            "usa IQ_ACCOUNT_TYPE=PRACTICE."
         )
 
     if DRY_RUN:
+
         print(
-            f"[DRY_RUN] {asset} -> {signal.action.upper()} "
-            f"score={signal.score} entry={signal.entry_price}"
+            f"[DRY_RUN] {asset} -> "
+            f"{signal.action.upper()} "
+            f"score={signal.score} "
+            f"entry={signal.entry_price}"
         )
+
         return False, None
 
-    # Expiración fija de 1 minuto.
-    result = api.buy(STAKE, asset, signal.action, EXPIRATION_MINUTES)
-    print(
-        f"[DEMO] {asset} -> {signal.action.upper()} "
-        f"expiración={EXPIRATION_MINUTES} minuto, resultado_api={result}"
+    result = api.buy(
+        STAKE,
+        asset,
+        signal.action,
+        EXPIRATION_MINUTES,
     )
+
+    print(
+        f"[DEMO] {asset} -> "
+        f"{signal.action.upper()} "
+        f"expiración={EXPIRATION_MINUTES} minuto, "
+        f"resultado_api={result}"
+    )
+
     return result
 
 
@@ -371,109 +529,256 @@ def execute_signal(api, asset: str, signal: Signal) -> Tuple[bool, Any]:
 # =========================
 
 def scan_once(api) -> None:
-    global last_scan_time, signals_sent, force_scan
+
+    global last_scan_time
+    global signals_sent
+    global force_scan
 
     with lock:
+
         if not bot_running:
             return
+
         force_scan = False
 
-    candidates: List[Tuple[int, str, Signal, List[Dict[str, Any]]]] = []
+    candidates: List[
+        Tuple[
+            int,
+            str,
+            Signal,
+            List[Dict[str, Any]]
+        ]
+    ] = []
 
     for asset in ASSETS:
+
         try:
-            candles = get_closed_candles(api, asset)
+
+            candles = get_closed_candles(
+                api,
+                asset
+            )
+
             if len(candles) < 30:
                 continue
 
-            settle_paper_trades(asset, candles)
+            settle_paper_trades(
+                asset,
+                candles
+            )
 
-            signal = analyze_rejection(candles, min_score=MIN_SCORE)
+            signal = analyze_rejection(
+                candles,
+                min_score=MIN_SCORE
+            )
+
             signal_time = signal.candle_time
 
-            if signal.action == "none" or signal_time is None:
+            if (
+                signal.action == "none"
+                or signal_time is None
+            ):
                 continue
 
-            adaptive_assistant.record_signal(asset, signal, candles)
-            adaptive = adaptive_assistant.evaluate(asset, signal, candles)
-            if not adaptive.get("approved", False):
-                print(f"[{asset}] Señal bloqueada por asistente: {adaptive.get('reason')}")
+            adaptive_assistant.record_signal(
+                asset,
+                signal,
+                candles
+            )
+
+            adaptive = adaptive_assistant.evaluate(
+                asset,
+                signal,
+                candles
+            )
+
+            if not adaptive.get(
+                "approved",
+                False
+            ):
+
+                print(
+                    f"[{asset}] Señal bloqueada "
+                    f"por asistente: "
+                    f"{adaptive.get('reason')}"
+                )
+
                 continue
 
             with lock:
-                if last_processed_candle.get(asset) == signal_time:
+
+                if (
+                    last_processed_candle.get(asset)
+                    == signal_time
+                ):
                     continue
+
                 last_processed_candle[asset] = signal_time
 
-            candidates.append((signal.score, asset, signal, candles))
+            candidates.append(
+                (
+                    signal.score,
+                    asset,
+                    signal,
+                    candles
+                )
+            )
 
         except Exception as exc:
-            print(f"[{asset}] Error: {exc}")
+
+            print(
+                f"[{asset}] Error: {exc}"
+            )
 
     with lock:
-        last_scan_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        last_scan_time = datetime.now().strftime(
+            "%Y-%m-%d %H:%M:%S"
+        )
 
     if not candidates:
         return
 
-    candidates.sort(key=lambda item: item[0], reverse=True)
+    candidates.sort(
+        key=lambda item: item[0],
+        reverse=True
+    )
+
     score, asset, signal, candles = candidates[0]
 
-    adaptive_selected = adaptive_assistant.evaluate(asset, signal, candles)
-    direction = "CALL 🟢" if signal.action == "call" else "PUT 🔴"
-    level_name = "soporte" if signal.action == "call" else "resistencia"
-    level_value = signal.support if signal.action == "call" else signal.resistance
+    adaptive_selected = adaptive_assistant.evaluate(
+        asset,
+        signal,
+        candles
+    )
+
+    direction = (
+        "CALL 🟢"
+        if signal.action == "call"
+        else "PUT 🔴"
+    )
+
+    level_name = (
+        "soporte"
+        if signal.action == "call"
+        else "resistencia"
+    )
+
+    level_value = (
+        signal.support
+        if signal.action == "call"
+        else signal.resistance
+    )
 
     message = (
+
         "🚨 <b>SEÑAL DE RECHAZO</b>\n\n"
+
         f"📌 Par: <b>{html.escape(asset)}</b>\n"
+
         f"📈 Dirección: <b>{direction}</b>\n"
+
         f"🎯 Score: <b>{score}/100</b>\n"
+
         f"📍 Zona: <b>{level_name}</b>\n"
+
         f"💵 Nivel: <b>{level_value}</b>\n"
-        f"🎬 Entrada de referencia: <b>{signal.entry_price}</b>\n"
-        f"⏱️ Expiración virtual: <b>{EXPIRATION_MINUTES} minuto(s)</b>\n"
-        f"🧪 Cuenta: <b>{html.escape(ACCOUNT_TYPE)}</b>\n"
+
+        f"🎬 Entrada de referencia: "
+        f"<b>{signal.entry_price}</b>\n"
+
+        f"⏱️ Expiración virtual: "
+        f"<b>{EXPIRATION_MINUTES} minuto(s)</b>\n"
+
+        f"🧪 Cuenta: "
+        f"<b>{html.escape(ACCOUNT_TYPE)}</b>\n"
+
         f"🔒 DRY_RUN: <b>{DRY_RUN}</b>\n"
-        f"📝 Motivo: <b>{html.escape(signal.reason)}</b>\n"
-        f"🧠 Asistente: <b>{html.escape(str(adaptive_selected.get('reason', 'OK')))}</b>\n\n"
-        "⚠️ Señal experimental. No garantiza ganancias."
+
+        f"📝 Motivo: "
+        f"<b>{html.escape(signal.reason)}</b>\n"
+
+        f"🧠 Asistente: "
+        f"<b>{html.escape(str(adaptive_selected.get('reason', 'OK')))}</b>\n\n"
+
+        "⚠️ Señal experimental. "
+        "No garantiza ganancias."
     )
 
     if send_telegram(message):
+
         with lock:
             signals_sent += 1
 
-    # Registro virtual para calcular WIN/LOSS con la siguiente vela.
-    if signal.entry_price is not None and signal.candle_time is not None:
+    if (
+        signal.entry_price is not None
+        and signal.candle_time is not None
+    ):
+
         with lock:
+
             pending_paper_trades[asset] = {
+
                 "action": signal.action,
+
                 "entry": signal.entry_price,
+
                 "candle_time": signal.candle_time,
-                "adaptive_sample": adaptive.get("sample", 0),
-                "adaptive_win_rate": adaptive.get("win_rate"),
+
+                "adaptive_sample": adaptive_selected.get(
+                    "sample",
+                    0
+                ),
+
+                "adaptive_win_rate": adaptive_selected.get(
+                    "win_rate"
+                ),
             }
 
-    execute_signal(api, asset, signal)
+    execute_signal(
+        api,
+        asset,
+        signal
+    )
 
+
+# =========================
+# PRINCIPAL
+# =========================
 
 def main() -> None:
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+
+    if (
+        not TELEGRAM_BOT_TOKEN
+        or not TELEGRAM_CHAT_ID
+    ):
+
         raise RuntimeError(
-            "Configura TELEGRAM_BOT_TOKEN/TELEGRAM_TOKEN y TELEGRAM_CHAT_ID."
+            "Configura "
+            "TELEGRAM_BOT_TOKEN/TELEGRAM_TOKEN "
+            "y TELEGRAM_CHAT_ID."
         )
 
     if ACCOUNT_TYPE != "PRACTICE":
+
         raise RuntimeError(
-            "Por seguridad, este archivo solo funciona con IQ_ACCOUNT_TYPE=PRACTICE."
+            "Por seguridad, este archivo "
+            "solo funciona con "
+            "IQ_ACCOUNT_TYPE=PRACTICE."
         )
 
     send_telegram(
+
         "🤖 <b>Bot iniciado</b>\n"
-        f"Cuenta: <b>{html.escape(ACCOUNT_TYPE)}</b>\n"
+
+        f"Cuenta: "
+        f"<b>{html.escape(ACCOUNT_TYPE)}</b>\n"
+
         f"DRY_RUN: <b>{DRY_RUN}</b>\n"
-        f"Pares configurados: <b>{len(ASSETS)}</b>\n"
+
+        f"Pares configurados: "
+        f"<b>{len(ASSETS)}</b>\n"
+
         "Usa /help para ver los comandos."
     )
 
@@ -483,21 +788,43 @@ def main() -> None:
     ).start()
 
     api = connect_iqoption()
+
     print(
-        f"Conectado a IQ Option. Cuenta={ACCOUNT_TYPE}, "
-        f"DRY_RUN={DRY_RUN}, pares={len(ASSETS)}"
+        f"Conectado a IQ Option. "
+        f"Cuenta={ACCOUNT_TYPE}, "
+        f"DRY_RUN={DRY_RUN}, "
+        f"pares={len(ASSETS)}"
     )
 
     while True:
+
         try:
+
             scan_once(api)
-            time.sleep(SCAN_INTERVAL_SECONDS)
+
+            time.sleep(
+                SCAN_INTERVAL_SECONDS
+            )
+
         except KeyboardInterrupt:
-            send_telegram("🛑 Bot detenido manualmente.")
+
+            send_telegram(
+                "🛑 Bot detenido manualmente."
+            )
+
             break
+
         except Exception as exc:
-            print(f"[MAIN] Error: {exc}")
-            send_telegram(f"⚠️ <b>Error del bot:</b> {html.escape(str(exc))}")
+
+            print(
+                f"[MAIN] Error: {exc}"
+            )
+
+            send_telegram(
+                "⚠️ <b>Error del bot:</b> "
+                f"{html.escape(str(exc))}"
+            )
+
             time.sleep(10)
 
 
