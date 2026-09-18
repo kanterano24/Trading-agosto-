@@ -50,13 +50,13 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 TIMEFRAME = 60
 EXPIRATION = int(os.getenv("EXPIRATION", "1"))
-AMOUNT = float(os.getenv("AMOUNT", "666"))
+AMOUNT = float(os.getenv("AMOUNT", "1000"))
 
 # Cuenta de IQ Option: PRACTICE o REAL
 ACCOUNT_TYPE = os.getenv("ACCOUNT_TYPE", "PRACTICE").strip().upper()
 
 # Límite total de entradas por ejecución del bot
-MAX_TOTAL_TRADES = 14
+MAX_TOTAL_TRADES = 10
 TOTAL_TRADES = 0
 CANDLE_COUNT = max(60, int(os.getenv("CANDLE_COUNT", "80")))
 MAX_OTC_PAIRS = max(1, int(os.getenv("MAX_OTC_PAIRS", "50")))
@@ -66,8 +66,6 @@ SNIPER_POLL = 0.06
 TRADE_COOLDOWN = float(os.getenv("TRADE_COOLDOWN", "60"))
 MIN_HISTORY = 35
 MIN_ROOM_TO_OPPOSITE_ATR = float(os.getenv("MIN_ROOM_TO_OPPOSITE_ATR", "0.90"))
-RESULT_POLL_SECONDS = float(os.getenv("RESULT_POLL_SECONDS", "2.0"))
-RESULT_TIMEOUT_SECONDS = float(os.getenv("RESULT_TIMEOUT_SECONDS", "150"))
 
 # Inicia el análisis automáticamente después de conectar a IQ Option.
 # Puede desactivarse con AUTO_START=false y usar /start desde Telegram.
@@ -94,15 +92,6 @@ LIVE_STATE: Dict[str, Dict[str, Any]] = {}
 PENDING_ENTRY: Dict[str, Dict[str, Any]] = {}
 LAST_TRADE_TIME: Dict[str, float] = {}
 LAST_TRADE_CANDLE: Dict[str, int] = {}
-
-# Tras una operación ganadora, el par exige señales EJECUTADAS: PUT -> CALL -> PUT.
-# Solo la dirección esperada puede ejecutarse durante la secuencia de desbloqueo.
-UNLOCK_SEQUENCE = ("put", "call", "put")
-PAIR_UNLOCK_PROGRESS: Dict[str, int] = {}
-PAIR_UNLOCK_ACTIVE: Dict[str, bool] = {}
-# Impide una segunda entrada en el mismo par mientras la primera
-# todavía no tiene resultado confirmado por IQ Option.
-ACTIVE_ORDERS: Dict[str, Dict[str, Any]] = {}
 
 STATE_LOCK = threading.RLock()
 
@@ -198,9 +187,6 @@ def telegram_command_loop() -> None:
                     with STATE_LOCK:
                         TOTAL_TRADES = 0
                         PENDING_ENTRY.clear()
-                        PAIR_UNLOCK_ACTIVE.clear()
-                        PAIR_UNLOCK_PROGRESS.clear()
-                        ACTIVE_ORDERS.clear()
                     BOT_RUNNING = True
                     telegram_send(
                         "🟢 BOT ACTIVADO\\n\\n"
@@ -654,11 +640,6 @@ def analyze_closed_candle(pair: str, expected_closed_ts: int) -> bool:
         if state and int(state.get("analyzed_ts", -1)) == expected_closed_ts:
             return True
 
-    with STATE_LOCK:
-        if pair in ACTIVE_ORDERS:
-            logger.info("%s | análisis omitido: operación anterior aún sin resultado", pair)
-            return True
-
     result = analyze_market(
         candle_1m=closed_row.to_dict(),
         previous_m1=df.iloc[:-1].copy(),
@@ -691,15 +672,6 @@ def analyze_closed_candle(pair: str, expected_closed_ts: int) -> bool:
 
     if not is_force_signal(result, signal):
         return True
-
-    if not unlock_gate_allows(pair, signal):
-        expected = expected_unlock_signal(pair)
-        logger.info("%s | señal %s no armada: durante desbloqueo se exige %s", pair, str(signal).upper(), str(expected).upper())
-        return True
-
-    with STATE_LOCK:
-        if pair in ACTIVE_ORDERS:
-            return True
 
     values = candle_values(closed_row)
     execution_ts = int(expected_closed_ts + TIMEFRAME)
@@ -817,136 +789,6 @@ def analyze_live_candle(pair: str, current_ts: int) -> bool:
 
 
 # ============================================================
-# CONTROL DE RESULTADOS Y BLOQUEO POR PAR
-# ============================================================
-
-def expected_unlock_signal(pair: str) -> Optional[str]:
-    """Devuelve la única dirección permitida durante el desbloqueo."""
-    with STATE_LOCK:
-        if not PAIR_UNLOCK_ACTIVE.get(pair, False):
-            return None
-        progress = int(PAIR_UNLOCK_PROGRESS.get(pair, 0))
-        if progress >= len(UNLOCK_SEQUENCE):
-            return None
-        return UNLOCK_SEQUENCE[progress]
-
-
-def unlock_gate_allows(pair: str, signal: str) -> bool:
-    """Bloquea las señales que no respeten PUT -> CALL -> PUT."""
-    expected = expected_unlock_signal(pair)
-    if expected is None:
-        return True
-    return signal == expected
-
-
-def register_executed_unlock_signal(pair: str, signal: str) -> None:
-    """Cuenta únicamente una señal que realmente fue ejecutada."""
-    with STATE_LOCK:
-        if not PAIR_UNLOCK_ACTIVE.get(pair, False):
-            return
-
-        progress = int(PAIR_UNLOCK_PROGRESS.get(pair, 0))
-        expected = UNLOCK_SEQUENCE[progress] if progress < len(UNLOCK_SEQUENCE) else None
-        if signal != expected:
-            return
-
-        progress += 1
-        PAIR_UNLOCK_PROGRESS[pair] = progress
-
-        if progress >= len(UNLOCK_SEQUENCE):
-            PAIR_UNLOCK_ACTIVE.pop(pair, None)
-            PAIR_UNLOCK_PROGRESS.pop(pair, None)
-            logger.info("%s | PAR DESBLOQUEADO | secuencia ejecutada PUT -> CALL -> PUT", pair)
-            telegram_send(
-                "🔓 PAR DESBLOQUEADO\n\n"
-                f"Par: {pair}\n"
-                "Secuencia ejecutada: PUT -> CALL -> PUT\n"
-                "El par vuelve a aceptar señales normales."
-            )
-        else:
-            next_signal = UNLOCK_SEQUENCE[progress]
-            logger.info(
-                "%s | desbloqueo %s/%s | ejecutado=%s | siguiente=%s",
-                pair, progress, len(UNLOCK_SEQUENCE), signal.upper(), next_signal.upper(),
-            )
-            telegram_send(
-                "🔒 SECUENCIA DE DESBLOQUEO\n\n"
-                f"Par: {pair}\n"
-                f"Ejecutada: {signal.upper()}\n"
-                f"Progreso: {progress}/{len(UNLOCK_SEQUENCE)}\n"
-                f"Siguiente dirección obligatoria: {next_signal.upper()}"
-            )
-
-
-def activate_unlock_after_win(pair: str) -> None:
-    """Después de una ganancia, cancela pendientes y activa la secuencia."""
-    with STATE_LOCK:
-        # Una señal preparada antes de conocer la ganancia nunca debe ejecutarse
-        # después de esa ganancia.
-        PENDING_ENTRY.pop(pair, None)
-        PAIR_UNLOCK_ACTIVE[pair] = True
-        PAIR_UNLOCK_PROGRESS[pair] = 0
-
-    telegram_send(
-        "🔒 PAR BLOQUEADO TRAS GANANCIA\n\n"
-        f"Par: {pair}\n"
-        "Para desbloquearlo solo se permitirán señales EJECUTADAS en orden:\n"
-        "PUT -> CALL -> PUT\n"
-        "Las demás direcciones serán descartadas."
-    )
-
-
-def _extract_win_value(value: Any) -> Optional[float]:
-    try:
-        if isinstance(value, tuple):
-            value = value[-1]
-        if isinstance(value, bool):
-            return 1.0 if value else 0.0
-        return float(value)
-    except (TypeError, ValueError):
-        return None
-
-
-def monitor_trade_result(pair: str, signal: str, order_id: Any) -> None:
-    """Consulta el resultado de la operación y activa el bloqueo solo si gana."""
-    if IQ is None or order_id in (None, False, ""):
-        return
-
-    deadline = time.time() + RESULT_TIMEOUT_SECONDS
-    while time.time() < deadline:
-        try:
-            checker = getattr(IQ, "check_win_v3", None)
-            if checker is None:
-                logger.warning("%s | no existe check_win_v3; no se puede confirmar resultado ID=%s", pair, order_id)
-                return
-
-            raw_result = checker(order_id)
-            result = _extract_win_value(raw_result)
-            if result is None:
-                time.sleep(RESULT_POLL_SECONDS)
-                continue
-
-            with STATE_LOCK:
-                ACTIVE_ORDERS.pop(pair, None)
-
-            if result > 0:
-                logger.info("%s | RESULTADO GANADOR | señal=%s | ID=%s | resultado=%s", pair, signal.upper(), order_id, result)
-                activate_unlock_after_win(pair)
-            elif result < 0:
-                logger.info("%s | RESULTADO PERDEDOR | señal=%s | ID=%s | resultado=%s", pair, signal.upper(), order_id, result)
-            else:
-                logger.info("%s | RESULTADO EMPATE/0 | señal=%s | ID=%s", pair, signal.upper(), order_id)
-            return
-        except Exception as exc:
-            logger.debug("%s | consulta resultado ID=%s: %s", pair, order_id, exc)
-        time.sleep(RESULT_POLL_SECONDS)
-
-    with STATE_LOCK:
-        ACTIVE_ORDERS.pop(pair, None)
-    logger.warning("%s | tiempo agotado esperando resultado ID=%s", pair, order_id)
-
-
-# ============================================================
 # EJECUCION
 # ============================================================
 
@@ -965,21 +807,10 @@ def buy_binary(pair: str, signal: str) -> Tuple[bool, Optional[Any]]:
     if IQ is None or signal not in ("call", "put"):
         return False, None
 
-    if not unlock_gate_allows(pair, signal):
-        expected = expected_unlock_signal(pair)
-        logger.info("%s | señal %s descartada; durante desbloqueo se exige %s", pair, signal.upper(), str(expected).upper())
-        return False, None
-
     # El bloqueo cubre la comprobación y el envío para evitar
     # que dos hilos consuman el mismo cupo simultáneamente.
     with STATE_LOCK:
         if TOTAL_TRADES >= MAX_TOTAL_TRADES:
-            return False, None
-
-        # Doble protección: no permitir dos operaciones simultáneas del mismo par
-        # aunque el resultado de la anterior todavía no haya sido consultado.
-        if pair in ACTIVE_ORDERS:
-            logger.info("%s | entrada bloqueada: operación anterior pendiente de resultado", pair)
             return False, None
 
         try:
@@ -997,12 +828,6 @@ def buy_binary(pair: str, signal: str) -> Tuple[bool, Optional[Any]]:
 
             TOTAL_TRADES += 1
             current_trades = TOTAL_TRADES
-            ACTIVE_ORDERS[pair] = {
-                "order_id": order_id,
-                "signal": signal,
-                "opened_at": time.time(),
-            }
-            register_executed_unlock_signal(pair, signal)
 
             if TOTAL_TRADES >= MAX_TOTAL_TRADES:
                 BOT_RUNNING = False
@@ -1029,12 +854,6 @@ def buy_binary(pair: str, signal: str) -> Tuple[bool, Optional[Any]]:
             "No se abrirán nuevas operaciones."
         )
 
-    threading.Thread(
-        target=monitor_trade_result,
-        args=(pair, signal, order_id),
-        daemon=True,
-    ).start()
-
     return True, order_id
 
 
@@ -1056,10 +875,6 @@ def execute_sniper(pair: str, pending: Dict[str, Any]) -> bool:
 
     if LAST_TRADE_CANDLE.get(pair) == execution_ts:
         return False
-
-    with STATE_LOCK:
-        if pair in ACTIVE_ORDERS:
-            return False
 
     if cooldown_active(pair):
         return False
@@ -1203,9 +1018,6 @@ def main() -> None:
     with STATE_LOCK:
         TOTAL_TRADES = 0
         PENDING_ENTRY.clear()
-        PAIR_UNLOCK_ACTIVE.clear()
-        PAIR_UNLOCK_PROGRESS.clear()
-        ACTIVE_ORDERS.clear()
 
     BOT_RUNNING = AUTO_START
 
