@@ -50,7 +50,7 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 TIMEFRAME = 60
 EXPIRATION = int(os.getenv("EXPIRATION", "1"))
-AMOUNT = float(os.getenv("AMOUNT", "333"))
+AMOUNT = float(os.getenv("AMOUNT", "334"))
 
 # Cuenta de IQ Option: PRACTICE o REAL
 ACCOUNT_TYPE = os.getenv("ACCOUNT_TYPE", "PRACTICE").strip().upper()
@@ -607,6 +607,66 @@ def revalidate_pending_location(
 # ANALISIS Y PREPARACION N+1
 # ============================================================
 
+
+def _fmt_price(value: Any) -> str:
+    try:
+        return f"{float(value):.6f}"
+    except (TypeError, ValueError):
+        return "N/D"
+
+
+def _candle_diagnostic(label: str, candle: Any) -> str:
+    if not isinstance(candle, dict):
+        return f"{label}: N/D"
+    return (
+        f"{label}: "
+        f"O={_fmt_price(candle.get('open'))} | "
+        f"H={_fmt_price(candle.get('high'))} | "
+        f"L={_fmt_price(candle.get('low'))} | "
+        f"C={_fmt_price(candle.get('close'))} | "
+        f"Rango={_fmt_price(candle.get('range'))} | "
+        f"Cuerpo={_fmt_price(candle.get('body'))} | "
+        f"MechaSup={_fmt_price(candle.get('upper'))} | "
+        f"MechaInf={_fmt_price(candle.get('lower'))} | "
+        f"PosCierre={_fmt_price(candle.get('close_position'))}"
+    )
+
+
+def _diagnostic_message(
+    pair: str,
+    signal: str,
+    result: Dict[str, Any],
+    rejection_label: str = "N",
+    confirmation_label: str = "N+1",
+) -> str:
+    analysis = result.get("analysis") or {}
+    rejection = analysis.get("rejection_candle") or {}
+    confirmation = analysis.get("confirmation_candle") or {}
+    direction = str(signal or "").upper()
+
+    return (
+        "📊 DIAGNÓSTICO TÉCNICO\n\n"
+        f"Par: {pair}\n"
+        f"Dirección: {direction}\n"
+        f"Score: {result.get('score', 0)}/100\n"
+        f"Calidad: {result.get('entry_quality', 0)}/100\n"
+        f"Estructura: {analysis.get('structure', 'unknown')}\n"
+        f"ATR: {_fmt_price(analysis.get('atr'))}\n"
+        f"Soporte: {_fmt_price(analysis.get('support'))}\n"
+        f"Resistencia: {_fmt_price(analysis.get('resistance'))}\n"
+        f"Tolerancia: {_fmt_price(analysis.get('tolerance'))}\n"
+        f"EMA rápida: {_fmt_price(analysis.get('fast_ema'))}\n"
+        f"EMA lenta: {_fmt_price(analysis.get('slow_ema'))}\n"
+        f"Contexto alcista: {analysis.get('bullish_context')}\n"
+        f"Contexto bajista: {analysis.get('bearish_context')}\n\n"
+        f"{_candle_diagnostic(rejection_label, rejection)}\n"
+        f"{_candle_diagnostic(confirmation_label, confirmation)}\n\n"
+        f"Timestamp {rejection_label}: {analysis.get('rejection_timestamp', 'N/D')}\n"
+        f"Timestamp {confirmation_label}: {analysis.get('confirmation_timestamp', 'N/D')}\n\n"
+        f"Motivos: {result.get('reason', '')}"
+    )
+
+
 def analysis_message(pair: str, ts: int, result: Dict[str, Any]) -> str:
     analysis = result.get("analysis") or {}
 
@@ -717,13 +777,14 @@ def analyze_closed_candle(pair: str, expected_closed_ts: int) -> bool:
         f"Score: {score}/100\n"
         f"Calidad: {analysis.get('entry_quality', result.get('entry_quality', 0))}/100\n"
         f"Estructura: {analysis.get('structure', 'unknown')}\n\n"
-        f"Cierre N: {values['close']}\n"
+        f"Cierre N: {_fmt_price(values['close'])}\n"
         f"N cierre: {expected_closed_ts}\n"
-        f"N+1: {execution_ts}\n\n"
+        f"N+1 previsto: {execution_ts}\n\n"
         "🚫 N no se opera.\n"
-        "⚡ Ejecutar únicamente en la siguiente vela disponible (N+2 respecto al rechazo).\n"
+        "⚡ La entrada queda pendiente para la vela programada.\n"
         f"⏳ Expiración: {EXPIRATION} minuto(s)\n\n"
-        f"{result.get('reason', '')}"
+        f"{result.get('reason', '')}\n\n"
+        + _diagnostic_message(pair, signal, result)
     )
 
     return True
@@ -892,11 +953,46 @@ def execute_sniper(pair: str, pending: Dict[str, Any]) -> bool:
         with STATE_LOCK:
             PENDING_ENTRY.pop(pair, None)
 
+        analysis = pending.get("analysis") or {}
+        current_df = get_closed_candles(pair)
+        current_close = None
+        if current_df is not None and not current_df.empty:
+            current_close = float(current_df.iloc[-1]["close"])
+
+        last_high = analysis.get("last_swing_high")
+        last_low = analysis.get("last_swing_low")
+        opposite_level = last_high if signal == "call" else last_low
+        if isinstance(opposite_level, (tuple, list)) and len(opposite_level) >= 2:
+            opposite_level = opposite_level[1]
+
+        atr_value = float(analysis.get("atr") or 0.0)
+        room_value = None
+        room_atr_value = None
+        if current_close is not None and opposite_level is not None:
+            try:
+                room_value = (
+                    float(opposite_level) - current_close
+                    if signal == "call"
+                    else current_close - float(opposite_level)
+                )
+                if atr_value > 0:
+                    room_atr_value = room_value / atr_value
+            except (TypeError, ValueError):
+                pass
+
         telegram_send(
             "🚫 ENTRADA DESCARTADA\n\n"
             f"Par: {pair}\n"
             f"Dirección: {signal.upper()}\n"
-            "El espacio disponible cambió antes de N+1.\n"
+            "El espacio disponible no cumplió el mínimo antes de ejecutar.\n\n"
+            f"Precio actual: {_fmt_price(current_close)}\n"
+            f"Nivel opuesto: {_fmt_price(opposite_level)}\n"
+            f"ATR: {_fmt_price(atr_value)}\n"
+            f"Espacio: {_fmt_price(room_value)}\n"
+            f"Espacio en ATR: {_fmt_price(room_atr_value)}\n"
+            f"Mínimo requerido: {MIN_ROOM_TO_OPPOSITE_ATR:.2f} ATR\n"
+            f"N: {pending.get('continuity_ts')}\n"
+            f"Entrada programada: {pending.get('execution_ts')}\n\n"
             "La entrada no se ejecutará."
         )
         return False
@@ -923,16 +1019,23 @@ def execute_sniper(pair: str, pending: Dict[str, Any]) -> bool:
     with STATE_LOCK:
         PENDING_ENTRY.pop(pair, None)
 
+    pending_analysis = pending.get("analysis") or {}
     telegram_send(
         "✅ FUERZA EJECUTADA\n\n"
         f"Par: {pair}\n"
         f"Dirección: {signal.upper()}\n"
         f"Tipo: {pending.get('entry_type')}\n"
         f"N cierre: {pending.get('continuity_ts')}\n"
-        f"N+1: {execution_ts}\n"
+        f"Entrada programada: {execution_ts}\n"
         f"Reloj IQ: {sent_at:.3f}\n"
-        f"ID: {order_id}\n\n"
-        f"⏳ Expiración: {EXPIRATION} minuto(s)"
+        f"ID: {order_id}\n"
+        f"Precio de cierre N: {_fmt_price(pending.get('close'))}\n\n"
+        f"⏳ Expiración: {EXPIRATION} minuto(s)\n\n"
+        f"Estructura: {pending_analysis.get('structure', 'unknown')}\n"
+        f"ATR: {_fmt_price(pending_analysis.get('atr'))}\n"
+        f"Soporte: {_fmt_price(pending_analysis.get('support'))}\n"
+        f"Resistencia: {_fmt_price(pending_analysis.get('resistance'))}\n"
+        f"Motivos: {pending.get('reason', '')}"
     )
 
     logger.info(
