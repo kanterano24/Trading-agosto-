@@ -73,8 +73,6 @@ ASSETS: List[str] = [
     "GBPUSD",
     "AUDCHF",
     "AUDUSD",
-    "EURTHB",
-    "USDTHB",
 ]
 
 
@@ -146,11 +144,10 @@ def get_telegram_updates(offset: Optional[int]) -> List[Dict[str, Any]]:
         )
         if response.status_code == 409:
             print(
-                "[TELEGRAM] Error 409: hay otra instancia usando getUpdates. "
-                "Detén otros workers/servicios o réplicas y deja solo uno activo."
+                "[TELEGRAM] Error 409: otra instancia está usando getUpdates. "
+                "Detén el proceso duplicado; este proceso dejará de hacer polling."
             )
-            time.sleep(10)
-            return []
+            raise RuntimeError("Telegram 409: polling duplicado detectado.")
 
         response.raise_for_status()
         data = response.json()
@@ -171,7 +168,13 @@ def telegram_command_loop() -> None:
     offset: Optional[int] = None
 
     while True:
-        for update in get_telegram_updates(offset):
+        try:
+            updates = get_telegram_updates(offset)
+        except RuntimeError as exc:
+            print(f"[TELEGRAM] Polling detenido: {exc}")
+            return
+
+        for update in updates:
             offset = int(update["update_id"]) + 1
             message = update.get("message", {})
             chat_id = str(message.get("chat", {}).get("id", ""))
@@ -255,20 +258,12 @@ def connect_iqoption():
 
 
 def asset_is_available(api, asset: str) -> bool:
-    """Evita consultar pares que IQ Option no tiene disponibles."""
-    try:
-        open_time = api.get_all_open_time()
-        for market in ("binary", "turbo", "digital", "forex"):
-            section = open_time.get(market, {}) if isinstance(open_time, dict) else {}
-            info = section.get(asset)
-            if isinstance(info, dict):
-                return bool(info.get("open", False))
-        # Si la API no entrega información para ese mercado, se deja
-        # que get_candles confirme si existe.
-        return True
-    except Exception as exc:
-        print(f"[{asset}] No se pudo verificar disponibilidad: {exc}")
-        return True
+    """
+    No llama a get_all_open_time(): esa función puede activar hilos internos
+    de digitales que fallan con datos None en algunas versiones de iqoptionapi.
+    La disponibilidad se valida de forma práctica al solicitar las velas.
+    """
+    return True
 
 
 def get_closed_candles(api, asset: str) -> List[Dict[str, Any]]:
@@ -400,10 +395,6 @@ def scan_once(api) -> None:
 
     for asset in ASSETS:
         try:
-            if not asset_is_available(api, asset):
-                print(f"[{asset}] No disponible; se omite.")
-                continue
-
             candles = get_closed_candles(api, asset)
             if len(candles) < 30:
                 continue
@@ -411,13 +402,15 @@ def scan_once(api) -> None:
             settle_paper_trades(asset, candles)
 
             signal = analyze_rejection(candles, min_score=MIN_SCORE)
-            # Compatibilidad con versiones antiguas de strategy.py:
-            # algunas devolvían objetos sin candle_time.
+
+            # Compatibilidad con versiones antiguas de strategy.py.
+            signal_action = getattr(signal, "action", "none")
+            signal_score = int(getattr(signal, "score", 0) or 0)
             signal_time = getattr(signal, "candle_time", None)
             if signal_time is None:
                 signal_time = candle_time(candles[-1])
 
-            if signal.action == "none" or signal_time is None:
+            if signal_action == "none" or signal_time is None:
                 continue
 
             with lock:
@@ -425,7 +418,7 @@ def scan_once(api) -> None:
                     continue
                 last_processed_candle[asset] = signal_time
 
-            candidates.append((signal.score, asset, signal, candles))
+            candidates.append((signal_score, asset, signal, candles))
 
         except Exception as exc:
             print(f"[{asset}] Error: {exc}")
