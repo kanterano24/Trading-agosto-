@@ -50,7 +50,7 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 TIMEFRAME = 60
 EXPIRATION = int(os.getenv("EXPIRATION", "1"))
-AMOUNT = float(os.getenv("AMOUNT", "1500"))
+AMOUNT = float(os.getenv("AMOUNT", "1000"))
 
 # Cuenta de IQ Option: PRACTICE o REAL
 ACCOUNT_TYPE = os.getenv("ACCOUNT_TYPE", "PRACTICE").strip().upper()
@@ -62,7 +62,7 @@ CANDLE_COUNT = max(60, int(os.getenv("CANDLE_COUNT", "80")))
 MAX_OTC_PAIRS = max(1, int(os.getenv("MAX_OTC_PAIRS", "50")))
 
 PAIR_REFRESH_SECONDS = 60.0
-SNIPER_POLL = 0.06
+SNIPER_POLL = float(os.getenv("SNIPER_POLL", "0.25"))
 TRADE_COOLDOWN = float(os.getenv("TRADE_COOLDOWN", "60"))
 MIN_HISTORY = 35
 MIN_ROOM_TO_OPPOSITE_ATR = float(os.getenv("MIN_ROOM_TO_OPPOSITE_ATR", "0.90"))
@@ -602,7 +602,7 @@ def revalidate_pending_location(
     valid = room_atr >= MIN_ROOM_TO_OPPOSITE_ATR
 
     logger.info(
-        "%s | revalidacion N+1 | signal=%s | room=%.2f ATR | valido=%s",
+        "%s | revalidacion N+2 | signal=%s | room=%.2f ATR | valido=%s",
         pair,
         signal,
         room_atr,
@@ -621,7 +621,7 @@ def analysis_message(pair: str, ts: int, result: Dict[str, Any]) -> str:
     return (
         "🔎 ANÁLISIS DE FUERZA\n\n"
         f"Par: {pair}\n"
-        f"Vela N: {ts}\n"
+        f"Vela de confirmación N+1: {ts}\n"
         f"Dirección: {result.get('signal')}\n"
         f"Estructura: {analysis.get('structure', 'unknown')}\n"
         f"Fase: {analysis.get('impulse_phase', 'unknown')}\n"
@@ -739,11 +739,11 @@ def analyze_closed_candle(pair: str, expected_closed_ts: int) -> bool:
         f"Score: {score}/100\n"
         f"Calidad: {analysis.get('entry_quality', result.get('entry_quality', 0))}/100\n"
         f"Estructura: {analysis.get('structure', 'unknown')}\n\n"
-        f"Cierre N: {values['close']}\n"
-        f"N cierre: {expected_closed_ts}\n"
-        f"N+1: {execution_ts}\n\n"
-        "🚫 N no se opera.\n"
-        "⚡ Ejecutar únicamente en N+1.\n"
+        f"Cierre N+1: {values['close']}\n"
+        f"Confirmación N+1: {expected_closed_ts}\n"
+        f"Ejecución N+2: {execution_ts}\n\n"
+        "🚫 N y N+1 no se operan.\n"
+        "⚡ Ejecutar únicamente en N+2.\n"
         f"⏳ Expiración: {EXPIRATION} minuto(s)\n\n"
         f"{result.get('reason', '')}"
     )
