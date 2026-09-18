@@ -298,6 +298,9 @@ def analyze_market(
         "pattern": "rejection_with_next_candle_confirmation",
         "structure": swing["name"],
         "structure_confirmed": swing.get("confirmed", False),
+        # Niveles estructurales que utiliza bot.py para revalidar la entrada.
+        "last_swing_high": swing.get("last_pivot_high"),
+        "last_swing_low": swing.get("last_pivot_low"),
         "rejection_detected": rejected,
         "confirmation_checked": True,
         "execution_mode": "after_N_plus_1_close",
