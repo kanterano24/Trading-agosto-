@@ -56,7 +56,7 @@ AMOUNT = float(os.getenv("AMOUNT", "666"))
 ACCOUNT_TYPE = os.getenv("ACCOUNT_TYPE", "PRACTICE").strip().upper()
 
 # Límite total de entradas por ejecución del bot
-MAX_TOTAL_TRADES = 100
+MAX_TOTAL_TRADES = 14
 TOTAL_TRADES = 0
 CANDLE_COUNT = max(60, int(os.getenv("CANDLE_COUNT", "80")))
 MAX_OTC_PAIRS = max(1, int(os.getenv("MAX_OTC_PAIRS", "50")))
