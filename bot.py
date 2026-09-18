@@ -50,13 +50,13 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 TIMEFRAME = 60
 EXPIRATION = int(os.getenv("EXPIRATION", "1"))
-AMOUNT = float(os.getenv("AMOUNT", "150"))
+AMOUNT = float(os.getenv("AMOUNT", "555"))
 
 # Cuenta de IQ Option: PRACTICE o REAL
 ACCOUNT_TYPE = os.getenv("ACCOUNT_TYPE", "PRACTICE").strip().upper()
 
 # Límite total de entradas por ejecución del bot
-MAX_TOTAL_TRADES = 100
+MAX_TOTAL_TRADES = 10
 TOTAL_TRADES = 0
 CANDLE_COUNT = max(60, int(os.getenv("CANDLE_COUNT", "80")))
 MAX_OTC_PAIRS = max(1, int(os.getenv("MAX_OTC_PAIRS", "50")))
@@ -73,8 +73,9 @@ AUTO_START = os.getenv("AUTO_START", "true").strip().lower() in {
     "1", "true", "yes", "on"
 }
 
-# La API publica de strategy.py debe exponer solamente entry_type=force.
+# La estrategia puede devolver rechazo o continuidad filtrada.
 REQUIRE_FORCE = False
+MIN_ACCEPT_SCORE = int(os.getenv("MIN_ACCEPT_SCORE", "76"))
 REQUIRE_N_PLUS_1 = True
 
 
@@ -492,7 +493,13 @@ def is_force_signal(result: Dict[str, Any], signal: Any) -> bool:
     if REQUIRE_FORCE and entry_type != "force":
         return False
 
-    if not REQUIRE_FORCE and entry_type not in {"force", "bb_atr_rsi"}:
+    if not REQUIRE_FORCE and entry_type not in {"force", "rejection", "continuation", "bb_atr_rsi"}:
+        return False
+
+    try:
+        if int(result.get("score", 0) or 0) < MIN_ACCEPT_SCORE:
+            return False
+    except (TypeError, ValueError):
         return False
 
     if REQUIRE_FORCE and analysis.get("force") is False:
@@ -510,13 +517,13 @@ def is_force_signal(result: Dict[str, Any], signal: Any) -> bool:
         if pullback.get("valid") is False:
             return False
 
-        # Ambas confirmaciones son obligatorias cuando el campo existe.
-        for key in (
-            "previous_candle_confirmed",
-            "extreme_confirmed",
-        ):
-            if key in pullback and pullback.get(key) is not True:
-                return False
+        # La confirmación de vela es obligatoria. El extremo solo es
+        # obligatorio para una entrada por rechazo; continuidad no exige
+        # tocar un extremo estructural.
+        if pullback.get("previous_candle_confirmed") is not True:
+            return False
+        if entry_type == "rejection" and pullback.get("extreme_confirmed") is not True:
+            return False
 
     return True
 
@@ -593,7 +600,7 @@ def analysis_message(pair: str, ts: int, result: Dict[str, Any]) -> str:
     analysis = result.get("analysis") or {}
 
     return (
-        "🔎 ANÁLISIS DE FUERZA\n\n"
+        "🔎 ANÁLISIS DE ENTRADA\n\n"
         f"Par: {pair}\n"
         f"Vela N: {ts}\n"
         f"Dirección: {result.get('signal')}\n"
@@ -950,6 +957,40 @@ def process_pair(pair: str) -> None:
     analyze_closed_candle(pair, closed_ts)
 
 
+def _keep_best_pending_per_execution() -> None:
+    """Conserva solo la mejor señal por vela de ejecución entre los pares.
+
+    Esto evita que el bot abra varias operaciones de la misma oportunidad
+    temporal cuando analiza hasta 50 pares OTC.
+    """
+    with STATE_LOCK:
+        grouped: Dict[int, list[tuple[str, Dict[str, Any]]]] = {}
+        for pair, pending in PENDING_ENTRY.items():
+            execution_ts = int(pending.get("execution_ts", 0) or 0)
+            if execution_ts > 0:
+                grouped.setdefault(execution_ts, []).append((pair, pending))
+
+        winners: set[tuple[str, int]] = set()
+        for execution_ts, entries in grouped.items():
+            winner_pair, winner = max(
+                entries, key=lambda item: int(item[1].get("score", 0) or 0)
+            )
+            winners.add((winner_pair, execution_ts))
+            logger.info(
+                "SEÑAL ELEGIDA | N+1=%s | par=%s | score=%s",
+                execution_ts, winner_pair, winner.get("score", 0),
+            )
+
+        for pair, pending in list(PENDING_ENTRY.items()):
+            execution_ts = int(pending.get("execution_ts", 0) or 0)
+            if (pair, execution_ts) not in winners:
+                PENDING_ENTRY.pop(pair, None)
+                logger.info(
+                    "%s | señal descartada por selección global | score=%s",
+                    pair, pending.get("score", 0),
+                )
+
+
 def analyze_all_pairs() -> None:
     if not BOT_RUNNING or trade_limit_reached():
         return
@@ -964,6 +1005,11 @@ def analyze_all_pairs() -> None:
             process_pair(pair)
         except Exception:
             logger.exception("Error procesando %s", pair)
+
+    # Tras analizar todos los pares, conservar la mejor oportunidad de cada
+    # vela de ejecución. La ejecución de las señales existentes ocurre al
+    # comienzo de process_pair(), antes del nuevo análisis.
+    _keep_best_pending_per_execution()
 
 
 # ============================================================
