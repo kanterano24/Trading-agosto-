@@ -313,6 +313,13 @@ def analyze_market(
         "atr": atr,
         "support": support,
         "resistance": resistance,
+        # Nombres compatibles con la revalidacion de bot.py.
+        # Si no existe un pivote confirmado, se usa la zona estructural
+        # calculada como respaldo para no dejar la revalidacion sin nivel.
+        "last_swing_high": swing.get("last_pivot_high") or resistance,
+        "previous_swing_high": swing.get("previous_pivot_high"),
+        "last_swing_low": swing.get("last_pivot_low") or support,
+        "previous_swing_low": swing.get("previous_pivot_low"),
         "tolerance": tolerance,
         "fast_ema": fast,
         "slow_ema": slow,
