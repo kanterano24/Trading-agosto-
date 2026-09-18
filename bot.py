@@ -39,8 +39,17 @@ from strategy import analyze_rejection
 IQ_EMAIL = os.getenv("IQ_EMAIL", "")
 IQ_PASSWORD = os.getenv("IQ_PASSWORD", "")
 
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+# Acepta ambos nombres para evitar errores de configuración en Railway.
+TELEGRAM_BOT_TOKEN = (
+    os.getenv("TELEGRAM_BOT_TOKEN")
+    or os.getenv("TELEGRAM_TOKEN")
+    or ""
+).strip()
+TELEGRAM_CHAT_ID = (
+    os.getenv("TELEGRAM_CHAT_ID")
+    or os.getenv("TELEGRAM_CHATID")
+    or ""
+).strip()
 
 ACCOUNT_TYPE = os.getenv("IQ_ACCOUNT_TYPE", "PRACTICE")
 DRY_RUN = os.getenv("DRY_RUN", "true").lower() == "true"
