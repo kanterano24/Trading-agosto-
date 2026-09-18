@@ -329,6 +329,12 @@ def analyze_market(
         "confirmation_candle": confirmation,
         "confirmation_body_ratio": confirmation["body_ratio"],
         "confirmation_close_position": confirmation["close_position"],
+        "confirmation_strength": (
+            "strong" if confirmation["body_ratio"] >= 0.45 and (
+                (direction == "call" and confirmation["close_position"] >= 0.75) or
+                (direction == "put" and confirmation["close_position"] <= 0.25)
+            ) else "normal"
+        ),
         "rejection_timestamp": int(data.iloc[-2]["from"]) if "from" in data.columns else None,
         "confirmation_timestamp": int(data.iloc[-1]["from"]) if "from" in data.columns else None,
         "force": True,
@@ -371,6 +377,8 @@ def analyze_market(
             analysis["blocked_reason"] = "ema_context_not_aligned"
             return _empty("contexto_ema_no_alineado", analysis)
 
+    # Puntuación explicable: parte de 90 solo después de pasar todos los filtros.
+    # Los puntos adicionales permiten estudiar qué confirmaciones aportan más valor.
     score = 90
     reasons = rejection_reasons + [swing["name"]] + confirmation_reasons
 
