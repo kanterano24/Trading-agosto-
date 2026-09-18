@@ -35,6 +35,13 @@ LOOKBACK = 60
 SWING_LOOKBACK = 18
 ZONE_ATR_FACTOR = 0.30
 MIN_SCORE = 90
+# Confirmación estricta para evitar entradas con N+1 débil.
+MIN_CONFIRMATION_BODY_RATIO = 0.35
+MIN_CONFIRMATION_CLOSE_POSITION_CALL = 0.65
+MAX_CONFIRMATION_CLOSE_POSITION_PUT = 0.35
+# La señal debe coincidir con el contexto EMA para reducir CALL contra tendencia bajista
+# y PUT contra tendencia alcista.
+REQUIRE_CONTEXT_ALIGNMENT = True
 EPS = 1e-10
 
 
@@ -298,9 +305,6 @@ def analyze_market(
         "pattern": "rejection_with_next_candle_confirmation",
         "structure": swing["name"],
         "structure_confirmed": swing.get("confirmed", False),
-        # Niveles estructurales que utiliza bot.py para revalidar la entrada.
-        "last_swing_high": swing.get("last_pivot_high"),
-        "last_swing_low": swing.get("last_pivot_low"),
         "rejection_detected": rejected,
         "confirmation_checked": True,
         "execution_mode": "after_N_plus_1_close",
@@ -316,6 +320,8 @@ def analyze_market(
         "bearish_context": bearish_context,
         "rejection_candle": rejection,
         "confirmation_candle": confirmation,
+        "confirmation_body_ratio": confirmation["body_ratio"],
+        "confirmation_close_position": confirmation["close_position"],
         "rejection_timestamp": int(data.iloc[-2]["from"]) if "from" in data.columns else None,
         "confirmation_timestamp": int(data.iloc[-1]["from"]) if "from" in data.columns else None,
         "force": True,
@@ -337,6 +343,26 @@ def analyze_market(
     )
     if not confirmed:
         return _empty("N_plus_1_did_not_confirm_direction", analysis)
+
+    # N+1 debe tener cuerpo suficiente y cerrar cerca del extremo de su rango.
+    # Esto evita confirmar CALL/PUT con velas débiles o con rechazo contrario.
+    if confirmation["body_ratio"] < MIN_CONFIRMATION_BODY_RATIO:
+        analysis["blocked_reason"] = "confirmation_body_too_small"
+        return _empty("N_plus_1_body_too_small", analysis)
+
+    if direction == "call" and confirmation["close_position"] < MIN_CONFIRMATION_CLOSE_POSITION_CALL:
+        analysis["blocked_reason"] = "call_confirmation_close_too_low"
+        return _empty("N_plus_1_call_close_not_strong", analysis)
+
+    if direction == "put" and confirmation["close_position"] > MAX_CONFIRMATION_CLOSE_POSITION_PUT:
+        analysis["blocked_reason"] = "put_confirmation_close_too_high"
+        return _empty("N_plus_1_put_close_not_strong", analysis)
+
+    if REQUIRE_CONTEXT_ALIGNMENT:
+        context_aligned = (direction == "call" and bullish_context) or (direction == "put" and bearish_context)
+        if not context_aligned:
+            analysis["blocked_reason"] = "ema_context_not_aligned"
+            return _empty("contexto_ema_no_alineado", analysis)
 
     score = 90
     reasons = rejection_reasons + [swing["name"]] + confirmation_reasons
