@@ -145,9 +145,9 @@ def get_telegram_updates(offset: Optional[int]) -> List[Dict[str, Any]]:
         if response.status_code == 409:
             print(
                 "[TELEGRAM] Error 409: otra instancia está usando getUpdates. "
-                "Detén el proceso duplicado; este proceso dejará de hacer polling."
+                "Detén el proceso duplicado en Railway/otro servidor."
             )
-            raise RuntimeError("Telegram 409: polling duplicado detectado.")
+            return []
 
         response.raise_for_status()
         data = response.json()
@@ -246,6 +246,25 @@ def connect_iqoption():
 
     if not IQ_EMAIL or not IQ_PASSWORD:
         raise RuntimeError("Configura IQ_EMAIL e IQ_PASSWORD.")
+
+    # Algunas versiones de iqoptionapi lanzan un hilo interno para
+    # digitales que falla cuando la respuesta del servidor es None.
+    # Este parche evita que ese hilo intente indexar None.
+    original_digital_data = IQ_Option.get_digital_underlying_list_data
+
+    def safe_digital_data(self):
+        try:
+            result = original_digital_data(self)
+            if not isinstance(result, dict):
+                return {"underlying": []}
+            if not isinstance(result.get("underlying"), list):
+                result["underlying"] = []
+            return result
+        except Exception as exc:
+            print(f"[IQ] Datos digitales no disponibles; se omiten: {exc}")
+            return {"underlying": []}
+
+    IQ_Option.get_digital_underlying_list_data = safe_digital_data
 
     api = IQ_Option(IQ_EMAIL, IQ_PASSWORD)
     connected, reason = api.connect()
