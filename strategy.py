@@ -1,10 +1,10 @@
-"""Estrategia CONTINUIDAD FILTRADA + RECHAZO + ESPACIO.
+"""Estrategia de rechazo estructural para Binary OTC M1.
 
-Interfaz compatible con el bot:
+Interfaz compatible con bot (1).py vv2:
     analyze_market(candle_1m=..., previous_m1=..., pair=...)
 
-La estrategia solo analiza la vela N cerrada. El bot ejecuta exclusivamente
-la señal preparada en N durante la apertura de N+1.
+Solo se consideran velas cerradas. La señal se prepara en N y el motor
+vv2 la ejecuta en la apertura de N+1.
 """
 from __future__ import annotations
 
@@ -16,21 +16,19 @@ import pandas as pd
 
 MIN_BARS = 35
 MAX_CANDLES = 120
-FORCE_PERIOD = 10
-FORCE_PERCENT = 120.0
-WICK_PERCENT = 50.0
-MIN_REJECTION_WICK_RATIO = 0.35
-MIN_CLOSE_POSITION = 0.70
-MIN_ROOM_ATR = 0.90
-SWING_LOOKBACK = 8
-MAX_SIGNAL_BODY_ATR = 1.35
+ATR_PERIOD = 14
+EMA_FAST = 8
+EMA_SLOW = 21
+LOOKBACK = 60
+ZONE_ATR_FACTOR = 0.30
+MIN_SCORE = 90
 EPS = 1e-10
 
 
 def _safe_float(value: Any, default: float = 0.0) -> float:
     try:
-        result = float(value)
-        return result if math.isfinite(result) else default
+        number = float(value)
+        return number if math.isfinite(number) else default
     except (TypeError, ValueError):
         return default
 
@@ -41,10 +39,10 @@ def _normalize(df: Optional[pd.DataFrame]) -> pd.DataFrame:
     out = df.copy()
     out.rename(columns={"max": "high", "min": "low", "timestamp": "from"}, inplace=True)
     required = ["open", "high", "low", "close"]
-    if any(col not in out.columns for col in required):
+    if any(column not in out.columns for column in required):
         return pd.DataFrame()
-    for col in required:
-        out[col] = pd.to_numeric(out[col], errors="coerce")
+    for column in required:
+        out[column] = pd.to_numeric(out[column], errors="coerce")
     if "from" in out.columns:
         out["from"] = pd.to_numeric(out["from"], errors="coerce")
         out.dropna(subset=["from"], inplace=True)
@@ -72,85 +70,41 @@ def _build_dataframe(candle_1m: Any, previous_m1: Optional[pd.DataFrame], df: Op
 
 
 def _true_range(data: pd.DataFrame) -> pd.Series:
-    prev_close = data["close"].shift(1)
+    previous_close = data["close"].shift(1)
     return pd.concat(
         [
             data["high"] - data["low"],
-            (data["high"] - prev_close).abs(),
-            (data["low"] - prev_close).abs(),
+            (data["high"] - previous_close).abs(),
+            (data["low"] - previous_close).abs(),
         ], axis=1,
     ).max(axis=1)
 
 
 def _metrics(row: pd.Series) -> Dict[str, float]:
-    o = _safe_float(row.get("open"))
-    h = _safe_float(row.get("high"))
-    l = _safe_float(row.get("low"))
-    c = _safe_float(row.get("close"))
-    rng = max(h - l, EPS)
-    body = abs(c - o)
+    open_price = _safe_float(row.get("open"))
+    high = _safe_float(row.get("high"))
+    low = _safe_float(row.get("low"))
+    close = _safe_float(row.get("close"))
+    candle_range = max(high - low, EPS)
+    body = abs(close - open_price)
     return {
-        "open": o,
-        "high": h,
-        "low": l,
-        "close": c,
-        "range": rng,
+        "open": open_price,
+        "high": high,
+        "low": low,
+        "close": close,
+        "range": candle_range,
         "body": body,
-        "upper": max(h - max(o, c), 0.0),
-        "lower": max(min(o, c) - l, 0.0),
-        "close_position": (c - l) / rng,
-        "body_ratio": body / rng,
+        "upper": max(high - max(open_price, close), 0.0),
+        "lower": max(min(open_price, close) - low, 0.0),
+        "close_position": (close - low) / candle_range,
+        "body_ratio": body / candle_range,
     }
 
 
-def _is_bullish(m: Dict[str, float]) -> bool:
-    return m["close"] > m["open"]
-
-
-def _is_bearish(m: Dict[str, float]) -> bool:
-    return m["close"] < m["open"]
-
-
-def _continuation(data: pd.DataFrame, index: int, direction: str, average_body: pd.Series) -> bool:
-    if index <= 0 or index >= len(data):
-        return False
-    current = _metrics(data.iloc[index])
-    previous = _metrics(data.iloc[index - 1])
-    avg = _safe_float(average_body.iloc[index], 0.0)
-    if avg <= 0.0:
-        return False
-    strong = current["body"] >= avg * FORCE_PERCENT / 100.0
-    controlled_upper = current["upper"] <= current["body"] * WICK_PERCENT / 100.0
-    controlled_lower = current["lower"] <= current["body"] * WICK_PERCENT / 100.0
-    if direction == "bullish":
-        return (
-            _is_bullish(current)
-            and _is_bullish(previous)
-            and strong
-            and current["close"] > previous["high"]
-            and controlled_upper
-        )
-    return (
-        _is_bearish(current)
-        and _is_bearish(previous)
-        and strong
-        and current["close"] < previous["low"]
-        and controlled_lower
-    )
-
-
-def _rejection(metrics: Dict[str, float], side: str) -> bool:
-    if side == "call":
-        return (
-            metrics["lower"] / metrics["range"] >= MIN_REJECTION_WICK_RATIO
-            and metrics["close_position"] >= MIN_CLOSE_POSITION
-            and metrics["close"] >= metrics["open"]
-        )
-    return (
-        metrics["upper"] / metrics["range"] >= MIN_REJECTION_WICK_RATIO
-        and metrics["close_position"] <= 1.0 - MIN_CLOSE_POSITION
-        and metrics["close"] <= metrics["open"]
-    )
+def _ema(values: pd.Series, period: int) -> float:
+    if values.empty:
+        return 0.0
+    return _safe_float(values.ewm(span=period, adjust=False).mean().iloc[-1])
 
 
 def _empty(reason: str, analysis: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
@@ -178,102 +132,116 @@ def analyze_market(
         return _empty(f"Historial insuficiente {len(data)}/{MIN_BARS}")
 
     data = data.copy()
-    data["body"] = (data["close"] - data["open"]).abs()
     data["tr"] = _true_range(data)
-    data["atr"] = data["tr"].rolling(14, min_periods=14).mean()
-    data["avg_body"] = data["body"].rolling(FORCE_PERIOD, min_periods=FORCE_PERIOD).mean()
-
-    if not math.isfinite(_safe_float(data.iloc[-1]["atr"], np.nan)):
+    data["atr"] = data["tr"].rolling(ATR_PERIOD, min_periods=ATR_PERIOD).mean()
+    atr = _safe_float(data.iloc[-1]["atr"], 0.0)
+    if atr <= 0.0:
         return _empty("ATR insuficiente")
 
-    # El patrón termina en la vela N cerrada: c1, c2, c3.
-    c1_i, c2_i, c3_i = len(data) - 3, len(data) - 2, len(data) - 1
-    c1 = _metrics(data.iloc[c1_i])
-    c2 = _metrics(data.iloc[c2_i])
-    c3 = _metrics(data.iloc[c3_i])
-    atr = _safe_float(data.iloc[c3_i]["atr"], 0.0)
-    avg_body = data["avg_body"]
+    candle = _metrics(data.iloc[-1])
+    previous = data.iloc[:-1]
+    support = _safe_float(previous["low"].tail(LOOKBACK).min())
+    resistance = _safe_float(previous["high"].tail(LOOKBACK).max())
+    tolerance = max(atr * ZONE_ATR_FACTOR, candle["range"] * 0.10)
 
-    c1_sell = _continuation(data, c1_i, "bearish", avg_body)
-    c1_buy = _continuation(data, c1_i, "bullish", avg_body)
-    c3_sell = _continuation(data, c3_i, "bearish", avg_body)
-    c3_buy = _continuation(data, c3_i, "bullish", avg_body)
-    c2_has_signal = _continuation(data, c2_i, "bullish", avg_body) or _continuation(data, c2_i, "bearish", avg_body)
+    near_support = candle["low"] <= support + tolerance and candle["close"] > support
+    near_resistance = candle["high"] >= resistance - tolerance and candle["close"] < resistance
 
-    lookback = data.iloc[max(0, c1_i - SWING_LOOKBACK):c1_i]
-    if lookback.empty:
-        lookback = data.iloc[:c1_i]
-    swing_high = float(lookback["high"].max())
-    swing_low = float(lookback["low"].min())
+    fast = _ema(previous["close"].tail(30), EMA_FAST)
+    slow = _ema(previous["close"].tail(30), EMA_SLOW)
+    bullish_context = fast >= slow
+    bearish_context = fast <= slow
 
-    call_rejection = _rejection(c3, "call")
-    put_rejection = _rejection(c3, "put")
-    call_room = (swing_high - c3["close"]) / atr if atr > 0 else 0.0
-    put_room = (c3["close"] - swing_low) / atr if atr > 0 else 0.0
-    not_extended = c3["body"] / atr <= MAX_SIGNAL_BODY_ATR if atr > 0 else False
+    bullish = (
+        near_support
+        and candle["lower"] >= max(candle["body"] * 1.40, atr * 0.20)
+        and candle["close"] > candle["open"]
+        and candle["close_position"] >= 0.62
+        and candle["body_ratio"] <= 0.65
+    )
+    bearish = (
+        near_resistance
+        and candle["upper"] >= max(candle["body"] * 1.40, atr * 0.20)
+        and candle["close"] < candle["open"]
+        and (candle["high"] - candle["close"]) / candle["range"] >= 0.62
+        and candle["body_ratio"] <= 0.65
+    )
 
     analysis = {
         "pair": pair,
-        "force": False,
-        "pattern": "1-2-3-4",
+        "pattern": "support_resistance_rejection",
         "execution_mode": "next_candle",
-        "strict_rejection_filter": True,
-        "min_rejection_wick_ratio": MIN_REJECTION_WICK_RATIO,
-        "min_close_position": MIN_CLOSE_POSITION,
-        "expiration_minutes": 3,
+        "expiration_minutes": 1,
         "atr": atr,
-        "last_swing_high": swing_high,
-        "last_swing_low": swing_low,
-        "candle_1": c1,
-        "candle_2": c2,
-        "candle_3": c3,
-        "c1_sell_continuation": c1_sell,
-        "c1_buy_continuation": c1_buy,
-        "c2_has_signal": c2_has_signal,
-        "c3_sell_continuation": c3_sell,
-        "c3_buy_continuation": c3_buy,
-        "call_rejection": call_rejection,
-        "put_rejection": put_rejection,
-        "call_room_atr": call_room,
-        "put_room_atr": put_room,
-        "body_atr_ratio": c3["body"] / atr if atr > 0 else math.inf,
-        "structure": "bullish" if c3_buy else "bearish" if c3_sell else "mixed",
-        "impulse_phase": "confirmed_pattern" if not c2_has_signal else "blocked_intermediate_signal",
+        "last_swing_high": resistance,
+        "last_swing_low": support,
+        "support": support,
+        "resistance": resistance,
+        "bullish_context": bullish_context,
+        "bearish_context": bearish_context,
+        "candle": candle,
+        "force": True,
     }
 
-    if c2_has_signal:
-        return _empty("Descartada: la vela 2 tiene señal de continuidad", analysis)
+    if bullish:
+        score = 76
+        reasons = ["bullish_support_rejection"]
+        if candle["lower"] >= candle["body"] * 2.0:
+            score += 7
+            reasons.append("long_lower_wick")
+        if bullish_context:
+            score += 5
+            reasons.append("ema_context")
+        if candle["close"] > support + tolerance * 0.25:
+            score += 5
+            reasons.append("close_above_support")
+        if candle["body_ratio"] <= 0.45:
+            score += 7
+            reasons.append("controlled_body")
+        if score >= MIN_SCORE:
+            return {
+                "signal": "call",
+                "direction": "bullish",
+                "score": min(score, 100),
+                "entry_quality": min(score, 100),
+                "entry_type": "force",
+                "blocked": False,
+                "reason": ",".join(reasons) + " | N cerrada / ejecución N+1",
+                "signal_price": candle["close"],
+                "candle_timestamp": int(data.iloc[-1]["from"]) if "from" in data.columns else None,
+                "analysis": analysis,
+            }
 
-    candidates = []
-    if c1_sell and c3_buy and call_rejection and call_room >= MIN_ROOM_ATR and not_extended:
-        score = 100
-        candidates.append((score, "call", "CALL: VEN en vela 1 + vela 2 limpia + COM en vela 3 + rechazo + espacio"))
-    if c1_buy and c3_sell and put_rejection and put_room >= MIN_ROOM_ATR and not_extended:
-        score = 100
-        candidates.append((score, "put", "PUT: COM en vela 1 + vela 2 limpia + VEN en vela 3 + rechazo + espacio"))
+    if bearish:
+        score = 76
+        reasons = ["bearish_resistance_rejection"]
+        if candle["upper"] >= candle["body"] * 2.0:
+            score += 7
+            reasons.append("long_upper_wick")
+        if bearish_context:
+            score += 5
+            reasons.append("ema_context")
+        if candle["close"] < resistance - tolerance * 0.25:
+            score += 5
+            reasons.append("close_below_resistance")
+        if candle["body_ratio"] <= 0.45:
+            score += 7
+            reasons.append("controlled_body")
+        if score >= MIN_SCORE:
+            return {
+                "signal": "put",
+                "direction": "bearish",
+                "score": min(score, 100),
+                "entry_quality": min(score, 100),
+                "entry_type": "force",
+                "blocked": False,
+                "reason": ",".join(reasons) + " | N cerrada / ejecución N+1",
+                "signal_price": candle["close"],
+                "candle_timestamp": int(data.iloc[-1]["from"]) if "from" in data.columns else None,
+                "analysis": analysis,
+            }
 
-    if not candidates:
-        return _empty("Sin patrón válido: continuidad + vela intermedia limpia + rechazo + espacio", analysis)
-
-    score, signal, reason = candidates[0]
-    analysis["force"] = True
-    analysis["pullback"] = {
-        "valid": True,
-        "previous_candle_confirmed": True,
-        "extreme_confirmed": True,
-    }
-    return {
-        "signal": signal,
-        "direction": "bullish" if signal == "call" else "bearish",
-        "score": score,
-        "entry_quality": score,
-        "entry_type": "force",
-        "blocked": False,
-        "reason": reason + " | rechazo estricto en C3 | N cerrada / ejecución N+1",
-        "signal_price": c3["close"],
-        "candle_timestamp": int(data.iloc[c3_i]["from"]) if "from" in data.columns else None,
-        "analysis": analysis,
-    }
+    return _empty("no_valid_rejection_or_score_below_90", analysis)
 
 
 def get_signal(df: pd.DataFrame) -> Optional[str]:
@@ -285,4 +253,4 @@ def signal(df: pd.DataFrame) -> Optional[str]:
 
 
 if __name__ == "__main__":
-    print("strategy.py cargado correctamente: continuidad filtrada + rechazo + espacio")
+    print("strategy.py cargado: rechazo soporte/resistencia, score mínimo 90, ejecución N+1")
