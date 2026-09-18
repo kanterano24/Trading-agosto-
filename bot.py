@@ -145,9 +145,9 @@ def get_telegram_updates(offset: Optional[int]) -> List[Dict[str, Any]]:
         if response.status_code == 409:
             print(
                 "[TELEGRAM] Error 409: otra instancia está usando getUpdates. "
-                "Detén el proceso duplicado en Railway/otro servidor."
+                "El polling de esta instancia se detendrá."
             )
-            return []
+            raise RuntimeError("Telegram 409: polling duplicado detectado.")
 
         response.raise_for_status()
         data = response.json()
@@ -247,25 +247,6 @@ def connect_iqoption():
     if not IQ_EMAIL or not IQ_PASSWORD:
         raise RuntimeError("Configura IQ_EMAIL e IQ_PASSWORD.")
 
-    # Algunas versiones de iqoptionapi lanzan un hilo interno para
-    # digitales que falla cuando la respuesta del servidor es None.
-    # Este parche evita que ese hilo intente indexar None.
-    original_digital_data = IQ_Option.get_digital_underlying_list_data
-
-    def safe_digital_data(self):
-        try:
-            result = original_digital_data(self)
-            if not isinstance(result, dict):
-                return {"underlying": []}
-            if not isinstance(result.get("underlying"), list):
-                result["underlying"] = []
-            return result
-        except Exception as exc:
-            print(f"[IQ] Datos digitales no disponibles; se omiten: {exc}")
-            return {"underlying": []}
-
-    IQ_Option.get_digital_underlying_list_data = safe_digital_data
-
     api = IQ_Option(IQ_EMAIL, IQ_PASSWORD)
     connected, reason = api.connect()
 
@@ -278,9 +259,10 @@ def connect_iqoption():
 
 def asset_is_available(api, asset: str) -> bool:
     """
-    No llama a get_all_open_time(): esa función puede activar hilos internos
-    de digitales que fallan con datos None en algunas versiones de iqoptionapi.
-    La disponibilidad se valida de forma práctica al solicitar las velas.
+    No llama a get_all_open_time().
+    En algunas versiones de iqoptionapi esa llamada inicia el hilo de
+    digitales y puede producir: NoneType is not subscriptable.
+    La disponibilidad real se comprueba al solicitar las velas.
     """
     return True
 
@@ -421,8 +403,8 @@ def scan_once(api) -> None:
             settle_paper_trades(asset, candles)
 
             signal = analyze_rejection(candles, min_score=MIN_SCORE)
-
-            # Compatibilidad con versiones antiguas de strategy.py.
+            # Compatibilidad con versiones antiguas de strategy.py:
+            # algunas devolvían objetos sin candle_time.
             signal_action = getattr(signal, "action", "none")
             signal_score = int(getattr(signal, "score", 0) or 0)
             signal_time = getattr(signal, "candle_time", None)
