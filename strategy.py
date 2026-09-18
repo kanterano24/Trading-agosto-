@@ -1,23 +1,29 @@
-"""Estrategia de rechazo estructural para Binary OTC M1.
+"""strategy.py
 
-Interfaz compatible con bot vv2:
+Estrategia de rechazo + confirmacion para Binary OTC M1.
+
+Flujo obligatorio:
+    N   = vela de rechazo cerrada.
+    N+1 = vela de confirmacion cerrada.
+    N+2 = primera vela en la que el bot puede ejecutar con esta logica.
+
+IMPORTANTE:
+- No se genera una senal solamente porque exista una vela de rechazo.
+- CALL: rechazo en soporte y N+1 confirma con vela alcista.
+- PUT: rechazo en resistencia y N+1 confirma con vela bajista.
+- Para una confirmacion fuerte, N+1 debe cerrar por encima del maximo de N
+  (CALL) o por debajo del minimo de N (PUT).
+- Se bloquea cualquier estructura desconocida.
+- Esta estrategia no garantiza ganancias; probar primero en DEMO.
+
+Interfaz compatible con vv2:
     analyze_market(candle_1m=..., previous_m1=..., pair=...)
-
-Reglas principales:
-- Solo se analizan velas cerradas.
-- La señal se prepara en N y se ejecuta en N+1.
-- Solo se permiten estructuras explícitas de rechazo:
-    * bearish_to_bullish_rejection: rechazo de soporte para CALL.
-    * bullish_to_bearish_rejection: rechazo de resistencia para PUT.
-- Cualquier estructura no identificada (unknown) queda bloqueada.
-- El score mínimo es 90.
 """
 from __future__ import annotations
 
 import math
 from typing import Any, Dict, Optional, Tuple
 
-import numpy as np
 import pandas as pd
 
 MIN_BARS = 35
@@ -32,9 +38,6 @@ MIN_SCORE = 90
 EPS = 1e-10
 
 
-# ---------------------------------------------------------------------------
-# Utilidades
-# ---------------------------------------------------------------------------
 def _safe_float(value: Any, default: float = 0.0) -> float:
     try:
         number = float(value)
@@ -145,26 +148,16 @@ def _empty(reason: str, analysis: Optional[Dict[str, Any]] = None) -> Dict[str, 
     }
 
 
-# ---------------------------------------------------------------------------
-# Filtro estructural
-# ---------------------------------------------------------------------------
 def _swing_structure(data: pd.DataFrame, support: float, resistance: float) -> Dict[str, Any]:
-    """Devuelve una estructura explícita o unknown.
-
-    Se buscan pivotes simples de 3 velas en el tramo reciente. La estructura
-    solo se acepta cuando existe un extremo reciente que haya sido rechazado:
-      - LL/HL cerca del soporte para una reacción alcista.
-      - HH/LH cerca de la resistencia para una reacción bajista.
-    """
     if len(data) < 7:
         return {"name": "unknown", "confirmed": False, "reason": "few_bars"}
 
     recent = data.tail(SWING_LOOKBACK).reset_index(drop=True)
     highs = recent["high"].to_numpy(dtype=float)
     lows = recent["low"].to_numpy(dtype=float)
-
     pivot_highs = []
     pivot_lows = []
+
     for i in range(1, len(recent) - 1):
         if highs[i] >= highs[i - 1] and highs[i] >= highs[i + 1]:
             pivot_highs.append((i, highs[i]))
@@ -185,69 +178,82 @@ def _swing_structure(data: pd.DataFrame, support: float, resistance: float) -> D
         "previous_pivot_high": previous_high[1] if previous_high else None,
     }
 
-    if last_low and previous_low:
-        if abs(last_low[1] - support) <= max(abs(resistance - support) * 0.20, EPS):
-            if last_low[1] < previous_low[1]:
-                result.update(name="LL_support_rejection", confirmed=True)
-            elif last_low[1] > previous_low[1]:
-                result.update(name="HL_support_rejection", confirmed=True)
+    zone_width = max(abs(resistance - support) * 0.20, EPS)
+    if last_low and previous_low and abs(last_low[1] - support) <= zone_width:
+        if last_low[1] < previous_low[1]:
+            result.update(name="LL_support_rejection", confirmed=True)
+        elif last_low[1] > previous_low[1]:
+            result.update(name="HL_support_rejection", confirmed=True)
 
-    if last_high and previous_high:
-        if abs(last_high[1] - resistance) <= max(abs(resistance - support) * 0.20, EPS):
-            if last_high[1] > previous_high[1]:
-                result.update(name="HH_resistance_rejection", confirmed=True)
-            elif last_high[1] < previous_high[1]:
-                result.update(name="LH_resistance_rejection", confirmed=True)
+    if last_high and previous_high and abs(last_high[1] - resistance) <= zone_width:
+        if last_high[1] > previous_high[1]:
+            result.update(name="HH_resistance_rejection", confirmed=True)
+        elif last_high[1] < previous_high[1]:
+            result.update(name="LH_resistance_rejection", confirmed=True)
 
     return result
 
 
-def _rejection_structure(
+def _rejection_side(
     candle: Dict[str, float],
     support: float,
     resistance: float,
     tolerance: float,
-    bullish_context: bool,
-    bearish_context: bool,
-    swing: Dict[str, Any],
 ) -> Tuple[str, bool, list[str]]:
-    """Autoriza exclusivamente estructuras de rechazo completas."""
     near_support = candle["low"] <= support + tolerance and candle["close"] > support
     near_resistance = candle["high"] >= resistance - tolerance and candle["close"] < resistance
 
-    bullish_candle = (
+    bullish_rejection = (
         near_support
         and candle["lower"] >= max(candle["body"] * 1.40, EPS)
-        and candle["close"] > candle["open"]
-        and candle["close_position"] >= 0.62
-        and candle["body_ratio"] <= 0.65
+        and candle["close_position"] >= 0.60
+        and candle["body_ratio"] <= 0.70
     )
-    bearish_candle = (
+    bearish_rejection = (
         near_resistance
         and candle["upper"] >= max(candle["body"] * 1.40, EPS)
-        and candle["close"] < candle["open"]
-        and candle["close_position"] <= 0.38
-        and candle["body_ratio"] <= 0.65
+        and candle["close_position"] <= 0.40
+        and candle["body_ratio"] <= 0.70
     )
 
-    if bullish_candle and (bullish_context or swing["name"] in {"LL_support_rejection", "HL_support_rejection"}):
-        reasons = ["bearish_to_bullish_rejection", "support_reclaimed"]
-        if swing["name"] != "unknown":
-            reasons.append(swing["name"])
-        return "bearish_to_bullish_rejection", True, reasons
-
-    if bearish_candle and (bearish_context or swing["name"] in {"HH_resistance_rejection", "LH_resistance_rejection"}):
-        reasons = ["bullish_to_bearish_rejection", "resistance_reclaimed_down"]
-        if swing["name"] != "unknown":
-            reasons.append(swing["name"])
-        return "bullish_to_bearish_rejection", True, reasons
-
+    if bullish_rejection:
+        return "call", True, ["bullish_support_rejection", "close_above_support"]
+    if bearish_rejection:
+        return "put", True, ["bearish_resistance_rejection", "close_below_resistance"]
     return "unknown", False, []
 
 
-# ---------------------------------------------------------------------------
-# Análisis principal
-# ---------------------------------------------------------------------------
+def _confirm_next_candle(
+    direction: str,
+    rejection: Dict[str, float],
+    confirmation: Dict[str, float],
+) -> Tuple[bool, list[str]]:
+    """Confirma la direccion usando la vela posterior ya cerrada."""
+    reasons: list[str] = []
+
+    if direction == "call":
+        bullish = confirmation["close"] > confirmation["open"]
+        closes_above_rejection = confirmation["close"] > rejection["high"]
+        holds_rejection = confirmation["close"] > rejection["close"]
+        if bullish and holds_rejection:
+            reasons.append("next_candle_bullish_confirmation")
+            if closes_above_rejection:
+                reasons.append("close_above_rejection_high")
+            return True, reasons
+
+    if direction == "put":
+        bearish = confirmation["close"] < confirmation["open"]
+        closes_below_rejection = confirmation["close"] < rejection["low"]
+        holds_rejection = confirmation["close"] < rejection["close"]
+        if bearish and holds_rejection:
+            reasons.append("next_candle_bearish_confirmation")
+            if closes_below_rejection:
+                reasons.append("close_below_rejection_low")
+            return True, reasons
+
+    return False, []
+
+
 def analyze_market(
     df: Optional[pd.DataFrame] = None,
     candle_1m: Any = None,
@@ -266,39 +272,38 @@ def analyze_market(
     if atr <= 0.0:
         return _empty("ATR insuficiente")
 
-    candle = _metrics(data.iloc[-1])
-    previous = data.iloc[:-1]
-    support = _safe_float(previous["low"].tail(LOOKBACK).min())
-    resistance = _safe_float(previous["high"].tail(LOOKBACK).max())
-    tolerance = max(atr * ZONE_ATR_FACTOR, candle["range"] * 0.10)
+    # La ultima vela es N+1, y la anterior es N (rechazo).
+    rejection = _metrics(data.iloc[-2])
+    confirmation = _metrics(data.iloc[-1])
+    context_data = data.iloc[:-2]
+    if len(context_data) < 10:
+        return _empty("Contexto insuficiente para soporte/resistencia")
 
-    fast = _ema(previous["close"].tail(30), EMA_FAST)
-    slow = _ema(previous["close"].tail(30), EMA_SLOW)
+    support = _safe_float(context_data["low"].tail(LOOKBACK).min())
+    resistance = _safe_float(context_data["high"].tail(LOOKBACK).max())
+    tolerance = max(atr * ZONE_ATR_FACTOR, rejection["range"] * 0.10)
+
+    fast = _ema(context_data["close"].tail(30), EMA_FAST)
+    slow = _ema(context_data["close"].tail(30), EMA_SLOW)
     bullish_context = fast > slow
     bearish_context = fast < slow
 
-    swing = _swing_structure(previous, support, resistance)
-    structure, confirmed, structure_reasons = _rejection_structure(
-        candle=candle,
-        support=support,
-        resistance=resistance,
-        tolerance=tolerance,
-        bullish_context=bullish_context,
-        bearish_context=bearish_context,
-        swing=swing,
+    swing = _swing_structure(context_data, support, resistance)
+    direction, rejected, rejection_reasons = _rejection_side(
+        rejection, support, resistance, tolerance
     )
 
     analysis = {
         "pair": pair,
-        "pattern": "structural_rejection_only",
-        "structure": structure,
-        "structure_confirmed": confirmed,
-        "swing_structure": swing,
-        "execution_mode": "next_candle",
+        "pattern": "rejection_with_next_candle_confirmation",
+        "structure": swing["name"],
+        "structure_confirmed": swing.get("confirmed", False),
+        "rejection_detected": rejected,
+        "confirmation_checked": True,
+        "execution_mode": "after_N_plus_1_close",
+        "execution_candle": "N+2",
         "expiration_minutes": 1,
         "atr": atr,
-        "last_swing_high": resistance,
-        "last_swing_low": support,
         "support": support,
         "resistance": resistance,
         "tolerance": tolerance,
@@ -306,69 +311,65 @@ def analyze_market(
         "slow_ema": slow,
         "bullish_context": bullish_context,
         "bearish_context": bearish_context,
-        "candle": candle,
+        "rejection_candle": rejection,
+        "confirmation_candle": confirmation,
+        "rejection_timestamp": int(data.iloc[-2]["from"]) if "from" in data.columns else None,
+        "confirmation_timestamp": int(data.iloc[-1]["from"]) if "from" in data.columns else None,
         "force": True,
     }
 
-    # Bloqueo duro: jamás enviar una señal con estructura unknown.
-    if not confirmed or structure == "unknown":
-        return _empty("unknown_or_unconfirmed_rejection_structure", analysis)
+    allowed_structures = {
+        "call": {"LL_support_rejection", "HL_support_rejection"},
+        "put": {"HH_resistance_rejection", "LH_resistance_rejection"},
+    }
 
-    score = 76
-    reasons = list(structure_reasons)
+    if not rejected or direction == "unknown":
+        return _empty("no_valid_rejection_on_N", analysis)
 
-    if candle["lower"] >= candle["body"] * 2.0 or candle["upper"] >= candle["body"] * 2.0:
-        score += 7
-        reasons.append("long_rejection_wick")
+    if swing["name"] not in allowed_structures[direction]:
+        return _empty("structure_not_allowed_or_unknown", analysis)
 
-    if bullish_context or bearish_context:
+    confirmed, confirmation_reasons = _confirm_next_candle(
+        direction, rejection, confirmation
+    )
+    if not confirmed:
+        return _empty("N_plus_1_did_not_confirm_direction", analysis)
+
+    score = 90
+    reasons = rejection_reasons + [swing["name"]] + confirmation_reasons
+
+    if direction == "call" and confirmation["close"] > rejection["high"]:
         score += 5
-        reasons.append("ema_context")
-
-    if structure == "bearish_to_bullish_rejection" and candle["close"] > support + tolerance * 0.25:
+        reasons.append("strong_break_of_rejection_high")
+    if direction == "put" and confirmation["close"] < rejection["low"]:
         score += 5
-        reasons.append("close_above_support")
+        reasons.append("strong_break_of_rejection_low")
 
-    if structure == "bullish_to_bearish_rejection" and candle["close"] < resistance - tolerance * 0.25:
-        score += 5
-        reasons.append("close_below_resistance")
+    if confirmation["body_ratio"] >= 0.45:
+        score += 3
+        reasons.append("confirmation_body_present")
 
-    if candle["body_ratio"] <= 0.45:
-        score += 7
-        reasons.append("controlled_body")
+    if (direction == "call" and bullish_context) or (direction == "put" and bearish_context):
+        score += 2
+        reasons.append("ema_context_aligned")
 
+    score = min(score, 100)
     if score < MIN_SCORE:
-        return _empty("valid_structure_but_score_below_90", analysis)
+        return _empty("confirmed_but_score_below_90", analysis)
 
-    if structure == "bearish_to_bullish_rejection":
-        return {
-            "signal": "call",
-            "direction": "bullish",
-            "score": min(score, 100),
-            "entry_quality": min(score, 100),
-            "entry_type": "force",
-            "blocked": False,
-            "reason": ",".join(reasons) + " | N cerrada / ejecución N+1",
-            "signal_price": candle["close"],
-            "candle_timestamp": int(data.iloc[-1]["from"]) if "from" in data.columns else None,
-            "analysis": analysis,
-        }
-
-    if structure == "bullish_to_bearish_rejection":
-        return {
-            "signal": "put",
-            "direction": "bearish",
-            "score": min(score, 100),
-            "entry_quality": min(score, 100),
-            "entry_type": "force",
-            "blocked": False,
-            "reason": ",".join(reasons) + " | N cerrada / ejecución N+1",
-            "signal_price": candle["close"],
-            "candle_timestamp": int(data.iloc[-1]["from"]) if "from" in data.columns else None,
-            "analysis": analysis,
-        }
-
-    return _empty("structure_not_allowed", analysis)
+    signal = "call" if direction == "call" else "put"
+    return {
+        "signal": signal,
+        "direction": "bullish" if signal == "call" else "bearish",
+        "score": score,
+        "entry_quality": score,
+        "entry_type": "force",
+        "blocked": False,
+        "reason": ",".join(reasons) + " | N rechazo + N+1 confirmada / ejecutar N+2",
+        "signal_price": confirmation["close"],
+        "candle_timestamp": int(data.iloc[-1]["from"]) if "from" in data.columns else None,
+        "analysis": analysis,
+    }
 
 
 def get_signal(df: pd.DataFrame) -> Optional[str]:
@@ -380,4 +381,4 @@ def signal(df: pd.DataFrame) -> Optional[str]:
 
 
 if __name__ == "__main__":
-    print("strategy.py cargado: solo estructuras explícitas de rechazo, score mínimo 90, ejecución N+1")
+    print("strategy.py cargado: rechazo en N + confirmacion cerrada en N+1; ejecucion N+2")
