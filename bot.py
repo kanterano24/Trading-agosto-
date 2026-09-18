@@ -56,7 +56,7 @@ TELEGRAM_CHAT_ID = (
 
 ACCOUNT_TYPE = os.getenv("IQ_ACCOUNT_TYPE", "PRACTICE").upper()
 # La ejecución solo se permite explícitamente en cuenta PRACTICE/DEMO.
-EXECUTE_DEMO = os.getenv("EXECUTE_DEMO", "false").strip().lower() == "true"
+EXECUTE_DEMO = os.getenv("EXECUTE_DEMO", "true").strip().lower() == "true"
 DRY_RUN = not EXECUTE_DEMO
 
 TIMEFRAME_SECONDS = 60
@@ -145,9 +145,9 @@ def get_telegram_updates(offset: Optional[int]) -> List[Dict[str, Any]]:
         if response.status_code == 409:
             print(
                 "[TELEGRAM] Error 409: otra instancia está usando getUpdates. "
-                "El polling de esta instancia se detendrá."
+                "Detén el proceso duplicado en Railway/otro servidor."
             )
-            raise RuntimeError("Telegram 409: polling duplicado detectado.")
+            return []
 
         response.raise_for_status()
         data = response.json()
@@ -247,6 +247,25 @@ def connect_iqoption():
     if not IQ_EMAIL or not IQ_PASSWORD:
         raise RuntimeError("Configura IQ_EMAIL e IQ_PASSWORD.")
 
+    # Algunas versiones de iqoptionapi lanzan un hilo interno para
+    # digitales que falla cuando la respuesta del servidor es None.
+    # Este parche evita que ese hilo intente indexar None.
+    original_digital_data = IQ_Option.get_digital_underlying_list_data
+
+    def safe_digital_data(self):
+        try:
+            result = original_digital_data(self)
+            if not isinstance(result, dict):
+                return {"underlying": []}
+            if not isinstance(result.get("underlying"), list):
+                result["underlying"] = []
+            return result
+        except Exception as exc:
+            print(f"[IQ] Datos digitales no disponibles; se omiten: {exc}")
+            return {"underlying": []}
+
+    IQ_Option.get_digital_underlying_list_data = safe_digital_data
+
     api = IQ_Option(IQ_EMAIL, IQ_PASSWORD)
     connected, reason = api.connect()
 
@@ -259,10 +278,9 @@ def connect_iqoption():
 
 def asset_is_available(api, asset: str) -> bool:
     """
-    No llama a get_all_open_time().
-    En algunas versiones de iqoptionapi esa llamada inicia el hilo de
-    digitales y puede producir: NoneType is not subscriptable.
-    La disponibilidad real se comprueba al solicitar las velas.
+    No llama a get_all_open_time(): esa función puede activar hilos internos
+    de digitales que fallan con datos None en algunas versiones de iqoptionapi.
+    La disponibilidad se valida de forma práctica al solicitar las velas.
     """
     return True
 
@@ -403,8 +421,8 @@ def scan_once(api) -> None:
             settle_paper_trades(asset, candles)
 
             signal = analyze_rejection(candles, min_score=MIN_SCORE)
-            # Compatibilidad con versiones antiguas de strategy.py:
-            # algunas devolvían objetos sin candle_time.
+
+            # Compatibilidad con versiones antiguas de strategy.py.
             signal_action = getattr(signal, "action", "none")
             signal_score = int(getattr(signal, "score", 0) or 0)
             signal_time = getattr(signal, "candle_time", None)
@@ -437,6 +455,10 @@ def scan_once(api) -> None:
     level_name = "soporte" if signal.action == "call" else "resistencia"
     level_value = signal.support if signal.action == "call" else signal.resistance
 
+    # Ejecutar inmediatamente después de confirmar el rechazo en una vela cerrada.
+    # La función execute_signal mantiene el bloqueo exclusivo a PRACTICE.
+    execution_ok, execution_data = execute_signal(api, asset, signal)
+
     message = (
         "🚨 <b>SEÑAL DE RECHAZO</b>\n\n"
         f"📌 Par: <b>{html.escape(asset)}</b>\n"
@@ -445,9 +467,10 @@ def scan_once(api) -> None:
         f"📍 Zona: <b>{level_name}</b>\n"
         f"💵 Nivel: <b>{level_value}</b>\n"
         f"🎬 Entrada de referencia: <b>{signal.entry_price}</b>\n"
-        f"⏱️ Expiración virtual: <b>{EXPIRATION_MINUTES} minuto(s)</b>\n"
+        f"⏱️ Expiración: <b>{EXPIRATION_MINUTES} minuto(s)</b>\n"
         f"🧪 Cuenta: <b>{html.escape(ACCOUNT_TYPE)}</b>\n"
         f"🔒 DRY_RUN: <b>{DRY_RUN}</b>\n"
+        f"⚡ Ejecución: <b>{'ACEPTADA' if execution_ok else 'NO CONFIRMADA'}</b>\n"
         f"📝 Motivo: <b>{html.escape(signal.reason)}</b>\n\n"
         "⚠️ Señal experimental. No garantiza ganancias."
     )
@@ -457,7 +480,7 @@ def scan_once(api) -> None:
             signals_sent += 1
 
     # Registro virtual para calcular WIN/LOSS con la siguiente vela.
-    if signal.entry_price is not None and signal.candle_time is not None:
+    if (DRY_RUN or execution_ok) and signal.entry_price is not None and signal.candle_time is not None:
         with lock:
             pending_paper_trades[asset] = {
                 "action": signal.action,
@@ -465,7 +488,6 @@ def scan_once(api) -> None:
                 "candle_time": signal.candle_time,
             }
 
-    execute_signal(api, asset, signal)
 
 
 def main() -> None:
@@ -490,6 +512,7 @@ def main() -> None:
         "🤖 <b>Bot iniciado</b>\n"
         f"Cuenta: <b>{html.escape(ACCOUNT_TYPE)}</b>\n"
         f"DRY_RUN: <b>{DRY_RUN}</b>\n"
+        f"Ejecución DEMO: <b>{EXECUTE_DEMO}</b>\n"
         f"Pares configurados: <b>{len(ASSETS)}</b>\n"
         "Usa /help para ver los comandos."
     )
