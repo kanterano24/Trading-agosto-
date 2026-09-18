@@ -1,10 +1,10 @@
-"""Estrategia CONTINUIDAD FILTRADA + RECHAZO + ESPACIO.
+"""Estrategia híbrida: rechazo estructural + continuidad filtrada.
 
-Interfaz compatible con el bot:
+Contrato público compatible con bot.py:
     analyze_market(candle_1m=..., previous_m1=..., pair=...)
 
-La estrategia solo analiza la vela N cerrada. El bot ejecuta exclusivamente
-la señal preparada en N durante la apertura de N+1.
+Se analiza únicamente la vela N cerrada y el bot ejecuta en N+1.
+El score es una puntuación de calidad de señal, NO una probabilidad.
 """
 from __future__ import annotations
 
@@ -16,14 +16,15 @@ import pandas as pd
 
 MIN_BARS = 35
 MAX_CANDLES = 120
+ATR_PERIOD = 14
 FORCE_PERIOD = 10
-FORCE_PERCENT = 120.0
-WICK_PERCENT = 50.0
-MIN_REJECTION_WICK_RATIO = 0.25
-MIN_CLOSE_POSITION = 0.60
+SWING_LOOKBACK = 12
+ZONE_ATR_TOLERANCE = 0.35
+MIN_REJECTION_WICK_RATIO = 0.28
+MIN_CLOSE_POSITION = 0.62
 MIN_ROOM_ATR = 0.90
-SWING_LOOKBACK = 8
 MAX_SIGNAL_BODY_ATR = 1.35
+MIN_SCORE = 76
 EPS = 1e-10
 
 
@@ -72,12 +73,12 @@ def _build_dataframe(candle_1m: Any, previous_m1: Optional[pd.DataFrame], df: Op
 
 
 def _true_range(data: pd.DataFrame) -> pd.Series:
-    prev_close = data["close"].shift(1)
+    previous_close = data["close"].shift(1)
     return pd.concat(
         [
             data["high"] - data["low"],
-            (data["high"] - prev_close).abs(),
-            (data["low"] - prev_close).abs(),
+            (data["high"] - previous_close).abs(),
+            (data["low"] - previous_close).abs(),
         ], axis=1,
     ).max(axis=1)
 
@@ -111,46 +112,73 @@ def _is_bearish(m: Dict[str, float]) -> bool:
     return m["close"] < m["open"]
 
 
-def _continuation(data: pd.DataFrame, index: int, direction: str, average_body: pd.Series) -> bool:
-    if index <= 0 or index >= len(data):
+def _near(value: float, level: float, tolerance: float) -> bool:
+    return abs(value - level) <= max(tolerance, EPS)
+
+
+def _rejection(metrics: Dict[str, float], side: str, zone: float, atr: float) -> bool:
+    tolerance = max(atr * ZONE_ATR_TOLERANCE, metrics["range"] * 0.20)
+    if side == "call":
+        return (
+            _near(metrics["low"], zone, tolerance)
+            and metrics["lower"] / metrics["range"] >= MIN_REJECTION_WICK_RATIO
+            and metrics["close_position"] >= MIN_CLOSE_POSITION
+            and _is_bullish(metrics)
+        )
+    return (
+        _near(metrics["high"], zone, tolerance)
+        and metrics["upper"] / metrics["range"] >= MIN_REJECTION_WICK_RATIO
+        and metrics["close_position"] <= 1.0 - MIN_CLOSE_POSITION
+        and _is_bearish(metrics)
+    )
+
+
+def _trend_score(data: pd.DataFrame, index: int, side: str) -> int:
+    start = max(0, index - 5)
+    closes = data["close"].iloc[start:index]
+    if len(closes) < 3:
+        return 0
+    rising = closes.iloc[-1] > closes.iloc[0]
+    falling = closes.iloc[-1] < closes.iloc[0]
+    if side == "call":
+        return 10 if rising else 0
+    return 10 if falling else 0
+
+
+def _continuation(data: pd.DataFrame, index: int, side: str, average_body: pd.Series) -> bool:
+    if index <= 1 or index >= len(data):
         return False
     current = _metrics(data.iloc[index])
     previous = _metrics(data.iloc[index - 1])
     avg = _safe_float(average_body.iloc[index], 0.0)
     if avg <= 0.0:
         return False
-    strong = current["body"] >= avg * FORCE_PERCENT / 100.0
-    controlled_upper = current["upper"] <= current["body"] * WICK_PERCENT / 100.0
-    controlled_lower = current["lower"] <= current["body"] * WICK_PERCENT / 100.0
-    if direction == "bullish":
-        return (
-            _is_bullish(current)
-            and _is_bullish(previous)
-            and strong
-            and current["close"] > previous["high"]
-            and controlled_upper
-        )
-    return (
-        _is_bearish(current)
-        and _is_bearish(previous)
-        and strong
-        and current["close"] < previous["low"]
-        and controlled_lower
+    strong = current["body"] >= avg * 1.05
+    controlled_wick = (
+        current["upper"] <= max(current["body"] * 0.65, EPS)
+        if side == "call"
+        else current["lower"] <= max(current["body"] * 0.65, EPS)
     )
-
-
-def _rejection(metrics: Dict[str, float], side: str) -> bool:
     if side == "call":
-        return (
-            metrics["lower"] / metrics["range"] >= MIN_REJECTION_WICK_RATIO
-            and metrics["close_position"] >= MIN_CLOSE_POSITION
-            and metrics["close"] >= metrics["open"]
-        )
-    return (
-        metrics["upper"] / metrics["range"] >= MIN_REJECTION_WICK_RATIO
-        and metrics["close_position"] <= 1.0 - MIN_CLOSE_POSITION
-        and metrics["close"] <= metrics["open"]
-    )
+        return _is_bullish(current) and _is_bullish(previous) and strong and controlled_wick
+    return _is_bearish(current) and _is_bearish(previous) and strong and controlled_wick
+
+
+def _score_rejection(metrics: Dict[str, float], side: str, trend: int, room_atr: float) -> int:
+    score = 58 + trend
+    wick = metrics["lower"] if side == "call" else metrics["upper"]
+    score += 10 if wick / metrics["range"] >= 0.40 else 5
+    score += 10 if metrics["body_ratio"] >= 0.35 else 4
+    score += 8 if room_atr >= 1.30 else 0
+    return min(score, 100)
+
+
+def _score_continuation(metrics: Dict[str, float], trend: int, room_atr: float) -> int:
+    score = 54 + trend
+    score += 10 if metrics["body_ratio"] >= 0.55 else 5
+    score += 8 if metrics["close_position"] >= 0.70 or metrics["close_position"] <= 0.30 else 0
+    score += 8 if room_atr >= 1.30 else 0
+    return min(score, 100)
 
 
 def _empty(reason: str, analysis: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
@@ -180,91 +208,92 @@ def analyze_market(
     data = data.copy()
     data["body"] = (data["close"] - data["open"]).abs()
     data["tr"] = _true_range(data)
-    data["atr"] = data["tr"].rolling(14, min_periods=14).mean()
+    data["atr"] = data["tr"].rolling(ATR_PERIOD, min_periods=ATR_PERIOD).mean()
     data["avg_body"] = data["body"].rolling(FORCE_PERIOD, min_periods=FORCE_PERIOD).mean()
 
-    if not math.isfinite(_safe_float(data.iloc[-1]["atr"], np.nan)):
+    c3_i = len(data) - 1
+    c2_i = len(data) - 2
+    if not math.isfinite(_safe_float(data.iloc[c3_i]["atr"], np.nan)):
         return _empty("ATR insuficiente")
 
-    # El patrón termina en la vela N cerrada: c1, c2, c3.
-    c1_i, c2_i, c3_i = len(data) - 3, len(data) - 2, len(data) - 1
-    c1 = _metrics(data.iloc[c1_i])
     c2 = _metrics(data.iloc[c2_i])
     c3 = _metrics(data.iloc[c3_i])
     atr = _safe_float(data.iloc[c3_i]["atr"], 0.0)
-    avg_body = data["avg_body"]
+    average_body = data["avg_body"]
 
-    c1_sell = _continuation(data, c1_i, "bearish", avg_body)
-    c1_buy = _continuation(data, c1_i, "bullish", avg_body)
-    c3_sell = _continuation(data, c3_i, "bearish", avg_body)
-    c3_buy = _continuation(data, c3_i, "bullish", avg_body)
-    c2_has_signal = _continuation(data, c2_i, "bullish", avg_body) or _continuation(data, c2_i, "bearish", avg_body)
+    lookback = data.iloc[max(0, c3_i - SWING_LOOKBACK - 1):c3_i - 1]
+    if len(lookback) < 5:
+        return _empty("Estructura insuficiente")
+    support = float(lookback["low"].min())
+    resistance = float(lookback["high"].max())
 
-    lookback = data.iloc[max(0, c1_i - SWING_LOOKBACK):c1_i]
-    if lookback.empty:
-        lookback = data.iloc[:c1_i]
-    swing_high = float(lookback["high"].max())
-    swing_low = float(lookback["low"].min())
+    call_rejection = _rejection(c2, "call", support, atr) or _rejection(c3, "call", support, atr)
+    put_rejection = _rejection(c2, "put", resistance, atr) or _rejection(c3, "put", resistance, atr)
+    call_continuation = _continuation(data, c3_i, "call", average_body)
+    put_continuation = _continuation(data, c3_i, "put", average_body)
 
-    call_rejection = _rejection(c2, "call") or _rejection(c3, "call")
-    put_rejection = _rejection(c2, "put") or _rejection(c3, "put")
-    call_room = (swing_high - c3["close"]) / atr if atr > 0 else 0.0
-    put_room = (c3["close"] - swing_low) / atr if atr > 0 else 0.0
+    call_room = (resistance - c3["close"]) / atr if atr > 0 else 0.0
+    put_room = (c3["close"] - support) / atr if atr > 0 else 0.0
     not_extended = c3["body"] / atr <= MAX_SIGNAL_BODY_ATR if atr > 0 else False
+    call_trend = _trend_score(data, c3_i, "call")
+    put_trend = _trend_score(data, c3_i, "put")
 
-    analysis = {
+    analysis: Dict[str, Any] = {
         "pair": pair,
         "force": False,
-        "pattern": "1-2-3-4",
+        "pattern": "rejection_or_continuation",
         "execution_mode": "next_candle",
         "expiration_minutes": 3,
         "atr": atr,
-        "last_swing_high": swing_high,
-        "last_swing_low": swing_low,
-        "candle_1": c1,
+        "last_swing_high": resistance,
+        "last_swing_low": support,
         "candle_2": c2,
         "candle_3": c3,
-        "c1_sell_continuation": c1_sell,
-        "c1_buy_continuation": c1_buy,
-        "c2_has_signal": c2_has_signal,
-        "c3_sell_continuation": c3_sell,
-        "c3_buy_continuation": c3_buy,
         "call_rejection": call_rejection,
         "put_rejection": put_rejection,
+        "call_continuation": call_continuation,
+        "put_continuation": put_continuation,
         "call_room_atr": call_room,
         "put_room_atr": put_room,
         "body_atr_ratio": c3["body"] / atr if atr > 0 else math.inf,
-        "structure": "bullish" if c3_buy else "bearish" if c3_sell else "mixed",
-        "impulse_phase": "confirmed_pattern" if not c2_has_signal else "blocked_intermediate_signal",
+        "structure": "bullish" if call_trend else "bearish" if put_trend else "mixed",
     }
 
-    if c2_has_signal:
-        return _empty("Descartada: la vela 2 tiene señal de continuidad", analysis)
-
     candidates = []
-    if c1_sell and c3_buy and call_rejection and call_room >= MIN_ROOM_ATR and not_extended:
-        score = 100
-        candidates.append((score, "call", "CALL: VEN en vela 1 + vela 2 limpia + COM en vela 3 + rechazo + espacio"))
-    if c1_buy and c3_sell and put_rejection and put_room >= MIN_ROOM_ATR and not_extended:
-        score = 100
-        candidates.append((score, "put", "PUT: COM en vela 1 + vela 2 limpia + VEN en vela 3 + rechazo + espacio"))
+    if call_rejection and call_room >= MIN_ROOM_ATR and not_extended:
+        score = _score_rejection(c3, "call", call_trend, call_room)
+        candidates.append((score, "call", "rejection", "CALL: rechazo confirmado cerca de soporte + espacio"))
+    if put_rejection and put_room >= MIN_ROOM_ATR and not_extended:
+        score = _score_rejection(c3, "put", put_trend, put_room)
+        candidates.append((score, "put", "rejection", "PUT: rechazo confirmado cerca de resistencia + espacio"))
 
+    # Continuidad permitida, pero solo si existe tendencia, vela controlada y espacio.
+    if call_continuation and call_trend >= 10 and call_room >= MIN_ROOM_ATR and not_extended:
+        score = _score_continuation(c3, call_trend, call_room)
+        candidates.append((score, "call", "continuation", "CALL: continuidad filtrada + tendencia + espacio"))
+    if put_continuation and put_trend >= 10 and put_room >= MIN_ROOM_ATR and not_extended:
+        score = _score_continuation(c3, put_trend, put_room)
+        candidates.append((score, "put", "continuation", "PUT: continuidad filtrada + tendencia + espacio"))
+
+    candidates = [candidate for candidate in candidates if candidate[0] >= MIN_SCORE]
     if not candidates:
-        return _empty("Sin patrón válido: continuidad + vela intermedia limpia + rechazo + espacio", analysis)
+        return _empty("Sin rechazo o continuidad de calidad", analysis)
 
-    score, signal, reason = candidates[0]
+    score, signal, entry_type, reason = max(candidates, key=lambda item: item[0])
     analysis["force"] = True
+    analysis["entry_quality"] = score
     analysis["pullback"] = {
         "valid": True,
         "previous_candle_confirmed": True,
-        "extreme_confirmed": True,
+        "extreme_confirmed": entry_type == "rejection",
     }
+
     return {
         "signal": signal,
         "direction": "bullish" if signal == "call" else "bearish",
         "score": score,
         "entry_quality": score,
-        "entry_type": "force",
+        "entry_type": entry_type,
         "blocked": False,
         "reason": reason + " | N cerrada / ejecución N+1",
         "signal_price": c3["close"],
@@ -282,4 +311,4 @@ def signal(df: pd.DataFrame) -> Optional[str]:
 
 
 if __name__ == "__main__":
-    print("strategy.py cargado correctamente: continuidad filtrada + rechazo + espacio")
+    print("strategy.py cargado correctamente: rechazo estructural + continuidad filtrada")
