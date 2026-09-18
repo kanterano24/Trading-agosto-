@@ -68,12 +68,6 @@ MIN_SCORE = int(os.getenv("MIN_SCORE", "80"))
 
 SCAN_INTERVAL_SECONDS = 5
 TELEGRAM_POLL_INTERVAL = 2
-TELEGRAM_CONFLICT_COOLDOWN = 60
-
-# Caché de pares confirmados por IQ Option. Evita consultar símbolos
-# que la API no reconoce en la sesión actual.
-_available_assets_cache: Optional[List[str]] = None
-telegram_conflict_until = 0.0
 
 ASSETS: List[str] = [
     "EURUSD", "GBPUSD", "USDJPY", "AUDUSD", "USDCAD",
@@ -141,14 +135,7 @@ def send_telegram(message: str, chat_id: Optional[str] = None) -> bool:
 
 
 def get_telegram_updates(offset: Optional[int]) -> List[Dict[str, Any]]:
-    global telegram_conflict_until
-
     if not TELEGRAM_BOT_TOKEN:
-        return []
-
-    # HTTP 409 significa que otro proceso está usando getUpdates con el
-    # mismo token. Se aplica una pausa para no llenar los logs de Railway.
-    if time.time() < telegram_conflict_until:
         return []
 
     params: Dict[str, Any] = {
@@ -167,17 +154,6 @@ def get_telegram_updates(offset: Optional[int]) -> List[Dict[str, Any]]:
         response.raise_for_status()
         data = response.json()
         return data.get("result", []) if data.get("ok") else []
-    except requests.HTTPError as exc:
-        status = exc.response.status_code if exc.response is not None else None
-        if status == 409:
-            telegram_conflict_until = time.time() + TELEGRAM_CONFLICT_COOLDOWN
-            print(
-                "[TELEGRAM] HTTP 409: otro proceso está usando este token. "
-                f"Pausa de {TELEGRAM_CONFLICT_COOLDOWN}s."
-            )
-        else:
-            print(f"[TELEGRAM] Lectura de comandos falló: {exc}")
-        return []
     except (requests.RequestException, ValueError) as exc:
         print(f"[TELEGRAM] Lectura de comandos falló: {exc}")
         return []
@@ -274,44 +250,6 @@ def connect_iqoption():
 
     api.change_balance(ACCOUNT_TYPE)
     return api
-
-
-def get_available_assets(api) -> List[str]:
-    """Devuelve solo los símbolos que IQ Option reconoce en esta sesión."""
-    global _available_assets_cache
-
-    if _available_assets_cache is not None:
-        return _available_assets_cache
-
-    try:
-        markets = api.get_all_open_time() or {}
-        known = set()
-
-        for market_data in markets.values():
-            if isinstance(market_data, dict):
-                known.update(str(name).upper() for name in market_data.keys())
-
-        selected = [asset for asset in ASSETS if asset.upper() in known]
-
-        if selected:
-            _available_assets_cache = list(dict.fromkeys(selected))
-        else:
-            # Si la versión de la librería no expone la lista de mercados,
-            # no se hacen consultas masivas que provoquen errores repetidos.
-            _available_assets_cache = []
-
-        print(
-            f"[IQ] Pares reconocidos: {len(_available_assets_cache)}/"
-            f"{len(ASSETS)}"
-        )
-        if not _available_assets_cache:
-            print("[IQ] No se encontraron pares compatibles en get_all_open_time().")
-
-    except Exception as exc:
-        _available_assets_cache = []
-        print(f"[IQ] No se pudo consultar la lista de pares: {exc}")
-
-    return _available_assets_cache
 
 
 def get_closed_candles(api, asset: str) -> List[Dict[str, Any]]:
@@ -442,12 +380,7 @@ def scan_once(api) -> None:
 
     candidates: List[Tuple[int, str, Signal, List[Dict[str, Any]]]] = []
 
-    assets_to_scan = get_available_assets(api)
-    if not assets_to_scan:
-        print("[SCAN] Sin pares compatibles; se omite este ciclo.")
-        return
-
-    for asset in assets_to_scan:
+    for asset in ASSETS:
         try:
             candles = get_closed_candles(api, asset)
             if len(candles) < 30:
@@ -518,8 +451,8 @@ def scan_once(api) -> None:
                 "action": signal.action,
                 "entry": signal.entry_price,
                 "candle_time": signal.candle_time,
-                "adaptive_sample": adaptive_selected.get("sample", 0),
-                "adaptive_win_rate": adaptive_selected.get("win_rate"),
+                "adaptive_sample": adaptive.get("sample", 0),
+                "adaptive_win_rate": adaptive.get("win_rate"),
             }
 
     execute_signal(api, asset, signal)
