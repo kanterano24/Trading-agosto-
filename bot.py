@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import logging
+import csv
+import os
 import os
 import threading
 import time
@@ -50,13 +52,13 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 TIMEFRAME = 60
 EXPIRATION = int(os.getenv("EXPIRATION", "1"))
-AMOUNT = float(os.getenv("AMOUNT", "1000"))
+AMOUNT = float(os.getenv("AMOUNT", "500"))
 
 # Cuenta de IQ Option: PRACTICE o REAL
 ACCOUNT_TYPE = os.getenv("ACCOUNT_TYPE", "PRACTICE").strip().upper()
 
 # Límite total de entradas por ejecución del bot
-MAX_TOTAL_TRADES = 100
+MAX_TOTAL_TRADES = 35
 TOTAL_TRADES = 0
 CANDLE_COUNT = max(60, int(os.getenv("CANDLE_COUNT", "80")))
 MAX_OTC_PAIRS = max(1, int(os.getenv("MAX_OTC_PAIRS", "50")))
@@ -116,6 +118,54 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(message)s",
 )
 logger = logging.getLogger(__name__)
+
+# Registro local para estudiar las condiciones de N/N+1 y su resultado real.
+HISTORY_FILE = os.getenv("TRADE_HISTORY_FILE", "trade_history.csv")
+HISTORY_LOCK = threading.RLock()
+HISTORY_FIELDS = [
+    "event", "timestamp", "pair", "signal", "score", "entry_type",
+    "rejection_timestamp", "confirmation_timestamp", "execution_ts",
+    "structure", "support", "resistance", "atr", "fast_ema", "slow_ema",
+    "confirmation_body_ratio", "confirmation_close_position", "reason",
+    "order_id", "result",
+]
+
+def record_history(event: str, pair: str, data: Optional[Dict[str, Any]] = None, **extra: Any) -> None:
+    """Guarda eventos de análisis/ejecución sin interrumpir el ciclo del bot."""
+    payload = dict(data or {})
+    analysis = payload.get("analysis") or {}
+    row = {
+        "event": event,
+        "timestamp": int(time.time()),
+        "pair": pair,
+        "signal": payload.get("signal"),
+        "score": payload.get("score", 0),
+        "entry_type": payload.get("entry_type"),
+        "rejection_timestamp": analysis.get("rejection_timestamp"),
+        "confirmation_timestamp": analysis.get("confirmation_timestamp"),
+        "execution_ts": payload.get("execution_ts"),
+        "structure": analysis.get("structure"),
+        "support": analysis.get("support"),
+        "resistance": analysis.get("resistance"),
+        "atr": analysis.get("atr"),
+        "fast_ema": analysis.get("fast_ema"),
+        "slow_ema": analysis.get("slow_ema"),
+        "confirmation_body_ratio": analysis.get("confirmation_body_ratio"),
+        "confirmation_close_position": analysis.get("confirmation_close_position"),
+        "reason": payload.get("reason", ""),
+        "order_id": extra.get("order_id", payload.get("order_id")),
+        "result": extra.get("result", payload.get("result")),
+    }
+    try:
+        with HISTORY_LOCK:
+            exists = os.path.exists(HISTORY_FILE) and os.path.getsize(HISTORY_FILE) > 0
+            with open(HISTORY_FILE, "a", newline="", encoding="utf-8") as handle:
+                writer = csv.DictWriter(handle, fieldnames=HISTORY_FIELDS)
+                if not exists:
+                    writer.writeheader()
+                writer.writerow(row)
+    except Exception as exc:
+        logger.debug("%s | no se pudo guardar historial: %s", pair, exc)
 
 
 # ============================================================
@@ -433,7 +483,12 @@ def ensure_connection() -> bool:
 # ============================================================
 
 def realtime_dataframe(pair: str) -> pd.DataFrame:
-    return pd.DataFrame()
+    """Obtiene velas cerradas recientes; no usa la vela actualmente abierta."""
+    df = get_closed_candles(pair)
+    if df is None or df.empty:
+        return pd.DataFrame()
+    current_ts = floor_candle_timestamp(get_iq_server_timestamp())
+    return df[df["from"].astype(int) < int(current_ts)].copy().reset_index(drop=True)
 
 
 def get_closed_candles(pair: str) -> Optional[pd.DataFrame]:
@@ -680,6 +735,8 @@ def analyze_closed_candle(pair: str, expected_closed_ts: int) -> bool:
             "created_at": time.time(),
         }
 
+    record_history("analysis", pair, result, execution_ts=int(expected_closed_ts + TIMEFRAME))
+
     logger.info(
         "%s | N CERRADA | signal=%s | type=%s | score=%s | %s",
         pair,
@@ -729,6 +786,8 @@ def analyze_closed_candle(pair: str, expected_closed_ts: int) -> bool:
                 return True
 
         PENDING_ENTRY[pair] = pending
+
+    record_history("armed", pair, pending)
 
     side = "CALL 🟢" if signal == "call" else "PUT 🔴"
     telegram_send(
@@ -788,7 +847,7 @@ def analyze_live_candle(pair: str, current_ts: int) -> bool:
         return False
 
     analysis = result.get("analysis") or {}
-    ok, order_id = buy_binary(pair, signal)
+    ok, order_id = buy_binary(pair, signal, trade_context=pending)
     if not ok:
         logger.warning("%s | orden rechazada | señal=%s", pair, signal)
         return False
@@ -907,7 +966,7 @@ def _extract_win_value(value: Any) -> Optional[float]:
         return None
 
 
-def monitor_trade_result(pair: str, signal: str, order_id: Any) -> None:
+def monitor_trade_result(pair: str, signal: str, order_id: Any, trade_context: Optional[Dict[str, Any]] = None) -> None:
     """Consulta el resultado de la operación y activa el bloqueo solo si gana."""
     if IQ is None or order_id in (None, False, ""):
         return
@@ -931,11 +990,14 @@ def monitor_trade_result(pair: str, signal: str, order_id: Any) -> None:
 
             if result > 0:
                 logger.info("%s | RESULTADO GANADOR | señal=%s | ID=%s | resultado=%s", pair, signal.upper(), order_id, result)
+                record_history("result", pair, trade_context or {"signal": signal}, order_id=order_id, result=result)
                 activate_unlock_after_win(pair)
             elif result < 0:
                 logger.info("%s | RESULTADO PERDEDOR | señal=%s | ID=%s | resultado=%s", pair, signal.upper(), order_id, result)
+                record_history("result", pair, trade_context or {"signal": signal}, order_id=order_id, result=result)
             else:
                 logger.info("%s | RESULTADO EMPATE/0 | señal=%s | ID=%s", pair, signal.upper(), order_id)
+                record_history("result", pair, trade_context or {"signal": signal}, order_id=order_id, result=result)
             return
         except Exception as exc:
             logger.debug("%s | consulta resultado ID=%s: %s", pair, order_id, exc)
@@ -959,7 +1021,7 @@ def trade_limit_reached() -> bool:
         return TOTAL_TRADES >= MAX_TOTAL_TRADES
 
 
-def buy_binary(pair: str, signal: str) -> Tuple[bool, Optional[Any]]:
+def buy_binary(pair: str, signal: str, trade_context: Optional[Dict[str, Any]] = None) -> Tuple[bool, Optional[Any]]:
     global TOTAL_TRADES, BOT_RUNNING
 
     if IQ is None or signal not in ("call", "put"):
@@ -1001,6 +1063,7 @@ def buy_binary(pair: str, signal: str) -> Tuple[bool, Optional[Any]]:
                 "order_id": order_id,
                 "signal": signal,
                 "opened_at": time.time(),
+                "context": dict(trade_context or {}),
             }
             register_executed_unlock_signal(pair, signal)
 
@@ -1031,7 +1094,7 @@ def buy_binary(pair: str, signal: str) -> Tuple[bool, Optional[Any]]:
 
     threading.Thread(
         target=monitor_trade_result,
-        args=(pair, signal, order_id),
+        args=(pair, signal, order_id, trade_context),
         daemon=True,
     ).start()
 
