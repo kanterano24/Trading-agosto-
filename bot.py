@@ -50,7 +50,7 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 TIMEFRAME = 60
 EXPIRATION = int(os.getenv("EXPIRATION", "1"))
-AMOUNT = float(os.getenv("AMOUNT", "334"))
+AMOUNT = float(os.getenv("AMOUNT", "666"))
 
 # Cuenta de IQ Option: PRACTICE o REAL
 ACCOUNT_TYPE = os.getenv("ACCOUNT_TYPE", "PRACTICE").strip().upper()
@@ -66,6 +66,8 @@ SNIPER_POLL = 0.06
 TRADE_COOLDOWN = float(os.getenv("TRADE_COOLDOWN", "60"))
 MIN_HISTORY = 35
 MIN_ROOM_TO_OPPOSITE_ATR = float(os.getenv("MIN_ROOM_TO_OPPOSITE_ATR", "0.90"))
+RESULT_POLL_SECONDS = float(os.getenv("RESULT_POLL_SECONDS", "2.0"))
+RESULT_TIMEOUT_SECONDS = float(os.getenv("RESULT_TIMEOUT_SECONDS", "150"))
 
 # Inicia el análisis automáticamente después de conectar a IQ Option.
 # Puede desactivarse con AUTO_START=false y usar /start desde Telegram.
@@ -92,6 +94,15 @@ LIVE_STATE: Dict[str, Dict[str, Any]] = {}
 PENDING_ENTRY: Dict[str, Dict[str, Any]] = {}
 LAST_TRADE_TIME: Dict[str, float] = {}
 LAST_TRADE_CANDLE: Dict[str, int] = {}
+
+# Tras una operación ganadora, el par exige señales EJECUTADAS: PUT -> CALL -> PUT.
+# Solo la dirección esperada puede ejecutarse durante la secuencia de desbloqueo.
+UNLOCK_SEQUENCE = ("put", "call", "put")
+PAIR_UNLOCK_PROGRESS: Dict[str, int] = {}
+PAIR_UNLOCK_ACTIVE: Dict[str, bool] = {}
+# Impide una segunda entrada en el mismo par mientras la primera
+# todavía no tiene resultado confirmado por IQ Option.
+ACTIVE_ORDERS: Dict[str, Dict[str, Any]] = {}
 
 STATE_LOCK = threading.RLock()
 
@@ -187,6 +198,9 @@ def telegram_command_loop() -> None:
                     with STATE_LOCK:
                         TOTAL_TRADES = 0
                         PENDING_ENTRY.clear()
+                        PAIR_UNLOCK_ACTIVE.clear()
+                        PAIR_UNLOCK_PROGRESS.clear()
+                        ACTIVE_ORDERS.clear()
                     BOT_RUNNING = True
                     telegram_send(
                         "🟢 BOT ACTIVADO\\n\\n"
@@ -380,7 +394,7 @@ def connect_iq() -> bool:
     telegram_send(
         "🟢 IQ OPTION CONECTADO\n\n"
         "📊 BB + ATR Trailing Stops + RSI\n"
-        "⚡ Rechazo N + confirmación N+1; ejecución en N+2\n"
+        "⚡ Analiza N cerrada y ejecuta en N+1\n"
         f"⏳ Expiración: {EXPIRATION} minuto(s)"
     )
 
@@ -549,14 +563,8 @@ def revalidate_pending_location(
     if atr <= 0.0 or IQ is None:
         return False
 
-    # strategy.py vv2 expone los pivotes; si un pivote no existe,
-    # usamos la resistencia/soporte calculados como respaldo.
     last_high = analysis.get("last_swing_high")
     last_low = analysis.get("last_swing_low")
-    if last_high is None:
-        last_high = analysis.get("resistance")
-    if last_low is None:
-        last_low = analysis.get("support")
 
     def level_value(value: Any) -> Optional[float]:
         if isinstance(value, (tuple, list)) and len(value) >= 2:
@@ -607,66 +615,6 @@ def revalidate_pending_location(
 # ANALISIS Y PREPARACION N+1
 # ============================================================
 
-
-def _fmt_price(value: Any) -> str:
-    try:
-        return f"{float(value):.6f}"
-    except (TypeError, ValueError):
-        return "N/D"
-
-
-def _candle_diagnostic(label: str, candle: Any) -> str:
-    if not isinstance(candle, dict):
-        return f"{label}: N/D"
-    return (
-        f"{label}: "
-        f"O={_fmt_price(candle.get('open'))} | "
-        f"H={_fmt_price(candle.get('high'))} | "
-        f"L={_fmt_price(candle.get('low'))} | "
-        f"C={_fmt_price(candle.get('close'))} | "
-        f"Rango={_fmt_price(candle.get('range'))} | "
-        f"Cuerpo={_fmt_price(candle.get('body'))} | "
-        f"MechaSup={_fmt_price(candle.get('upper'))} | "
-        f"MechaInf={_fmt_price(candle.get('lower'))} | "
-        f"PosCierre={_fmt_price(candle.get('close_position'))}"
-    )
-
-
-def _diagnostic_message(
-    pair: str,
-    signal: str,
-    result: Dict[str, Any],
-    rejection_label: str = "N",
-    confirmation_label: str = "N+1",
-) -> str:
-    analysis = result.get("analysis") or {}
-    rejection = analysis.get("rejection_candle") or {}
-    confirmation = analysis.get("confirmation_candle") or {}
-    direction = str(signal or "").upper()
-
-    return (
-        "📊 DIAGNÓSTICO TÉCNICO\n\n"
-        f"Par: {pair}\n"
-        f"Dirección: {direction}\n"
-        f"Score: {result.get('score', 0)}/100\n"
-        f"Calidad: {result.get('entry_quality', 0)}/100\n"
-        f"Estructura: {analysis.get('structure', 'unknown')}\n"
-        f"ATR: {_fmt_price(analysis.get('atr'))}\n"
-        f"Soporte: {_fmt_price(analysis.get('support'))}\n"
-        f"Resistencia: {_fmt_price(analysis.get('resistance'))}\n"
-        f"Tolerancia: {_fmt_price(analysis.get('tolerance'))}\n"
-        f"EMA rápida: {_fmt_price(analysis.get('fast_ema'))}\n"
-        f"EMA lenta: {_fmt_price(analysis.get('slow_ema'))}\n"
-        f"Contexto alcista: {analysis.get('bullish_context')}\n"
-        f"Contexto bajista: {analysis.get('bearish_context')}\n\n"
-        f"{_candle_diagnostic(rejection_label, rejection)}\n"
-        f"{_candle_diagnostic(confirmation_label, confirmation)}\n\n"
-        f"Timestamp {rejection_label}: {analysis.get('rejection_timestamp', 'N/D')}\n"
-        f"Timestamp {confirmation_label}: {analysis.get('confirmation_timestamp', 'N/D')}\n\n"
-        f"Motivos: {result.get('reason', '')}"
-    )
-
-
 def analysis_message(pair: str, ts: int, result: Dict[str, Any]) -> str:
     analysis = result.get("analysis") or {}
 
@@ -706,6 +654,11 @@ def analyze_closed_candle(pair: str, expected_closed_ts: int) -> bool:
         if state and int(state.get("analyzed_ts", -1)) == expected_closed_ts:
             return True
 
+    with STATE_LOCK:
+        if pair in ACTIVE_ORDERS:
+            logger.info("%s | análisis omitido: operación anterior aún sin resultado", pair)
+            return True
+
     result = analyze_market(
         candle_1m=closed_row.to_dict(),
         previous_m1=df.iloc[:-1].copy(),
@@ -738,6 +691,15 @@ def analyze_closed_candle(pair: str, expected_closed_ts: int) -> bool:
 
     if not is_force_signal(result, signal):
         return True
+
+    if not unlock_gate_allows(pair, signal):
+        expected = expected_unlock_signal(pair)
+        logger.info("%s | señal %s no armada: durante desbloqueo se exige %s", pair, str(signal).upper(), str(expected).upper())
+        return True
+
+    with STATE_LOCK:
+        if pair in ACTIVE_ORDERS:
+            return True
 
     values = candle_values(closed_row)
     execution_ts = int(expected_closed_ts + TIMEFRAME)
@@ -777,14 +739,13 @@ def analyze_closed_candle(pair: str, expected_closed_ts: int) -> bool:
         f"Score: {score}/100\n"
         f"Calidad: {analysis.get('entry_quality', result.get('entry_quality', 0))}/100\n"
         f"Estructura: {analysis.get('structure', 'unknown')}\n\n"
-        f"Cierre N: {_fmt_price(values['close'])}\n"
+        f"Cierre N: {values['close']}\n"
         f"N cierre: {expected_closed_ts}\n"
-        f"N+1 previsto: {execution_ts}\n\n"
+        f"N+1: {execution_ts}\n\n"
         "🚫 N no se opera.\n"
-        "⚡ La entrada queda pendiente para la vela programada.\n"
+        "⚡ Ejecutar únicamente en N+1.\n"
         f"⏳ Expiración: {EXPIRATION} minuto(s)\n\n"
-        f"{result.get('reason', '')}\n\n"
-        + _diagnostic_message(pair, signal, result)
+        f"{result.get('reason', '')}"
     )
 
     return True
@@ -856,6 +817,136 @@ def analyze_live_candle(pair: str, current_ts: int) -> bool:
 
 
 # ============================================================
+# CONTROL DE RESULTADOS Y BLOQUEO POR PAR
+# ============================================================
+
+def expected_unlock_signal(pair: str) -> Optional[str]:
+    """Devuelve la única dirección permitida durante el desbloqueo."""
+    with STATE_LOCK:
+        if not PAIR_UNLOCK_ACTIVE.get(pair, False):
+            return None
+        progress = int(PAIR_UNLOCK_PROGRESS.get(pair, 0))
+        if progress >= len(UNLOCK_SEQUENCE):
+            return None
+        return UNLOCK_SEQUENCE[progress]
+
+
+def unlock_gate_allows(pair: str, signal: str) -> bool:
+    """Bloquea las señales que no respeten PUT -> CALL -> PUT."""
+    expected = expected_unlock_signal(pair)
+    if expected is None:
+        return True
+    return signal == expected
+
+
+def register_executed_unlock_signal(pair: str, signal: str) -> None:
+    """Cuenta únicamente una señal que realmente fue ejecutada."""
+    with STATE_LOCK:
+        if not PAIR_UNLOCK_ACTIVE.get(pair, False):
+            return
+
+        progress = int(PAIR_UNLOCK_PROGRESS.get(pair, 0))
+        expected = UNLOCK_SEQUENCE[progress] if progress < len(UNLOCK_SEQUENCE) else None
+        if signal != expected:
+            return
+
+        progress += 1
+        PAIR_UNLOCK_PROGRESS[pair] = progress
+
+        if progress >= len(UNLOCK_SEQUENCE):
+            PAIR_UNLOCK_ACTIVE.pop(pair, None)
+            PAIR_UNLOCK_PROGRESS.pop(pair, None)
+            logger.info("%s | PAR DESBLOQUEADO | secuencia ejecutada PUT -> CALL -> PUT", pair)
+            telegram_send(
+                "🔓 PAR DESBLOQUEADO\n\n"
+                f"Par: {pair}\n"
+                "Secuencia ejecutada: PUT -> CALL -> PUT\n"
+                "El par vuelve a aceptar señales normales."
+            )
+        else:
+            next_signal = UNLOCK_SEQUENCE[progress]
+            logger.info(
+                "%s | desbloqueo %s/%s | ejecutado=%s | siguiente=%s",
+                pair, progress, len(UNLOCK_SEQUENCE), signal.upper(), next_signal.upper(),
+            )
+            telegram_send(
+                "🔒 SECUENCIA DE DESBLOQUEO\n\n"
+                f"Par: {pair}\n"
+                f"Ejecutada: {signal.upper()}\n"
+                f"Progreso: {progress}/{len(UNLOCK_SEQUENCE)}\n"
+                f"Siguiente dirección obligatoria: {next_signal.upper()}"
+            )
+
+
+def activate_unlock_after_win(pair: str) -> None:
+    """Después de una ganancia, cancela pendientes y activa la secuencia."""
+    with STATE_LOCK:
+        # Una señal preparada antes de conocer la ganancia nunca debe ejecutarse
+        # después de esa ganancia.
+        PENDING_ENTRY.pop(pair, None)
+        PAIR_UNLOCK_ACTIVE[pair] = True
+        PAIR_UNLOCK_PROGRESS[pair] = 0
+
+    telegram_send(
+        "🔒 PAR BLOQUEADO TRAS GANANCIA\n\n"
+        f"Par: {pair}\n"
+        "Para desbloquearlo solo se permitirán señales EJECUTADAS en orden:\n"
+        "PUT -> CALL -> PUT\n"
+        "Las demás direcciones serán descartadas."
+    )
+
+
+def _extract_win_value(value: Any) -> Optional[float]:
+    try:
+        if isinstance(value, tuple):
+            value = value[-1]
+        if isinstance(value, bool):
+            return 1.0 if value else 0.0
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def monitor_trade_result(pair: str, signal: str, order_id: Any) -> None:
+    """Consulta el resultado de la operación y activa el bloqueo solo si gana."""
+    if IQ is None or order_id in (None, False, ""):
+        return
+
+    deadline = time.time() + RESULT_TIMEOUT_SECONDS
+    while time.time() < deadline:
+        try:
+            checker = getattr(IQ, "check_win_v3", None)
+            if checker is None:
+                logger.warning("%s | no existe check_win_v3; no se puede confirmar resultado ID=%s", pair, order_id)
+                return
+
+            raw_result = checker(order_id)
+            result = _extract_win_value(raw_result)
+            if result is None:
+                time.sleep(RESULT_POLL_SECONDS)
+                continue
+
+            with STATE_LOCK:
+                ACTIVE_ORDERS.pop(pair, None)
+
+            if result > 0:
+                logger.info("%s | RESULTADO GANADOR | señal=%s | ID=%s | resultado=%s", pair, signal.upper(), order_id, result)
+                activate_unlock_after_win(pair)
+            elif result < 0:
+                logger.info("%s | RESULTADO PERDEDOR | señal=%s | ID=%s | resultado=%s", pair, signal.upper(), order_id, result)
+            else:
+                logger.info("%s | RESULTADO EMPATE/0 | señal=%s | ID=%s", pair, signal.upper(), order_id)
+            return
+        except Exception as exc:
+            logger.debug("%s | consulta resultado ID=%s: %s", pair, order_id, exc)
+        time.sleep(RESULT_POLL_SECONDS)
+
+    with STATE_LOCK:
+        ACTIVE_ORDERS.pop(pair, None)
+    logger.warning("%s | tiempo agotado esperando resultado ID=%s", pair, order_id)
+
+
+# ============================================================
 # EJECUCION
 # ============================================================
 
@@ -874,10 +965,21 @@ def buy_binary(pair: str, signal: str) -> Tuple[bool, Optional[Any]]:
     if IQ is None or signal not in ("call", "put"):
         return False, None
 
+    if not unlock_gate_allows(pair, signal):
+        expected = expected_unlock_signal(pair)
+        logger.info("%s | señal %s descartada; durante desbloqueo se exige %s", pair, signal.upper(), str(expected).upper())
+        return False, None
+
     # El bloqueo cubre la comprobación y el envío para evitar
     # que dos hilos consuman el mismo cupo simultáneamente.
     with STATE_LOCK:
         if TOTAL_TRADES >= MAX_TOTAL_TRADES:
+            return False, None
+
+        # Doble protección: no permitir dos operaciones simultáneas del mismo par
+        # aunque el resultado de la anterior todavía no haya sido consultado.
+        if pair in ACTIVE_ORDERS:
+            logger.info("%s | entrada bloqueada: operación anterior pendiente de resultado", pair)
             return False, None
 
         try:
@@ -895,6 +997,12 @@ def buy_binary(pair: str, signal: str) -> Tuple[bool, Optional[Any]]:
 
             TOTAL_TRADES += 1
             current_trades = TOTAL_TRADES
+            ACTIVE_ORDERS[pair] = {
+                "order_id": order_id,
+                "signal": signal,
+                "opened_at": time.time(),
+            }
+            register_executed_unlock_signal(pair, signal)
 
             if TOTAL_TRADES >= MAX_TOTAL_TRADES:
                 BOT_RUNNING = False
@@ -921,6 +1029,12 @@ def buy_binary(pair: str, signal: str) -> Tuple[bool, Optional[Any]]:
             "No se abrirán nuevas operaciones."
         )
 
+    threading.Thread(
+        target=monitor_trade_result,
+        args=(pair, signal, order_id),
+        daemon=True,
+    ).start()
+
     return True, order_id
 
 
@@ -943,6 +1057,10 @@ def execute_sniper(pair: str, pending: Dict[str, Any]) -> bool:
     if LAST_TRADE_CANDLE.get(pair) == execution_ts:
         return False
 
+    with STATE_LOCK:
+        if pair in ACTIVE_ORDERS:
+            return False
+
     if cooldown_active(pair):
         return False
 
@@ -953,46 +1071,11 @@ def execute_sniper(pair: str, pending: Dict[str, Any]) -> bool:
         with STATE_LOCK:
             PENDING_ENTRY.pop(pair, None)
 
-        analysis = pending.get("analysis") or {}
-        current_df = get_closed_candles(pair)
-        current_close = None
-        if current_df is not None and not current_df.empty:
-            current_close = float(current_df.iloc[-1]["close"])
-
-        last_high = analysis.get("last_swing_high")
-        last_low = analysis.get("last_swing_low")
-        opposite_level = last_high if signal == "call" else last_low
-        if isinstance(opposite_level, (tuple, list)) and len(opposite_level) >= 2:
-            opposite_level = opposite_level[1]
-
-        atr_value = float(analysis.get("atr") or 0.0)
-        room_value = None
-        room_atr_value = None
-        if current_close is not None and opposite_level is not None:
-            try:
-                room_value = (
-                    float(opposite_level) - current_close
-                    if signal == "call"
-                    else current_close - float(opposite_level)
-                )
-                if atr_value > 0:
-                    room_atr_value = room_value / atr_value
-            except (TypeError, ValueError):
-                pass
-
         telegram_send(
             "🚫 ENTRADA DESCARTADA\n\n"
             f"Par: {pair}\n"
             f"Dirección: {signal.upper()}\n"
-            "El espacio disponible no cumplió el mínimo antes de ejecutar.\n\n"
-            f"Precio actual: {_fmt_price(current_close)}\n"
-            f"Nivel opuesto: {_fmt_price(opposite_level)}\n"
-            f"ATR: {_fmt_price(atr_value)}\n"
-            f"Espacio: {_fmt_price(room_value)}\n"
-            f"Espacio en ATR: {_fmt_price(room_atr_value)}\n"
-            f"Mínimo requerido: {MIN_ROOM_TO_OPPOSITE_ATR:.2f} ATR\n"
-            f"N: {pending.get('continuity_ts')}\n"
-            f"Entrada programada: {pending.get('execution_ts')}\n\n"
+            "El espacio disponible cambió antes de N+1.\n"
             "La entrada no se ejecutará."
         )
         return False
@@ -1019,23 +1102,16 @@ def execute_sniper(pair: str, pending: Dict[str, Any]) -> bool:
     with STATE_LOCK:
         PENDING_ENTRY.pop(pair, None)
 
-    pending_analysis = pending.get("analysis") or {}
     telegram_send(
         "✅ FUERZA EJECUTADA\n\n"
         f"Par: {pair}\n"
         f"Dirección: {signal.upper()}\n"
         f"Tipo: {pending.get('entry_type')}\n"
         f"N cierre: {pending.get('continuity_ts')}\n"
-        f"Entrada programada: {execution_ts}\n"
+        f"N+1: {execution_ts}\n"
         f"Reloj IQ: {sent_at:.3f}\n"
-        f"ID: {order_id}\n"
-        f"Precio de cierre N: {_fmt_price(pending.get('close'))}\n\n"
-        f"⏳ Expiración: {EXPIRATION} minuto(s)\n\n"
-        f"Estructura: {pending_analysis.get('structure', 'unknown')}\n"
-        f"ATR: {_fmt_price(pending_analysis.get('atr'))}\n"
-        f"Soporte: {_fmt_price(pending_analysis.get('support'))}\n"
-        f"Resistencia: {_fmt_price(pending_analysis.get('resistance'))}\n"
-        f"Motivos: {pending.get('reason', '')}"
+        f"ID: {order_id}\n\n"
+        f"⏳ Expiración: {EXPIRATION} minuto(s)"
     )
 
     logger.info(
@@ -1127,13 +1203,16 @@ def main() -> None:
     with STATE_LOCK:
         TOTAL_TRADES = 0
         PENDING_ENTRY.clear()
+        PAIR_UNLOCK_ACTIVE.clear()
+        PAIR_UNLOCK_PROGRESS.clear()
+        ACTIVE_ORDERS.clear()
 
     BOT_RUNNING = AUTO_START
 
     telegram_send(
         "🤖 BOT LISTO\n\n"
         "📊 Filtro Bollinger + ATR Trailing Stops + RSI\n"
-        "⚡ Rechazo N + confirmación N+1; ejecución en N+2\n"
+        "⚡ Analiza N cerrada y ejecuta en N+1\n"
         f"⏳ Expiración: {EXPIRATION} minuto(s)\n"
         f"🚀 Inicio automático: {'SI' if AUTO_START else 'NO'}\n\n"
         + (
