@@ -144,11 +144,20 @@ def get_telegram_updates(offset: Optional[int]) -> List[Dict[str, Any]]:
             params=params,
             timeout=15,
         )
+        if response.status_code == 409:
+            print(
+                "[TELEGRAM] Error 409: hay otra instancia usando getUpdates. "
+                "Detén otros workers/servicios o réplicas y deja solo uno activo."
+            )
+            time.sleep(10)
+            return []
+
         response.raise_for_status()
         data = response.json()
         return data.get("result", []) if data.get("ok") else []
     except (requests.RequestException, ValueError) as exc:
         print(f"[TELEGRAM] Lectura de comandos falló: {exc}")
+        time.sleep(3)
         return []
 
 
@@ -243,6 +252,23 @@ def connect_iqoption():
 
     api.change_balance(ACCOUNT_TYPE)
     return api
+
+
+def asset_is_available(api, asset: str) -> bool:
+    """Evita consultar pares que IQ Option no tiene disponibles."""
+    try:
+        open_time = api.get_all_open_time()
+        for market in ("binary", "turbo", "digital", "forex"):
+            section = open_time.get(market, {}) if isinstance(open_time, dict) else {}
+            info = section.get(asset)
+            if isinstance(info, dict):
+                return bool(info.get("open", False))
+        # Si la API no entrega información para ese mercado, se deja
+        # que get_candles confirme si existe.
+        return True
+    except Exception as exc:
+        print(f"[{asset}] No se pudo verificar disponibilidad: {exc}")
+        return True
 
 
 def get_closed_candles(api, asset: str) -> List[Dict[str, Any]]:
@@ -374,6 +400,10 @@ def scan_once(api) -> None:
 
     for asset in ASSETS:
         try:
+            if not asset_is_available(api, asset):
+                print(f"[{asset}] No disponible; se omite.")
+                continue
+
             candles = get_closed_candles(api, asset)
             if len(candles) < 30:
                 continue
@@ -381,7 +411,11 @@ def scan_once(api) -> None:
             settle_paper_trades(asset, candles)
 
             signal = analyze_rejection(candles, min_score=MIN_SCORE)
-            signal_time = signal.candle_time
+            # Compatibilidad con versiones antiguas de strategy.py:
+            # algunas devolvían objetos sin candle_time.
+            signal_time = getattr(signal, "candle_time", None)
+            if signal_time is None:
+                signal_time = candle_time(candles[-1])
 
             if signal.action == "none" or signal_time is None:
                 continue
@@ -450,6 +484,13 @@ def main() -> None:
         raise RuntimeError(
             "Por seguridad, este archivo solo funciona con IQ_ACCOUNT_TYPE=PRACTICE."
         )
+
+    # Polling con getUpdates no permite dos instancias simultáneas.
+    # El conflicto 409 suele indicar otro worker/servicio activo.
+    try:
+        requests.post(telegram_url("deleteWebhook"), timeout=10)
+    except requests.RequestException as exc:
+        print(f"[TELEGRAM] No se pudo limpiar webhook: {exc}")
 
     send_telegram(
         "🤖 <b>Bot iniciado</b>\n"
