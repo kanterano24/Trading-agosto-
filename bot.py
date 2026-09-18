@@ -54,8 +54,6 @@ AMOUNT = float(os.getenv("AMOUNT", "150"))
 
 # Cuenta de IQ Option: PRACTICE o REAL
 ACCOUNT_TYPE = os.getenv("ACCOUNT_TYPE", "PRACTICE").strip().upper()
-if ACCOUNT_TYPE != "PRACTICE":
-    raise ValueError("Este paquete está bloqueado para PRACTICE/DEMO. No se permite REAL.")
 
 # Límite total de entradas por ejecución del bot
 MAX_TOTAL_TRADES = 100
@@ -76,7 +74,8 @@ AUTO_START = os.getenv("AUTO_START", "true").strip().lower() in {
 }
 
 # La API publica de strategy.py debe exponer solamente entry_type=force.
-REQUIRE_FORCE = False
+REQUIRE_FORCE = True
+MIN_ACCEPTED_SCORE = int(os.getenv("MIN_ACCEPTED_SCORE", "90"))
 REQUIRE_N_PLUS_1 = True
 
 
@@ -164,7 +163,12 @@ def telegram_command_loop() -> None:
             data = response.json()
 
             if not data.get("ok"):
-                time.sleep(0.5)
+                description = str(data.get("description", ""))
+                if response.status_code == 409 or "terminated by other getUpdates request" in description.lower():
+                    logger.warning("Telegram 409: otra instancia está usando getUpdates; pausa de 30 s")
+                    time.sleep(30)
+                else:
+                    time.sleep(1)
                 continue
 
             for update in data.get("result", []):
@@ -375,8 +379,8 @@ def connect_iq() -> bool:
 
     telegram_send(
         "🟢 IQ OPTION CONECTADO\n\n"
-        "📊 Rechazo de soporte/resistencia\n"
-        "⚡ Ejecución inmediata tras vela cerrada\n"
+        "📊 BB + ATR Trailing Stops + RSI\n"
+        "⚡ Analiza N cerrada y ejecuta en N+1\n"
         f"⏳ Expiración: {EXPIRATION} minuto(s)"
     )
 
@@ -488,6 +492,12 @@ def is_force_signal(result: Dict[str, Any], signal: Any) -> bool:
     if signal not in ("call", "put"):
         return False
 
+    try:
+        if int(result.get("score", 0) or 0) < MIN_ACCEPTED_SCORE:
+            return False
+    except (TypeError, ValueError):
+        return False
+
     entry_type = str(result.get("entry_type") or "").strip().lower()
     analysis = result.get("analysis") or {}
 
@@ -595,7 +605,7 @@ def analysis_message(pair: str, ts: int, result: Dict[str, Any]) -> str:
     analysis = result.get("analysis") or {}
 
     return (
-        "🔎 ANÁLISIS DE RECHAZO\n\n"
+        "🔎 ANÁLISIS DE FUERZA\n\n"
         f"Par: {pair}\n"
         f"Vela N: {ts}\n"
         f"Dirección: {result.get('signal')}\n"
@@ -609,28 +619,25 @@ def analysis_message(pair: str, ts: int, result: Dict[str, Any]) -> str:
 
 
 def analyze_closed_candle(pair: str, expected_closed_ts: int) -> bool:
-    """Analiza la última vela cerrada y ejecuta inmediatamente en DEMO.
-
-    La estrategia solo acepta rechazo confirmado de soporte/resistencia.
-    Se registra una vez por vela para evitar duplicados.
-    """
-    global TOTAL_TRADES
-    if trade_limit_reached() or cooldown_active(pair):
-        return False
-
-    df = get_closed_candles(pair)
-    if df is None or df.empty or len(df) < MIN_HISTORY:
-        return False
-
-    df = df[df["from"].astype(int) <= int(expected_closed_ts)].copy()
-    df = df.sort_values("from").reset_index(drop=True)
+    df = realtime_dataframe(pair)
     closed_row = get_row_by_ts(df, expected_closed_ts)
-    if closed_row is None or len(df) < MIN_HISTORY:
+
+    if closed_row is None:
+        df = get_closed_candles(pair)
+        closed_row = get_row_by_ts(df, expected_closed_ts) if df is not None else None
+
+    if closed_row is None or df is None or len(df) < MIN_HISTORY:
+        return False
+
+    df = df[df["from"].astype(int) <= expected_closed_ts].copy()
+    df = df.sort_values("from").reset_index(drop=True)
+
+    if len(df) < MIN_HISTORY:
         return False
 
     with STATE_LOCK:
         state = LIVE_STATE.get(pair)
-        if state and int(state.get("analyzed_ts", -1)) == int(expected_closed_ts):
+        if state and int(state.get("analyzed_ts", -1)) == expected_closed_ts:
             return True
 
     result = analyze_market(
@@ -638,6 +645,7 @@ def analyze_closed_candle(pair: str, expected_closed_ts: int) -> bool:
         previous_m1=df.iloc[:-1].copy(),
         pair=pair,
     )
+
     signal = result.get("signal")
     score = int(result.get("score", 0) or 0)
     analysis = result.get("analysis") or {}
@@ -654,43 +662,64 @@ def analyze_closed_candle(pair: str, expected_closed_ts: int) -> bool:
         }
 
     logger.info(
-        "%s | RECHAZO CERRADO | signal=%s | score=%s | %s",
-        pair, signal, score, result.get("reason", ""),
+        "%s | N CERRADA | signal=%s | type=%s | score=%s | %s",
+        pair,
+        signal,
+        result.get("entry_type"),
+        score,
+        result.get("reason", ""),
     )
 
     if not is_force_signal(result, signal):
         return True
-    if LAST_TRADE_CANDLE.get(pair) == int(expected_closed_ts):
-        return True
 
-    ok, order_id = buy_binary(pair, signal)
-    if not ok:
-        telegram_send(
-            "❌ ORDEN NO CONFIRMADA\n\n"
-            f"Par: {pair}\nDirección: {str(signal).upper()}\n"
-            f"Score: {score}/100\nVela: {expected_closed_ts}\n"
-            "La API no confirmó la entrada."
-        )
-        return False
+    values = candle_values(closed_row)
+    execution_ts = int(expected_closed_ts + TIMEFRAME)
 
-    LAST_TRADE_TIME[pair] = time.time()
-    LAST_TRADE_CANDLE[pair] = int(expected_closed_ts)
+    pending = {
+        "signal": signal,
+        "score": score,
+        "entry_type": result.get("entry_type"),
+        "force": bool(analysis.get("force", True)),
+        "continuity_ts": int(expected_closed_ts),
+        "execution_ts": execution_ts,
+        "open": values["open"],
+        "high": values["high"],
+        "low": values["low"],
+        "close": values["close"],
+        "reason": result.get("reason", ""),
+        "analysis": analysis,
+        "created_at": time.time(),
+    }
+
+    with STATE_LOCK:
+        existing = PENDING_ENTRY.get(pair)
+
+        if existing is not None:
+            existing_ts = int(existing.get("execution_ts", 0))
+            if existing_ts >= execution_ts:
+                return True
+
+        PENDING_ENTRY[pair] = pending
+
+    side = "CALL 🟢" if signal == "call" else "PUT 🔴"
     telegram_send(
-        "✅ RECHAZO EJECUTADO INMEDIATAMENTE\n\n"
+        "🎯 SEÑAL DE FUERZA ARMADA\n\n"
         f"Par: {pair}\n"
-        f"Dirección: {str(signal).upper()}\n"
+        f"Dirección: {side}\n"
+        f"Tipo: {pending['entry_type']}\n"
         f"Score: {score}/100\n"
-        f"Zona: {analysis.get('zone', 'soporte/resistencia')}\n"
-        f"Nivel: {analysis.get('level', 'n/d')}\n"
-        f"Vela cerrada: {expected_closed_ts}\n"
-        f"ID: {order_id}\n"
-        f"⏳ Expiración: {EXPIRATION} minuto(s)\n"
-        f"Motivo: {result.get('reason', '')}"
+        f"Calidad: {analysis.get('entry_quality', result.get('entry_quality', 0))}/100\n"
+        f"Estructura: {analysis.get('structure', 'unknown')}\n\n"
+        f"Cierre N: {values['close']}\n"
+        f"N cierre: {expected_closed_ts}\n"
+        f"N+1: {execution_ts}\n\n"
+        "🚫 N no se opera.\n"
+        "⚡ Ejecutar únicamente en N+1.\n"
+        f"⏳ Expiración: {EXPIRATION} minuto(s)\n\n"
+        f"{result.get('reason', '')}"
     )
-    logger.info(
-        "%s | EJECUTADO INMEDIATO | %s | score=%s | ID=%s",
-        pair, str(signal).upper(), score, order_id,
-    )
+
     return True
 
 
