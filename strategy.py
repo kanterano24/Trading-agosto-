@@ -1,423 +1,838 @@
-"""strategy.py
+"""
+strategy.py
 
-Estrategia de rechazo + confirmacion para Binary OTC M1.
+Estrategia estructural de RECHAZO para DIGITAL OTC 1M.
 
-Flujo obligatorio:
-    N   = vela de rechazo cerrada.
-    N+1 = vela de confirmacion cerrada.
-    N+2 = primera vela en la que el bot puede ejecutar con esta logica.
+Objetivo:
+- Evitar entradas de continuidad tardías cerca del último máximo/mínimo.
+- Identificar dinámicamente el último máximo y último mínimo confirmados.
+- Permitir únicamente CALL/PUT con rechazo confirmado en su zona correspondiente.
+- CALL: estructura bullish + rechazo de soporte / último mínimo.
+- PUT: estructura bearish + rechazo de resistencia / último máximo.
+- Exigir score y calidad mínimos de 95/100, ejecución N+1 y expiración de 1 minuto.
+- Mantener una API compatible con bot.py: analyze_market(df), get_signal(), signal().
 
 IMPORTANTE:
-- No se genera una senal solamente porque exista una vela de rechazo.
-- CALL: rechazo en soporte y N+1 confirma con vela alcista.
-- PUT: rechazo en resistencia y N+1 confirma con vela bajista.
-- Para una confirmacion fuerte, N+1 debe cerrar por encima del maximo de N
-  (CALL) o por debajo del minimo de N (PUT).
-- Se bloquea cualquier estructura desconocida.
-- Esta estrategia no garantiza ganancias; probar primero en DEMO.
-
-Interfaz compatible con vv2:
-    analyze_market(candle_1m=..., previous_m1=..., pair=...)
+El módulo NO ejecuta operaciones. Si bot.py trabaja con N como vela viva y
+N+1 como vela de entrada, este módulo solo genera la señal; la ejecución sigue
+siendo responsabilidad de bot.py.
 """
+
 from __future__ import annotations
 
-import math
 from typing import Any, Dict, Optional, Tuple
+import math
 
+import numpy as np
 import pandas as pd
 
+
+# ============================================================
+# CONFIGURACIÓN
+# ============================================================
+
 MIN_BARS = 35
-MAX_CANDLES = 120
+MAX_CANDLES = 80
+
+EMA_FAST = 9
+EMA_MID = 21
+EMA_SLOW = 50
+RSI_PERIOD = 14
 ATR_PERIOD = 14
-EMA_FAST = 8
-EMA_SLOW = 21
-LOOKBACK = 60
-SWING_LOOKBACK = 18
-ZONE_ATR_FACTOR = 0.30
-MIN_SCORE = 90
-# Confirmación estricta para evitar entradas con N+1 débil.
-MIN_CONFIRMATION_BODY_RATIO = 0.35
-MIN_CONFIRMATION_CLOSE_POSITION_CALL = 0.65
-MAX_CONFIRMATION_CLOSE_POSITION_PUT = 0.35
-# La señal debe coincidir con el contexto EMA para reducir CALL contra tendencia bajista
-# y PUT contra tendencia alcista.
-REQUIRE_CONTEXT_ALIGNMENT = True
-EPS = 1e-10
+
+# Pivotes confirmados. 2/2 evita usar un extremo que todavía no está confirmado.
+PIVOT_LEFT = 2
+PIVOT_RIGHT = 2
+SWING_LOOKBACK = 35
+
+# Zona dinámica basada en ATR.
+ZONE_ATR = 0.28
+MAX_ENTRY_DISTANCE_ATR = 0.55
+MIN_ROOM_TO_OPPOSITE_ATR = 0.70
+MIN_RECENT_ROOM_ATR = 0.55
+MIN_TREND_SLOPE_ATR = 0.08
+MIN_SIGNAL_QUALITY = 95
+MIN_SIGNAL_SCORE = 95
+
+# Rechazo.
+MIN_BODY_RATIO = 0.25
+MIN_REJECTION_WICK_RATIO = 0.35
+MIN_WICK_BODY_RATIO = 1.15
+MIN_CLOSE_POSITION_CALL = 0.62
+MAX_CLOSE_POSITION_PUT = 0.38
+
+# Evita velas de continuación exageradas.
+MIN_BODY_ATR = 0.12
+MAX_BODY_ATR = 1.35
+
+# Tendencia / estructura.
+MIN_STRUCTURE_GAP_ATR = 0.05
+
+# RSI: no se usa como disparador; solo evita perseguir extremos.
+CALL_RSI_MIN = 38.0
+CALL_RSI_MAX = 68.0
+PUT_RSI_MIN = 32.0
+PUT_RSI_MAX = 62.0
+
+EPS = 1e-12
+
+
+# ============================================================
+# RESULTADO ESTABLE
+# ============================================================
+
+def _empty_result(reason: str = "sin señal") -> Dict[str, Any]:
+    return {
+        "signal": None,
+        "direction": "range",
+        "trend": "range",
+        "reason": reason,
+        "score": 0,
+        "continuity": False,
+        "blocked": True,
+        "zone": None,
+        "entry_type": None,
+        "entry_quality": 0,
+        "quality": 0,
+        "score_100": 0,
+        "execution": "N+1",
+        "expiration_minutes": 1,
+        "entry_for_next_candle": False,
+        "indecision_requires_n_plus_1": True,
+        "last_swing_high": None,
+        "last_swing_low": None,
+        "support": None,
+        "resistance": None,
+        "rsi": 0.0,
+        "atr": 0.0,
+        "candle_timestamp": None,
+    }
 
 
 def _safe_float(value: Any, default: float = 0.0) -> float:
     try:
-        number = float(value)
-        return number if math.isfinite(number) else default
-    except (TypeError, ValueError):
+        x = float(value)
+        return x if math.isfinite(x) else default
+    except Exception:
         return default
 
 
-def _normalize(df: Optional[pd.DataFrame]) -> pd.DataFrame:
+# ============================================================
+# NORMALIZACIÓN
+# ============================================================
+
+def _normalize(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or not isinstance(df, pd.DataFrame) or df.empty:
         return pd.DataFrame()
 
     out = df.copy()
-    out.rename(
-        columns={"max": "high", "min": "low", "timestamp": "from"},
-        inplace=True,
-    )
+
+    rename = {}
+    if "max" in out.columns and "high" not in out.columns:
+        rename["max"] = "high"
+    if "min" in out.columns and "low" not in out.columns:
+        rename["min"] = "low"
+
+    rename.update({
+        "Open": "open",
+        "High": "high",
+        "Low": "low",
+        "Close": "close",
+    })
+    out.rename(columns=rename, inplace=True)
+
     required = ["open", "high", "low", "close"]
-    if any(column not in out.columns for column in required):
+    if any(c not in out.columns for c in required):
         return pd.DataFrame()
 
-    for column in required:
-        out[column] = pd.to_numeric(out[column], errors="coerce")
+    for col in required:
+        out[col] = pd.to_numeric(out[col], errors="coerce")
 
     if "from" in out.columns:
         out["from"] = pd.to_numeric(out["from"], errors="coerce")
         out.dropna(subset=["from"], inplace=True)
-        out["from"] = out["from"].astype(int)
         out.sort_values("from", inplace=True)
-        out.drop_duplicates("from", keep="last", inplace=True)
+        out.drop_duplicates(subset=["from"], keep="last", inplace=True)
 
     out.dropna(subset=required, inplace=True)
-    return out.reset_index(drop=True).tail(MAX_CANDLES).reset_index(drop=True)
+    out.reset_index(drop=True, inplace=True)
+
+    if len(out) > MAX_CANDLES:
+        out = out.tail(MAX_CANDLES).reset_index(drop=True)
+
+    return out
 
 
-def _build_dataframe(
-    candle_1m: Any,
-    previous_m1: Optional[pd.DataFrame],
-    df: Optional[pd.DataFrame],
-) -> pd.DataFrame:
-    if df is not None:
-        return _normalize(df)
+# ============================================================
+# INDICADORES
+# ============================================================
 
-    history = _normalize(previous_m1)
-    if isinstance(candle_1m, pd.Series):
-        current = candle_1m.to_dict()
-    elif isinstance(candle_1m, dict):
-        current = dict(candle_1m)
-    else:
-        return history
+def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
+    out = _normalize(df)
+    if out.empty:
+        return out
 
-    current_df = _normalize(pd.DataFrame([current]))
-    if current_df.empty:
-        return history
-    return _normalize(pd.concat([history, current_df], ignore_index=True))
+    close = out["close"]
+    high = out["high"]
+    low = out["low"]
 
+    out["ema9"] = close.ewm(span=EMA_FAST, adjust=False).mean()
+    out["ema21"] = close.ewm(span=EMA_MID, adjust=False).mean()
+    out["ema50"] = close.ewm(span=EMA_SLOW, adjust=False).mean()
 
-def _true_range(data: pd.DataFrame) -> pd.Series:
-    previous_close = data["close"].shift(1)
-    return pd.concat(
+    prev_close = close.shift(1)
+    tr = pd.concat(
         [
-            data["high"] - data["low"],
-            (data["high"] - previous_close).abs(),
-            (data["low"] - previous_close).abs(),
+            high - low,
+            (high - prev_close).abs(),
+            (low - prev_close).abs(),
         ],
         axis=1,
     ).max(axis=1)
+    out["tr"] = tr
+    out["atr"] = tr.rolling(ATR_PERIOD, min_periods=ATR_PERIOD).mean()
+
+    delta = close.diff()
+    gain = delta.clip(lower=0.0)
+    loss = -delta.clip(upper=0.0)
+    avg_gain = gain.ewm(
+        alpha=1 / RSI_PERIOD,
+        adjust=False,
+        min_periods=RSI_PERIOD,
+    ).mean()
+    avg_loss = loss.ewm(
+        alpha=1 / RSI_PERIOD,
+        adjust=False,
+        min_periods=RSI_PERIOD,
+    ).mean()
+
+    rs = avg_gain / avg_loss.replace(0, np.nan)
+    out["rsi"] = 100.0 - (100.0 / (1.0 + rs))
+    out.loc[(avg_loss == 0) & (avg_gain > 0), "rsi"] = 100.0
+    out.loc[(avg_gain == 0) & (avg_loss > 0), "rsi"] = 0.0
+
+    return out
 
 
-def _metrics(row: pd.Series) -> Dict[str, float]:
-    open_price = _safe_float(row.get("open"))
-    high = _safe_float(row.get("high"))
-    low = _safe_float(row.get("low"))
-    close = _safe_float(row.get("close"))
-    candle_range = max(high - low, EPS)
-    body = abs(close - open_price)
-
-    return {
-        "open": open_price,
-        "high": high,
-        "low": low,
-        "close": close,
-        "range": candle_range,
-        "body": body,
-        "upper": max(high - max(open_price, close), 0.0),
-        "lower": max(min(open_price, close) - low, 0.0),
-        "close_position": (close - low) / candle_range,
-        "body_ratio": body / candle_range,
-    }
-
-
-def _ema(values: pd.Series, period: int) -> float:
-    if values.empty:
+def _atr(history: pd.DataFrame) -> float:
+    if history is None or history.empty:
         return 0.0
-    return _safe_float(values.ewm(span=period, adjust=False).mean().iloc[-1])
+
+    value = history["tr"].tail(ATR_PERIOD).mean() if "tr" in history else np.nan
+    if pd.isna(value) or value <= 0:
+        value = (history["high"] - history["low"]).tail(ATR_PERIOD).mean()
+    if pd.isna(value) or value <= 0:
+        value = abs(float(history["close"].iloc[-1])) * 0.0001
+    return float(max(value, EPS))
 
 
-def _empty(reason: str, analysis: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+# ============================================================
+# VELA
+# ============================================================
+
+def candle_direction(candle: pd.Series) -> str:
+    o = _safe_float(candle.get("open"))
+    c = _safe_float(candle.get("close"))
+    if c > o:
+        return "bull"
+    if c < o:
+        return "bear"
+    return "neutral"
+
+
+def candle_metrics(candle: pd.Series) -> Dict[str, float]:
+    o = _safe_float(candle.get("open"))
+    h = _safe_float(candle.get("high"))
+    l = _safe_float(candle.get("low"))
+    c = _safe_float(candle.get("close"))
+
+    rng = max(h - l, EPS)
+    body = abs(c - o)
+    upper = max(h - max(o, c), 0.0)
+    lower = max(min(o, c) - l, 0.0)
+
     return {
-        "signal": None,
-        "direction": "range",
-        "score": 0,
-        "entry_quality": 0,
-        "entry_type": None,
-        "blocked": True,
-        "reason": reason,
-        "analysis": analysis or {},
+        "open": o,
+        "high": h,
+        "low": l,
+        "close": c,
+        "range": rng,
+        "body": body,
+        "upper": upper,
+        "lower": lower,
+        "body_ratio": body / rng,
+        "close_position": (c - l) / rng,
     }
 
 
-def _swing_structure(data: pd.DataFrame, support: float, resistance: float) -> Dict[str, Any]:
-    if len(data) < 7:
-        return {"name": "unknown", "confirmed": False, "reason": "few_bars"}
+# ============================================================
+# PIVOTES / ÚLTIMO MÁXIMO / ÚLTIMO MÍNIMO
+# ============================================================
 
-    recent = data.tail(SWING_LOOKBACK).reset_index(drop=True)
-    highs = recent["high"].to_numpy(dtype=float)
-    lows = recent["low"].to_numpy(dtype=float)
-    pivot_highs = []
-    pivot_lows = []
+def _confirmed_swings(
+    history: pd.DataFrame,
+    left: int = PIVOT_LEFT,
+    right: int = PIVOT_RIGHT,
+) -> Tuple[list[Tuple[int, float]], list[Tuple[int, float]]]:
+    """Devuelve pivotes confirmados: [(index, price), ...]."""
+    highs: list[Tuple[int, float]] = []
+    lows: list[Tuple[int, float]] = []
 
-    for i in range(1, len(recent) - 1):
-        if highs[i] >= highs[i - 1] and highs[i] >= highs[i + 1]:
-            pivot_highs.append((i, highs[i]))
-        if lows[i] <= lows[i - 1] and lows[i] <= lows[i + 1]:
-            pivot_lows.append((i, lows[i]))
+    if history is None or len(history) < left + right + 3:
+        return highs, lows
 
-    last_low = pivot_lows[-1] if pivot_lows else None
-    previous_low = pivot_lows[-2] if len(pivot_lows) >= 2 else None
-    last_high = pivot_highs[-1] if pivot_highs else None
-    previous_high = pivot_highs[-2] if len(pivot_highs) >= 2 else None
+    start = max(left, len(history) - SWING_LOOKBACK)
+    end = len(history) - right
 
-    result = {
-        "name": "unknown",
-        "confirmed": False,
-        "last_pivot_low": last_low[1] if last_low else None,
-        "previous_pivot_low": previous_low[1] if previous_low else None,
-        "last_pivot_high": last_high[1] if last_high else None,
-        "previous_pivot_high": previous_high[1] if previous_high else None,
+    for i in range(start, end):
+        h = float(history["high"].iloc[i])
+        l = float(history["low"].iloc[i])
+
+        left_highs = history["high"].iloc[i - left:i]
+        right_highs = history["high"].iloc[i + 1:i + right + 1]
+        left_lows = history["low"].iloc[i - left:i]
+        right_lows = history["low"].iloc[i + 1:i + right + 1]
+
+        if h >= float(left_highs.max()) and h >= float(right_highs.max()):
+            highs.append((i, h))
+
+        if l <= float(left_lows.min()) and l <= float(right_lows.min()):
+            lows.append((i, l))
+
+    return highs, lows
+
+
+def _last_swing_levels(history: pd.DataFrame) -> Dict[str, Any]:
+    highs, lows = _confirmed_swings(history)
+
+    last_high = highs[-1] if highs else None
+    last_low = lows[-1] if lows else None
+
+    # Fallback: si todavía no hay pivote confirmado, usa extremos recientes.
+    w = history.tail(min(SWING_LOOKBACK, len(history)))
+    if last_high is None and not w.empty:
+        idx = int(w["high"].idxmax())
+        last_high = (idx, float(w.loc[idx, "high"]))
+    if last_low is None and not w.empty:
+        idx = int(w["low"].idxmin())
+        last_low = (idx, float(w.loc[idx, "low"]))
+
+    return {
+        "highs": highs,
+        "lows": lows,
+        "last_high": last_high,
+        "last_low": last_low,
     }
 
-    zone_width = max(abs(resistance - support) * 0.20, EPS)
-    if last_low and previous_low and abs(last_low[1] - support) <= zone_width:
-        if last_low[1] < previous_low[1]:
-            result.update(name="LL_support_rejection", confirmed=True)
-        elif last_low[1] > previous_low[1]:
-            result.update(name="HL_support_rejection", confirmed=True)
 
-    if last_high and previous_high and abs(last_high[1] - resistance) <= zone_width:
-        if last_high[1] > previous_high[1]:
-            result.update(name="HH_resistance_rejection", confirmed=True)
-        elif last_high[1] < previous_high[1]:
-            result.update(name="LH_resistance_rejection", confirmed=True)
+# ============================================================
+# ESTRUCTURA HH/HL - LH/LL
+# ============================================================
 
+def detect_structure(df: pd.DataFrame) -> str:
+    work = _normalize(df)
+    if len(work) < 12:
+        return "range"
+
+    swings = _last_swing_levels(work)
+    highs = swings["highs"]
+    lows = swings["lows"]
+
+    if len(highs) >= 2 and len(lows) >= 2:
+        h1 = highs[-2][1]
+        h2 = highs[-1][1]
+        l1 = lows[-2][1]
+        l2 = lows[-1][1]
+
+        high_gap = abs(h2 - h1)
+        low_gap = abs(l2 - l1)
+        atr = _atr(add_indicators(work))
+        min_gap = max(atr * MIN_STRUCTURE_GAP_ATR, EPS)
+
+        if h2 > h1 + min_gap and l2 > l1 + min_gap:
+            return "bullish"
+        if h2 < h1 - min_gap and l2 < l1 - min_gap:
+            return "bearish"
+
+    # Fallback suave con EMA, solo cuando los pivotes son insuficientes.
+    ind = add_indicators(work)
+    last = ind.iloc[-1]
+    if last["ema9"] > last["ema21"] > last["ema50"]:
+        return "bullish"
+    if last["ema9"] < last["ema21"] < last["ema50"]:
+        return "bearish"
+    return "range"
+
+
+def structure_score(df: pd.DataFrame) -> int:
+    work = _normalize(df)
+    if len(work) < 12:
+        return 0
+
+    swings = _last_swing_levels(work)
+    score = 0
+
+    highs = swings["highs"]
+    lows = swings["lows"]
+
+    if len(highs) >= 2:
+        score += 1 if highs[-1][1] != highs[-2][1] else 0
+    if len(lows) >= 2:
+        score += 1 if lows[-1][1] != lows[-2][1] else 0
+
+    structure = detect_structure(work)
+    if structure in ("bullish", "bearish"):
+        score += 2
+
+    ind = add_indicators(work)
+    if len(ind) >= 3:
+        if structure == "bullish" and ind["ema9"].iloc[-1] > ind["ema21"].iloc[-1]:
+            score += 1
+        elif structure == "bearish" and ind["ema9"].iloc[-1] < ind["ema21"].iloc[-1]:
+            score += 1
+
+    return min(score, 5)
+
+
+# ============================================================
+# ZONAS DINÁMICAS
+# ============================================================
+
+def recent_levels(df: pd.DataFrame, lookback: int = SWING_LOOKBACK) -> Tuple[float, float]:
+    work = _normalize(df)
+    if work.empty:
+        return 0.0, 0.0
+    x = work.tail(lookback)
+    return float(x["low"].min()), float(x["high"].max())
+
+
+def _zone_test(
+    candle: Dict[str, float],
+    level: float,
+    atr: float,
+    side: str,
+) -> Tuple[bool, float, str]:
+    """
+    Detecta si la vela realmente TESTEÓ el nivel y rechazó.
+    side='support' para CALL, side='resistance' para PUT.
+    """
+    zone = max(atr * ZONE_ATR, EPS)
+
+    if side == "support":
+        touched = candle["low"] <= level + zone
+        closed_above = candle["close"] > level
+        wick_ok = (
+            candle["lower"] / candle["range"] >= MIN_REJECTION_WICK_RATIO
+            or candle["lower"] >= candle["body"] * MIN_WICK_BODY_RATIO
+        )
+        close_ok = candle["close_position"] >= MIN_CLOSE_POSITION_CALL
+        valid = touched and closed_above and wick_ok and close_ok
+
+        distance = abs(candle["close"] - level) / atr
+        return valid, distance, "rechazo de soporte"
+
+    touched = candle["high"] >= level - zone
+    closed_below = candle["close"] < level
+    wick_ok = (
+        candle["upper"] / candle["range"] >= MIN_REJECTION_WICK_RATIO
+        or candle["upper"] >= candle["body"] * MIN_WICK_BODY_RATIO
+    )
+    close_ok = candle["close_position"] <= MAX_CLOSE_POSITION_PUT
+    valid = touched and closed_below and wick_ok and close_ok
+
+    distance = abs(candle["close"] - level) / atr
+    return valid, distance, "rechazo de resistencia"
+
+
+def is_near_sr(df: pd.DataFrame, tolerance: float = 0.0) -> bool:
+    """Compatibilidad: True si el último cierre está cerca de un extremo."""
+    work = _normalize(df)
+    if len(work) < 5:
+        return True
+
+    atr = _atr(add_indicators(work))
+    tol = tolerance if tolerance > 0 else atr * ZONE_ATR
+    low, high = recent_levels(work)
+    price = float(work["close"].iloc[-1])
+    return abs(price - low) <= tol or abs(high - price) <= tol
+
+
+# ============================================================
+# FILTROS DE ENTRADA
+# ============================================================
+
+def _room_to_opposite(
+    price: float,
+    opposite_level: float,
+    atr: float,
+    direction: str,
+) -> bool:
+    if atr <= 0:
+        return False
+    if direction == "bullish":
+        room = opposite_level - price
+    else:
+        room = price - opposite_level
+    return room >= atr * MIN_ROOM_TO_OPPOSITE_ATR
+
+
+def _ema_alignment(last: pd.Series, direction: str) -> bool:
+    e9 = _safe_float(last.get("ema9"))
+    e21 = _safe_float(last.get("ema21"))
+    e50 = _safe_float(last.get("ema50"))
+    close = _safe_float(last.get("close"))
+
+    if direction == "bullish":
+        return e9 >= e21 and e21 >= e50 and close >= e21
+    return e9 <= e21 and e21 <= e50 and close <= e21
+
+
+def _not_overextended(
+    price: float,
+    last_high: float,
+    last_low: float,
+    atr: float,
+    direction: str,
+) -> bool:
+    if atr <= 0:
+        return False
+
+    if direction == "bullish":
+        # CALL no se permite pegado al último máximo.
+        return (last_high - price) >= atr * MIN_ROOM_TO_OPPOSITE_ATR
+    # PUT no se permite pegado al último mínimo.
+    return (price - last_low) >= atr * MIN_ROOM_TO_OPPOSITE_ATR
+
+
+def _body_is_valid(candle: Dict[str, float], atr: float) -> bool:
+    if atr <= 0:
+        return False
+    body_atr = candle["body"] / atr
+    return (
+        candle["body_ratio"] >= MIN_BODY_RATIO
+        and MIN_BODY_ATR <= body_atr <= MAX_BODY_ATR
+    )
+
+
+# ============================================================
+# PREPARACIÓN Y FILTROS DE SEGURIDAD
+# ============================================================
+
+def _build_analysis_frame(
+    df: Optional[pd.DataFrame] = None,
+    *,
+    candle_1m: Optional[Dict[str, Any]] = None,
+    previous_m1: Optional[pd.DataFrame] = None,
+) -> pd.DataFrame:
+    """Admite la API antigua (df) y la API usada por bot.py (N + historial)."""
+    if candle_1m is not None:
+        history = _normalize(previous_m1 if previous_m1 is not None else pd.DataFrame())
+        current = pd.DataFrame([candle_1m])
+        current = _normalize(current)
+        if history.empty:
+            return current
+        return _normalize(pd.concat([history, current], ignore_index=True))
+    return _normalize(df if df is not None else pd.DataFrame())
+
+
+def _recent_room_ok(
+    history: pd.DataFrame,
+    price: float,
+    atr: float,
+    direction: str,
+    lookback: int = 8,
+) -> bool:
+    """Evita entradas pegadas al extremo inmediato de las últimas velas."""
+    if history is None or history.empty or atr <= 0:
+        return False
+    recent = history.tail(lookback)
+    recent_high = float(recent["high"].max())
+    recent_low = float(recent["low"].min())
+    required = atr * MIN_RECENT_ROOM_ATR
+    if direction == "bullish":
+        return recent_high - price >= required
+    return price - recent_low >= required
+
+
+def _trend_slope_ok(history: pd.DataFrame, atr: float, direction: str) -> bool:
+    """Exige pendiente mínima; evita operar rebotes dentro de rango."""
+    if history is None or len(history) < 6 or atr <= 0:
+        return False
+    closes = history["close"].astype(float)
+    delta = float(closes.iloc[-1] - closes.iloc[-6])
+    minimum = atr * MIN_TREND_SLOPE_ATR
+    return delta >= minimum if direction == "bullish" else delta <= -minimum
+
+
+def _attach_public_analysis(result: Dict[str, Any]) -> Dict[str, Any]:
+    """Mantiene campos planos y crea el bloque analysis que espera bot.py."""
+    analysis = result.get("analysis")
+    if not isinstance(analysis, dict):
+        analysis = {}
+    for key in (
+        "structure", "trend", "force", "entry_quality", "impulse_phase",
+        "pullback", "zone", "last_swing_high", "last_swing_low",
+    ):
+        if key in result and key not in analysis:
+            analysis[key] = result[key]
+    result["analysis"] = analysis
     return result
 
 
-def _rejection_side(
-    candle: Dict[str, float],
-    support: float,
-    resistance: float,
-    tolerance: float,
-) -> Tuple[str, bool, list[str]]:
-    near_support = candle["low"] <= support + tolerance and candle["close"] > support
-    near_resistance = candle["high"] >= resistance - tolerance and candle["close"] < resistance
-
-    bullish_rejection = (
-        near_support
-        and candle["lower"] >= max(candle["body"] * 1.40, EPS)
-        and candle["close_position"] >= 0.60
-        and candle["body_ratio"] <= 0.70
-    )
-    bearish_rejection = (
-        near_resistance
-        and candle["upper"] >= max(candle["body"] * 1.40, EPS)
-        and candle["close_position"] <= 0.40
-        and candle["body_ratio"] <= 0.70
-    )
-
-    if bullish_rejection:
-        return "call", True, ["bullish_support_rejection", "close_above_support"]
-    if bearish_rejection:
-        return "put", True, ["bearish_resistance_rejection", "close_below_resistance"]
-    return "unknown", False, []
-
-
-def _confirm_next_candle(
-    direction: str,
-    rejection: Dict[str, float],
-    confirmation: Dict[str, float],
-) -> Tuple[bool, list[str]]:
-    """Confirma la direccion usando la vela posterior ya cerrada."""
-    reasons: list[str] = []
-
-    if direction == "call":
-        bullish = confirmation["close"] > confirmation["open"]
-        closes_above_rejection = confirmation["close"] > rejection["high"]
-        holds_rejection = confirmation["close"] > rejection["close"]
-        if bullish and holds_rejection:
-            reasons.append("next_candle_bullish_confirmation")
-            if closes_above_rejection:
-                reasons.append("close_above_rejection_high")
-            return True, reasons
-
-    if direction == "put":
-        bearish = confirmation["close"] < confirmation["open"]
-        closes_below_rejection = confirmation["close"] < rejection["low"]
-        holds_rejection = confirmation["close"] < rejection["close"]
-        if bearish and holds_rejection:
-            reasons.append("next_candle_bearish_confirmation")
-            if closes_below_rejection:
-                reasons.append("close_below_rejection_low")
-            return True, reasons
-
-    return False, []
-
+# ============================================================
+# API PRINCIPAL
+# ============================================================
 
 def analyze_market(
     df: Optional[pd.DataFrame] = None,
-    candle_1m: Any = None,
-    candles_5s: Optional[pd.DataFrame] = None,
+    *,
+    candle_1m: Optional[Dict[str, Any]] = None,
     previous_m1: Optional[pd.DataFrame] = None,
     pair: Optional[str] = None,
 ) -> Dict[str, Any]:
-    data = _build_dataframe(candle_1m, previous_m1, df)
-    if len(data) < MIN_BARS:
-        return _empty(f"Historial insuficiente {len(data)}/{MIN_BARS}")
+    """
+    Analiza la última vela del dataframe como vela viva/confirmación.
 
-    data = data.copy()
-    data["tr"] = _true_range(data)
-    data["atr"] = data["tr"].rolling(ATR_PERIOD, min_periods=ATR_PERIOD).mean()
-    atr = _safe_float(data.iloc[-1]["atr"], 0.0)
-    if atr <= 0.0:
-        return _empty("ATR insuficiente")
+    La lógica exclusiva es simétrica:
 
-    # La ultima vela es N+1, y la anterior es N (rechazo).
-    rejection = _metrics(data.iloc[-2])
-    confirmation = _metrics(data.iloc[-1])
-    context_data = data.iloc[:-2]
-    if len(context_data) < 10:
-        return _empty("Contexto insuficiente para soporte/resistencia")
+      CALL = estructura bullish + rechazo del último mínimo/soporte
+             + espacio hasta el último máximo + calidad/score >= 95/100.
+      PUT  = estructura bearish + rechazo del último máximo/resistencia
+             + espacio hasta el último mínimo + calidad/score >= 95/100.
 
-    support = _safe_float(context_data["low"].tail(LOOKBACK).min())
-    resistance = _safe_float(context_data["high"].tail(LOOKBACK).max())
-    tolerance = max(atr * ZONE_ATR_FACTOR, rejection["range"] * 0.10)
+    Toda señal exige confirmación en la vela N y ejecución únicamente en N+1,
+    con expiración de 1 minuto. No se permiten continuidades ni rangos.
+    """
+    result = _empty_result()
 
-    fast = _ema(context_data["close"].tail(30), EMA_FAST)
-    slow = _ema(context_data["close"].tail(30), EMA_SLOW)
-    bullish_context = fast > slow
-    bearish_context = fast < slow
-
-    swing = _swing_structure(context_data, support, resistance)
-    direction, rejected, rejection_reasons = _rejection_side(
-        rejection, support, resistance, tolerance
+    clean = _build_analysis_frame(
+        df, candle_1m=candle_1m, previous_m1=previous_m1
     )
+    if len(clean) < MIN_BARS:
+        result["reason"] = f"Historial insuficiente {len(clean)}/{MIN_BARS}"
+        return result
 
-    analysis = {
-        "pair": pair,
-        "pattern": "rejection_with_next_candle_confirmation",
-        "structure": swing["name"],
-        "structure_confirmed": swing.get("confirmed", False),
-        "rejection_detected": rejected,
-        "confirmation_checked": True,
-        "execution_mode": "after_N_plus_1_close",
-        "execution_candle": "N+2",
-        "expiration_minutes": 1,
+    data = add_indicators(clean)
+    if data.empty or len(data) < MIN_BARS:
+        result["reason"] = "Indicadores insuficientes"
+        return result
+
+    # Se mantiene la convención usada por las versiones anteriores:
+    # última fila = vela viva; las anteriores = historial cerrado.
+    live = data.iloc[-1]
+    previous = data.iloc[-2]
+    history = data.iloc[:-1].copy()
+
+    atr = _atr(history)
+    rsi = _safe_float(live.get("rsi"), 50.0)
+    structure = detect_structure(history)
+    s_score = structure_score(history)
+    swings = _last_swing_levels(history)
+
+    last_high = swings["last_high"][1] if swings["last_high"] else None
+    last_low = swings["last_low"][1] if swings["last_low"] else None
+
+    result.update({
+        "direction": structure,
+        "trend": structure,
+        "structure": structure,
+        "structure_score": s_score,
         "atr": atr,
-        "support": support,
-        "resistance": resistance,
-        # Nombres compatibles con la revalidacion de bot.py.
-        # Si no existe un pivote confirmado, se usa la zona estructural
-        # calculada como respaldo para no dejar la revalidacion sin nivel.
-        "last_swing_high": swing.get("last_pivot_high") or resistance,
-        "previous_swing_high": swing.get("previous_pivot_high"),
-        "last_swing_low": swing.get("last_pivot_low") or support,
-        "previous_swing_low": swing.get("previous_pivot_low"),
-        "tolerance": tolerance,
-        "fast_ema": fast,
-        "slow_ema": slow,
-        "bullish_context": bullish_context,
-        "bearish_context": bearish_context,
-        "rejection_candle": rejection,
-        "confirmation_candle": confirmation,
-        "confirmation_body_ratio": confirmation["body_ratio"],
-        "confirmation_close_position": confirmation["close_position"],
-        "confirmation_strength": (
-            "strong" if confirmation["body_ratio"] >= 0.45 and (
-                (direction == "call" and confirmation["close_position"] >= 0.75) or
-                (direction == "put" and confirmation["close_position"] <= 0.25)
-            ) else "normal"
+        "rsi": rsi,
+        "last_swing_high": last_high,
+        "last_swing_low": last_low,
+        "resistance": last_high,
+        "support": last_low,
+        "candle": candle_direction(live),
+        "candle_timestamp": (
+            int(live["from"]) if "from" in data.columns and not pd.isna(live["from"])
+            else None
         ),
-        "rejection_timestamp": int(data.iloc[-2]["from"]) if "from" in data.columns else None,
-        "confirmation_timestamp": int(data.iloc[-1]["from"]) if "from" in data.columns else None,
-        "force": True,
-    }
+    })
 
-    allowed_structures = {
-        "call": {"LL_support_rejection", "HL_support_rejection"},
-        "put": {"HH_resistance_rejection", "LH_resistance_rejection"},
-    }
+    if structure not in ("bullish", "bearish"):
+        result["reason"] = "Estructura lateral/ambigua"
+        return result
 
-    if not rejected or direction == "unknown":
-        return _empty("no_valid_rejection_on_N", analysis)
+    if atr <= 0 or not math.isfinite(atr):
+        result["reason"] = "ATR inválido"
+        return result
 
-    if swing["name"] not in allowed_structures[direction]:
-        return _empty("structure_not_allowed_or_unknown", analysis)
+    if last_high is None or last_low is None:
+        result["reason"] = "No hay máximo/mínimo estructural"
+        return result
 
-    confirmed, confirmation_reasons = _confirm_next_candle(
-        direction, rejection, confirmation
-    )
-    if not confirmed:
-        return _empty("N_plus_1_did_not_confirm_direction", analysis)
+    c = candle_metrics(live)
+    p = candle_metrics(previous)
+    price = c["close"]
 
-    # N+1 debe tener cuerpo suficiente y cerrar cerca del extremo de su rango.
-    # Esto evita confirmar CALL/PUT con velas débiles o con rechazo contrario.
-    if confirmation["body_ratio"] < MIN_CONFIRMATION_BODY_RATIO:
-        analysis["blocked_reason"] = "confirmation_body_too_small"
-        return _empty("N_plus_1_body_too_small", analysis)
+    # Evita entrar inmediatamente después de una vela gigantesca.
+    if not _body_is_valid(c, atr):
+        result["reason"] = "Vela de entrada demasiado pequeña/grande"
+        return result
 
-    if direction == "call" and confirmation["close_position"] < MIN_CONFIRMATION_CLOSE_POSITION_CALL:
-        analysis["blocked_reason"] = "call_confirmation_close_too_low"
-        return _empty("N_plus_1_call_close_not_strong", analysis)
+    # Evita perseguir el precio en el extremo opuesto.
+    if not _not_overextended(price, last_high, last_low, atr, structure):
+        result["reason"] = (
+            "CALL bloqueado cerca del máximo" if structure == "bullish"
+            else "PUT bloqueado cerca del mínimo"
+        )
+        result["zone"] = "extremo_opuesto"
+        return result
 
-    if direction == "put" and confirmation["close_position"] > MAX_CONFIRMATION_CLOSE_POSITION_PUT:
-        analysis["blocked_reason"] = "put_confirmation_close_too_high"
-        return _empty("N_plus_1_put_close_not_strong", analysis)
+    if not _recent_room_ok(history, price, atr, structure):
+        result["reason"] = (
+            "CALL bloqueado: demasiado cerca del máximo reciente"
+            if structure == "bullish"
+            else "PUT bloqueado: demasiado cerca del mínimo reciente"
+        )
+        result["zone"] = "extremo_reciente"
+        return result
 
-    if REQUIRE_CONTEXT_ALIGNMENT:
-        context_aligned = (direction == "call" and bullish_context) or (direction == "put" and bearish_context)
-        if not context_aligned:
-            analysis["blocked_reason"] = "ema_context_not_aligned"
-            return _empty("contexto_ema_no_alineado", analysis)
+    if not _trend_slope_ok(history, atr, structure):
+        result["reason"] = "Pendiente estructural insuficiente; posible rango o rebote"
+        result["zone"] = "rango"
+        return result
 
-    # Puntuación explicable: parte de 90 solo después de pasar todos los filtros.
-    # Los puntos adicionales permiten estudiar qué confirmaciones aportan más valor.
-    score = 90
-    reasons = rejection_reasons + [swing["name"]] + confirmation_reasons
+    # ========================================================
+    # MODO EXCLUSIVO: RECHAZO DE ALTA CALIDAD (CALL O PUT)
+    # ========================================================
+    # CALL: estructura bullish + rechazo de soporte + espacio al máximo.
+    # PUT:  estructura bearish + rechazo de resistencia + espacio al mínimo.
+    # Continuidades, rangos y estructuras opuestas quedan bloqueados.
 
-    if direction == "call" and confirmation["close"] > rejection["high"]:
-        score += 5
-        reasons.append("strong_break_of_rejection_high")
-    if direction == "put" and confirmation["close"] < rejection["low"]:
-        score += 5
-        reasons.append("strong_break_of_rejection_low")
+    if structure == "bullish":
+        direction_name = "CALL"
+        if not _ema_alignment(live, "bullish"):
+            result["reason"] = "EMA no confirma estructura alcista"
+            return result
 
-    if confirmation["body_ratio"] >= 0.45:
-        score += 3
-        reasons.append("confirmation_body_present")
+        if not (CALL_RSI_MIN <= rsi <= CALL_RSI_MAX):
+            result["reason"] = f"RSI CALL fuera de rango {rsi:.1f}"
+            return result
 
-    if (direction == "call" and bullish_context) or (direction == "put" and bearish_context):
-        score += 2
-        reasons.append("ema_context_aligned")
+        support_ok, distance, zone_reason = _zone_test(
+            c, last_low, atr, "support"
+        )
+        if not support_ok:
+            result["reason"] = "Esperando rechazo real del último mínimo/soporte"
+            result["zone"] = "soporte"
+            return result
 
-    score = min(score, 100)
-    if score < MIN_SCORE:
-        return _empty("confirmed_but_score_below_90", analysis)
+        if distance > MAX_ENTRY_DISTANCE_ATR:
+            result["reason"] = "Cierre demasiado alejado del soporte"
+            return result
 
-    signal = "call" if direction == "call" else "put"
-    return {
+        if not _room_to_opposite(price, last_high, atr, "bullish"):
+            result["reason"] = "Poco espacio hasta el último máximo"
+            return result
+
+        if price <= p["close"]:
+            result["reason"] = "Rechazo CALL sin recuperación alcista suficiente"
+            return result
+
+        wick_strength = c["lower"] / max(c["range"], EPS)
+        quality = int(round(
+            55
+            + min(20.0, wick_strength * 30.0)
+            + min(15.0, s_score * 3.0)
+            + (5.0 if c["close_position"] >= 0.72 else 0.0)
+        ))
+        zone_label = "soporte_rechazado"
+        entry_type = "rejection_support"
+        signal = "call"
+        reason_prefix = "CALL"
+        level = last_low
+
+    elif structure == "bearish":
+        direction_name = "PUT"
+        if not _ema_alignment(live, "bearish"):
+            result["reason"] = "EMA no confirma estructura bajista"
+            return result
+
+        if not (PUT_RSI_MIN <= rsi <= PUT_RSI_MAX):
+            result["reason"] = f"RSI PUT fuera de rango {rsi:.1f}"
+            return result
+
+        resistance_ok, distance, zone_reason = _zone_test(
+            c, last_high, atr, "resistance"
+        )
+        if not resistance_ok:
+            result["reason"] = "Esperando rechazo real del último máximo/resistencia"
+            result["zone"] = "resistencia"
+            return result
+
+        if distance > MAX_ENTRY_DISTANCE_ATR:
+            result["reason"] = "Cierre demasiado alejado de la resistencia"
+            return result
+
+        if not _room_to_opposite(price, last_low, atr, "bearish"):
+            result["reason"] = "Poco espacio hasta el último mínimo"
+            return result
+
+        if price >= p["close"]:
+            result["reason"] = "Rechazo PUT sin recuperación bajista suficiente"
+            return result
+
+        wick_strength = c["upper"] / max(c["range"], EPS)
+        quality = int(round(
+            55
+            + min(20.0, wick_strength * 30.0)
+            + min(15.0, s_score * 3.0)
+            + (5.0 if c["close_position"] <= 0.28 else 0.0)
+        ))
+        zone_label = "resistencia_rechazada"
+        entry_type = "rejection_resistance"
+        signal = "put"
+        reason_prefix = "PUT"
+        level = last_high
+
+    else:
+        result["reason"] = "BLOQUEADO: solo se permiten estructuras bullish o bearish confirmadas"
+        return result
+
+    quality = min(100, max(0, quality))
+    if quality < MIN_SIGNAL_QUALITY:
+        result["reason"] = f"{reason_prefix} bloqueado: calidad {quality}/100 < 95/100"
+        return result
+
+    score_100 = quality
+    if score_100 < MIN_SIGNAL_SCORE:
+        result["reason"] = f"{reason_prefix} bloqueado: score {score_100}/100 < 95/100"
+        return result
+
+    result.update({
         "signal": signal,
-        "direction": "bullish" if signal == "call" else "bearish",
-        "score": score,
-        "entry_quality": score,
-        "entry_type": "force",
+        "score": score_100,
+        "score_100": score_100,
+        "reason": (
+            f"{reason_prefix} | rechazo {('soporte/último mínimo' if signal == 'call' else 'resistencia/último máximo')} | "
+            f"nivel={level:.8f} | calidad={quality}/100"
+        ),
+        "continuity": False,
         "blocked": False,
-        "reason": ",".join(reasons) + " | N rechazo + N+1 confirmada / ejecutar N+2",
-        "signal_price": confirmation["close"],
-        "candle_timestamp": int(data.iloc[-1]["from"]) if "from" in data.columns else None,
-        "analysis": analysis,
-    }
+        "zone": zone_label,
+        "entry_type": entry_type,
+        "entry_quality": quality,
+        "quality": quality,
+        "execution": "N+1",
+        "expiration_minutes": 1,
+        "entry_for_next_candle": True,
+        "indecision_requires_n_plus_1": True,
+        "signal_price": price,
+        "candle_open": c["open"],
+        "candle_close": c["close"],
+        "distance_to_zone_atr": distance,
+    })
 
+
+
+# ============================================================
+# COMPATIBILIDAD
+# ============================================================
 
 def get_signal(df: pd.DataFrame) -> Optional[str]:
-    return analyze_market(df=df).get("signal")
+    return analyze_market(df).get("signal")
 
 
 def signal(df: pd.DataFrame) -> Optional[str]:
@@ -425,4 +840,29 @@ def signal(df: pd.DataFrame) -> Optional[str]:
 
 
 if __name__ == "__main__":
-    print("strategy.py cargado: rechazo en N + confirmacion cerrada en N+1; ejecucion N+2")
+    print("strategy.py estructural cargado correctamente.")
+    print("API principal: analyze_market(df)")
+
+# ============================================================
+# COMPATIBILIDAD CON EL bot.py LEGACY
+# ============================================================
+# El bot.py legacy invierte la dirección antes de ejecutar:
+# call -> put / put -> call. Por eso pro_signal devuelve la dirección
+# inversa de la señal real para conservar la compatibilidad.
+
+def pro_signal(df: pd.DataFrame, aggressive: bool = False):
+    result = analyze_market(df)
+    signal = result.get("signal")
+    if signal not in ("call", "put"):
+        return None, None, 0
+    legacy_signal = "put" if signal == "call" else "call"
+    return (
+        legacy_signal,
+        result.get("entry_type"),
+        int(result.get("score_100", 0)),
+    )
+
+
+def update_result(value: Any) -> None:
+    """Compatibilidad con bot.py; los resultados no modifican la estrategia."""
+    return None
