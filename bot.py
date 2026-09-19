@@ -62,7 +62,10 @@ CANDLE_COUNT = max(60, int(os.getenv("CANDLE_COUNT", "80")))
 MAX_OTC_PAIRS = max(1, int(os.getenv("MAX_OTC_PAIRS", "50")))
 
 PAIR_REFRESH_SECONDS = 60.0
-SNIPER_POLL = 0.06
+SNIPER_POLL = 0.02
+# La orden solo se permite durante el segundo 00 o 01 de la vela N.
+# Si el bot llega tarde, la señal se descarta: nunca se traslada a otra vela.
+ENTRY_MAX_DELAY_SECONDS = float(os.getenv("ENTRY_MAX_DELAY_SECONDS", "1.00"))
 TRADE_COOLDOWN = float(os.getenv("TRADE_COOLDOWN", "60"))
 MIN_HISTORY = 35
 MIN_ROOM_TO_OPPOSITE_ATR = float(os.getenv("MIN_ROOM_TO_OPPOSITE_ATR", "0.90"))
@@ -380,7 +383,7 @@ def connect_iq() -> bool:
     telegram_send(
         "🟢 IQ OPTION CONECTADO\n\n"
         "📊 BB + ATR Trailing Stops + RSI\n"
-        "⚡ Análisis N-1; ejecución al comenzar N\n"
+        "⚡ Análisis N-1; ejecución en apertura N (00/01)\n"
         f"⏳ Expiración: {EXPIRATION} minuto(s)"
     )
 
@@ -834,6 +837,7 @@ def analyze_live_candle(pair: str, current_ts: int) -> bool:
 
     LAST_TRADE_TIME[pair] = time.time()
     LAST_TRADE_CANDLE[pair] = int(current_ts)
+    start_result_monitor(pair, signal, order_id, int(current_ts))
 
     telegram_send(
         "✅ ENTRADA EJECUTADA EN VELA DE SEÑAL\n\n"
@@ -853,6 +857,86 @@ def analyze_live_candle(pair: str, current_ts: int) -> bool:
         pair, signal.upper(), current_ts, order_id,
     )
     return True
+
+
+# ============================================================
+# RESULTADO DE LA OPERACION -> TELEGRAM
+# ============================================================
+
+def _result_text(raw_result: Any) -> tuple[str, str]:
+    """Normaliza las respuestas habituales de IQ Option."""
+    value = str(raw_result).strip().lower()
+    if value in {"win", "won", "profit", "true", "1"}:
+        return "WIN", "🟢 GANADA"
+    if value in {"loose", "loss", "lost", "lose", "false", "-1"}:
+        return "LOSS", "🔴 PERDIDA"
+    if value in {"equal", "draw", "tie", "0"}:
+        return "EMPATE", "🟡 EMPATE"
+    return str(raw_result), "ℹ️ RESULTADO"
+
+
+def monitor_trade_result(
+    pair: str,
+    signal: str,
+    order_id: Any,
+    execution_ts: int,
+) -> None:
+    """Espera la liquidación de la operación y envía el resultado a Telegram."""
+    if IQ is None or order_id in (None, "", False):
+        return
+
+    try:
+        checker = getattr(IQ, "check_win_v3", None)
+        if checker is None:
+            checker = getattr(IQ, "check_win_v4", None)
+        if checker is None:
+            logger.warning("%s | API sin check_win_v3/check_win_v4", pair)
+            telegram_send(
+                "⚠️ RESULTADO NO DISPONIBLE\n\n"
+                f"Par: {pair}\n"
+                f"ID: {order_id}\n"
+                "La versión de iqoptionapi no expone el método de resultado."
+            )
+            return
+
+        raw_result = checker(order_id)
+        result_code, result_label = _result_text(raw_result)
+        telegram_send(
+            f"{result_label}\n\n"
+            f"Par: {pair}\n"
+            f"Dirección: {str(signal).upper()}\n"
+            f"ID: {order_id}\n"
+            f"Entrada programada: {execution_ts}\n"
+            f"Resultado IQ: {raw_result}\n"
+            f"Código: {result_code}\n"
+            f"⏳ Expiración: {EXPIRATION} minuto(s)"
+        )
+        logger.info(
+            "%s | RESULTADO | señal=%s | ID=%s | resultado=%s",
+            pair, str(signal).upper(), order_id, raw_result,
+        )
+    except Exception as exc:
+        logger.exception("%s | error consultando resultado ID=%s", pair, order_id)
+        telegram_send(
+            "⚠️ ERROR CONSULTANDO RESULTADO\n\n"
+            f"Par: {pair}\n"
+            f"ID: {order_id}\n"
+            f"Detalle: {exc}"
+        )
+
+
+def start_result_monitor(
+    pair: str,
+    signal: str,
+    order_id: Any,
+    execution_ts: int,
+) -> None:
+    threading.Thread(
+        target=monitor_trade_result,
+        args=(pair, signal, order_id, execution_ts),
+        daemon=True,
+        name=f"result-{pair}",
+    ).start()
 
 
 # ============================================================
@@ -924,112 +1008,90 @@ def buy_binary(pair: str, signal: str) -> Tuple[bool, Optional[Any]]:
     return True, order_id
 
 
-def execute_sniper(pair: str, pending: Dict[str, Any]) -> bool:
+def execute_sniper(
+    pair: str,
+    pending: Dict[str, Any],
+    current_server_ts: Optional[float] = None,
+) -> bool:
+    """Ejecuta la señal únicamente al inicio real de la vela N.
+
+    Regla de entrada:
+    - segundo 00.000 hasta 01.000 como margen técnico de red;
+    - si ya pasó ese margen, se descarta la señal;
+    - no se hacen consultas de velas ni revalidaciones de red en este tramo,
+      porque esas consultas provocaban entradas tardías.
+    """
     execution_ts = int(pending["execution_ts"])
-    signal = str(pending["signal"])
+    signal = str(pending["signal"] or "").lower()
+    server_ts = (
+        float(current_server_ts)
+        if current_server_ts is not None
+        else get_iq_server_timestamp()
+    )
+    delay = server_ts - float(execution_ts)
 
-    current_ts = floor_candle_timestamp(get_iq_server_timestamp())
-
-    if current_ts < execution_ts:
+    if delay < 0:
         return False
 
-    if current_ts > execution_ts:
+    if delay > ENTRY_MAX_DELAY_SECONDS:
         with STATE_LOCK:
             PENDING_ENTRY.pop(pair, None)
+        logger.warning(
+            "%s | entrada tardía descartada | objetivo=%s | reloj=%.3f | retraso=%.3fs",
+            pair,
+            execution_ts,
+            server_ts,
+            delay,
+        )
+        return False
 
-        logger.info("%s | señal para N vencida y descartada", pair)
+    # Doble protección: la orden solo se envía durante el segundo 00 o 01.
+    if int(server_ts) != execution_ts:
         return False
 
     if LAST_TRADE_CANDLE.get(pair) == execution_ts:
+        with STATE_LOCK:
+            PENDING_ENTRY.pop(pair, None)
         return False
 
     if cooldown_active(pair):
-        return False
-
-    if floor_candle_timestamp(get_iq_server_timestamp()) != execution_ts:
-        return False
-
-    if not revalidate_pending_location(pair, pending):
         with STATE_LOCK:
             PENDING_ENTRY.pop(pair, None)
-
-        analysis = pending.get("analysis") or {}
-        current_df = get_closed_candles(pair)
-        current_close = None
-        if current_df is not None and not current_df.empty:
-            current_close = float(current_df.iloc[-1]["close"])
-
-        last_high = analysis.get("last_swing_high")
-        last_low = analysis.get("last_swing_low")
-        opposite_level = last_high if signal == "call" else last_low
-        if isinstance(opposite_level, (tuple, list)) and len(opposite_level) >= 2:
-            opposite_level = opposite_level[1]
-
-        atr_value = float(analysis.get("atr") or 0.0)
-        room_value = None
-        room_atr_value = None
-        if current_close is not None and opposite_level is not None:
-            try:
-                room_value = (
-                    float(opposite_level) - current_close
-                    if signal == "call"
-                    else current_close - float(opposite_level)
-                )
-                if atr_value > 0:
-                    room_atr_value = room_value / atr_value
-            except (TypeError, ValueError):
-                pass
-
-        telegram_send(
-            "🚫 ENTRADA DESCARTADA\n\n"
-            f"Par: {pair}\n"
-            f"Dirección: {signal.upper()}\n"
-            "El espacio disponible no cumplió el mínimo antes de ejecutar.\n\n"
-            f"Precio actual: {_fmt_price(current_close)}\n"
-            f"Nivel opuesto: {_fmt_price(opposite_level)}\n"
-            f"ATR: {_fmt_price(atr_value)}\n"
-            f"Espacio: {_fmt_price(room_value)}\n"
-            f"Espacio en ATR: {_fmt_price(room_atr_value)}\n"
-            f"Mínimo requerido: {MIN_ROOM_TO_OPPOSITE_ATR:.2f} ATR\n"
-            f"N: {pending.get('continuity_ts')}\n"
-            f"Entrada programada: {pending.get('execution_ts')}\n\n"
-            "La entrada no se ejecutará."
-        )
         return False
 
     sent_at = get_iq_server_timestamp()
     ok, order_id = buy_binary(pair, signal)
-
     if not ok:
         with STATE_LOCK:
             PENDING_ENTRY.pop(pair, None)
-
         telegram_send(
             "❌ ORDEN RECHAZADA\n\n"
             f"Par: {pair}\n"
             f"Dirección: {signal.upper()}\n"
-            f"Entrada en N: {execution_ts}\n"
+            f"Entrada objetivo: {execution_ts}\n"
+            f"Reloj IQ: {sent_at:.3f}\n"
             "La señal no se trasladará a otra vela."
         )
         return False
 
     LAST_TRADE_TIME[pair] = time.time()
     LAST_TRADE_CANDLE[pair] = execution_ts
-
+    start_result_monitor(pair, signal, order_id, execution_ts)
     with STATE_LOCK:
         PENDING_ENTRY.pop(pair, None)
 
     pending_analysis = pending.get("analysis") or {}
     telegram_send(
-        "✅ FUERZA EJECUTADA\n\n"
+        "✅ FUERZA EJECUTADA EN APERTURA\n\n"
         f"Par: {pair}\n"
         f"Dirección: {signal.upper()}\n"
         f"Tipo: {pending.get('entry_type')}\n"
         f"N-1 cierre: {pending.get('continuity_ts')}\n"
         f"Entrada programada: {execution_ts}\n"
         f"Reloj IQ: {sent_at:.3f}\n"
+        f"Retraso: {max(0.0, sent_at - execution_ts):.3f}s\n"
         f"ID: {order_id}\n"
-        f"Precio de cierre N: {_fmt_price(pending.get('close'))}\n\n"
+        f"Precio de cierre N-1: {_fmt_price(pending.get('close'))}\n\n"
         f"⏳ Expiración: {EXPIRATION} minuto(s)\n\n"
         f"Estructura: {pending_analysis.get('structure', 'unknown')}\n"
         f"ATR: {_fmt_price(pending_analysis.get('atr'))}\n"
@@ -1037,16 +1099,43 @@ def execute_sniper(pair: str, pending: Dict[str, Any]) -> bool:
         f"Resistencia: {_fmt_price(pending_analysis.get('resistance'))}\n"
         f"Motivos: {pending.get('reason', '')}"
     )
-
     logger.info(
-        "%s | EJECUTADO | %s | análisis N-1=%s | entrada N=%s | ID=%s",
+        "%s | EJECUTADO EN APERTURA | %s | N-1=%s | N=%s | reloj=%.3f | retraso=%.3fs | ID=%s",
         pair,
         signal.upper(),
         pending.get("continuity_ts"),
         execution_ts,
+        sent_at,
+        max(0.0, sent_at - execution_ts),
         order_id,
     )
     return True
+
+
+def sniper_execution_loop() -> None:
+    """Hilo prioritario que vigila las entradas sin esperar el análisis de 50 pares."""
+    while True:
+        try:
+            if not BOT_RUNNING or IQ is None or trade_limit_reached():
+                time.sleep(SNIPER_POLL)
+                continue
+
+            server_ts = get_iq_server_timestamp()
+            with STATE_LOCK:
+                pending_items = list(PENDING_ENTRY.items())
+
+            for pair, pending in pending_items:
+                if not BOT_RUNNING or trade_limit_reached():
+                    break
+                try:
+                    execute_sniper(pair, pending, current_server_ts=server_ts)
+                except Exception:
+                    logger.exception("Error ejecutando sniper para %s", pair)
+
+            time.sleep(SNIPER_POLL)
+        except Exception:
+            logger.exception("Error en hilo prioritario sniper")
+            time.sleep(0.10)
 
 
 # ============================================================
@@ -1059,14 +1148,8 @@ def process_pair(pair: str) -> None:
 
     current_ts = floor_candle_timestamp(get_iq_server_timestamp())
 
-    # Primero se ejecuta, si corresponde, la señal preparada con N-1
-    # al comenzar la vela N.
-    with STATE_LOCK:
-        pending = PENDING_ENTRY.get(pair)
-    if pending is not None:
-        execute_sniper(pair, pending)
-
-    # Después se analiza la última vela completamente cerrada: N-1.
+    # El hilo sniper independiente se encarga de ejecutar N en el segundo 00/01.
+    # Este hilo queda dedicado al análisis de la vela cerrada N-1.
     closed_ts = int(current_ts - TIMEFRAME)
     analyze_closed_candle(pair, closed_ts)
 
@@ -1130,10 +1213,12 @@ def main() -> None:
 
     BOT_RUNNING = AUTO_START
 
+    threading.Thread(target=sniper_execution_loop, daemon=True).start()
+
     telegram_send(
         "🤖 BOT LISTO\n\n"
         "📊 Filtro Bollinger + ATR Trailing Stops + RSI\n"
-        "⚡ Análisis N-1; ejecución al comenzar N\n"
+        "⚡ Análisis N-1; ejecución en apertura N (00/01)\n"
         f"⏳ Expiración: {EXPIRATION} minuto(s)\n"
         f"🚀 Inicio automático: {'SI' if AUTO_START else 'NO'}\n\n"
         + (
