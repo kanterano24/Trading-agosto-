@@ -50,7 +50,7 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 TIMEFRAME = 60
 EXPIRATION = int(os.getenv("EXPIRATION", "1"))
-AMOUNT = float(os.getenv("AMOUNT", "190"))
+AMOUNT = float(os.getenv("AMOUNT", "350"))
 
 # Cuenta de IQ Option: PRACTICE o REAL
 ACCOUNT_TYPE = os.getenv("ACCOUNT_TYPE", "PRACTICE").strip().upper()
@@ -193,7 +193,7 @@ def telegram_command_loop() -> None:
                         "⚡ BINARY OTC | FUERZA\\n"
                         f"Cuenta: {ACCOUNT_TYPE}\\n"
                         f"Entradas: 0/{MAX_TOTAL_TRADES}\\n"
-                        "📌 Análisis en N-1 y ejecución al comenzar N\\n"
+                        "📌 Análisis de estructura y ejecución al comenzar N\\n"
                         f"⏱ Temporalidad: {TIMEFRAME // 60} minuto(s)\\n"
                         f"⏳ Expiración: {EXPIRATION} minuto(s)\\n"
                         f"💵 Importe: {AMOUNT:g}"
@@ -215,7 +215,7 @@ def telegram_command_loop() -> None:
                         f"Estado: {status}\n"
                         "Mercado: BINARY OTC\n"
                         "Filtro: FUERZA\n"
-                        "Entrada: inicio de N\n"
+                        "Entrada: inicio de N a favor de la estructura\n"
                         f"Expiración: {EXPIRATION} minuto(s)\n"
                         f"Importe: {AMOUNT:g}\\n"
                         f"Cuenta: {ACCOUNT_TYPE}\\n"
@@ -380,7 +380,7 @@ def connect_iq() -> bool:
     telegram_send(
         "🟢 IQ OPTION CONECTADO\n\n"
         "📊 BB + ATR Trailing Stops + RSI\n"
-        "⚡ Análisis N-1; ejecución al comenzar N\n"
+        "⚡ Análisis de estructura; ejecución al comenzar N\n"
         f"⏳ Expiración: {EXPIRATION} minuto(s)"
     )
 
@@ -604,7 +604,7 @@ def revalidate_pending_location(
 
 
 # ============================================================
-# ANALISIS N-1 Y PREPARACION DE ENTRADA EN N
+# ANALISIS DE ESTRUCTURA Y PREPARACION DE ENTRADA EN N
 # ============================================================
 
 
@@ -728,7 +728,7 @@ def analyze_closed_candle(pair: str, expected_closed_ts: int) -> bool:
         }
 
     logger.info(
-        "%s | N-1 CERRADA | signal=%s | type=%s | score=%s | %s",
+        "%s | VELA CERRADA / ESTRUCTURA | signal=%s | type=%s | score=%s | %s",
         pair,
         signal,
         result.get("entry_type"),
@@ -778,7 +778,7 @@ def analyze_closed_candle(pair: str, expected_closed_ts: int) -> bool:
         f"Calidad: {analysis.get('entry_quality', result.get('entry_quality', 0))}/100\n"
         f"Estructura: {analysis.get('structure', 'unknown')}\n\n"
         f"Cierre N-1: {_fmt_price(values['close'])}\n"
-        f"N-1 cierre: {expected_closed_ts}\n"
+        f"Vela analizada: {expected_closed_ts}\n"
         f"Entrada al comenzar N: {execution_ts}\n\n"
         "🚫 N-2 confirma contexto; N-1 confirma rechazo; N ejecuta.\n"
         "⚡ La entrada queda pendiente para el inicio de N.\n"
@@ -1025,7 +1025,7 @@ def execute_sniper(pair: str, pending: Dict[str, Any]) -> bool:
         f"Par: {pair}\n"
         f"Dirección: {signal.upper()}\n"
         f"Tipo: {pending.get('entry_type')}\n"
-        f"N-1 cierre: {pending.get('continuity_ts')}\n"
+        f"Vela analizada: {pending.get('continuity_ts')}\n"
         f"Entrada programada: {execution_ts}\n"
         f"Reloj IQ: {sent_at:.3f}\n"
         f"ID: {order_id}\n"
@@ -1133,7 +1133,7 @@ def main() -> None:
     telegram_send(
         "🤖 BOT LISTO\n\n"
         "📊 Filtro Bollinger + ATR Trailing Stops + RSI\n"
-        "⚡ Análisis N-1; ejecución al comenzar N\n"
+        "⚡ Análisis de estructura; ejecución al comenzar N\n"
         f"⏳ Expiración: {EXPIRATION} minuto(s)\n"
         f"🚀 Inicio automático: {'SI' if AUTO_START else 'NO'}\n\n"
         + (
