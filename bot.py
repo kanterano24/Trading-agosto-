@@ -50,7 +50,7 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 TIMEFRAME = 60
 EXPIRATION = int(os.getenv("EXPIRATION", "1"))
-AMOUNT = float(os.getenv("AMOUNT", "333"))
+AMOUNT = float(os.getenv("AMOUNT", "400"))
 
 # Cuenta de IQ Option: PRACTICE o REAL
 ACCOUNT_TYPE = os.getenv("ACCOUNT_TYPE", "PRACTICE").strip().upper()
@@ -193,7 +193,7 @@ def telegram_command_loop() -> None:
                         "⚡ BINARY OTC | FUERZA\\n"
                         f"Cuenta: {ACCOUNT_TYPE}\\n"
                         f"Entradas: 0/{MAX_TOTAL_TRADES}\\n"
-                        "📌 Análisis en N y ejecución en N+1\\n"
+                        "📌 Análisis en N-1 y ejecución al comenzar N\\n"
                         f"⏱ Temporalidad: {TIMEFRAME // 60} minuto(s)\\n"
                         f"⏳ Expiración: {EXPIRATION} minuto(s)\\n"
                         f"💵 Importe: {AMOUNT:g}"
@@ -538,7 +538,7 @@ def revalidate_pending_location(
     pending: Dict[str, Any],
 ) -> bool:
     """
-    Revalida el espacio disponible justo antes de ejecutar N+1.
+    Revalida el espacio disponible justo antes de ejecutar N.
 
     La señal se prepara con N-1, pero el precio puede desplazarse
     durante el cambio de vela. Si el recorrido restante hasta el
@@ -604,7 +604,7 @@ def revalidate_pending_location(
 
 
 # ============================================================
-# ANALISIS Y PREPARACION N+1
+# ANALISIS N-1 Y PREPARACION DE ENTRADA EN N
 # ============================================================
 
 
@@ -637,7 +637,7 @@ def _diagnostic_message(
     signal: str,
     result: Dict[str, Any],
     rejection_label: str = "N",
-    confirmation_label: str = "N+1",
+    confirmation_label: str = "N",
 ) -> str:
     analysis = result.get("analysis") or {}
     rejection = analysis.get("rejection_candle") or {}
@@ -740,7 +740,7 @@ def analyze_closed_candle(pair: str, expected_closed_ts: int) -> bool:
         return True
 
     values = candle_values(closed_row)
-    execution_ts = int(expected_closed_ts + TIMEFRAME)
+    execution_ts = int(expected_closed_ts + TIMEFRAME)  # Entrada al comenzar N
 
     pending = {
         "signal": signal,
@@ -1059,8 +1059,8 @@ def process_pair(pair: str) -> None:
 
     current_ts = floor_candle_timestamp(get_iq_server_timestamp())
 
-    # Primero se ejecuta, si corresponde, la señal preparada en N
-    # durante la vela siguiente N+1.
+    # Primero se ejecuta, si corresponde, la señal preparada con N-1
+    # al comenzar la vela N.
     with STATE_LOCK:
         pending = PENDING_ENTRY.get(pair)
     if pending is not None:
