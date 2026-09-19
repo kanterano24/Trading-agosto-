@@ -51,7 +51,7 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 TIMEFRAME = 60
 EXPIRATION = 1  # Fijo: solo operaciones con expiración de 1 minuto
-AMOUNT = float(os.getenv("AMOUNT", "800"))
+AMOUNT = float(os.getenv("AMOUNT", "235"))
 
 # Cuenta de IQ Option: PRACTICE o REAL
 ACCOUNT_TYPE = os.getenv("ACCOUNT_TYPE", "PRACTICE").strip().upper()
@@ -60,13 +60,11 @@ ACCOUNT_TYPE = os.getenv("ACCOUNT_TYPE", "PRACTICE").strip().upper()
 MAX_TOTAL_TRADES = 100
 TOTAL_TRADES = 0
 CANDLE_COUNT = max(60, int(os.getenv("CANDLE_COUNT", "80")))
-MAX_OTC_PAIRS = max(1, int(os.getenv("MAX_OTC_PAIRS", "2")))
+MAX_OTC_PAIRS = 4  # Requisito fijo: analizar 4 pares OTC como máximo
 
 # Modo de estudio: por defecto concentra el bot en FARTCOINUSD-OTC.
 STUDY_PAIR = os.getenv("STUDY_PAIR", "FARTCOINUSD-OTC").strip().upper()
-STUDY_ONLY_PAIR = os.getenv("STUDY_ONLY_PAIR", "false").strip().lower() in {
-    "1", "true", "yes", "on"
-}
+STUDY_ONLY_PAIR = False  # Desactivado: el bot debe analizar 4 pares, no solo uno
 STUDY_LOG_DIR = os.getenv("STUDY_LOG_DIR", "trade_study")
 STUDY_LOG_FILE = os.path.join(STUDY_LOG_DIR, "trades.jsonl")
 
@@ -225,7 +223,7 @@ def telegram_command_loop() -> None:
                         f"Estado: {status}\n"
                         "Mercado: BINARY OTC\n"
                         "Filtro: FUERZA\n"
-                        "Entrada: inicio de N a favor de la estructura\n"
+                        "Entrada: después de corrección y confirmación\n"
                         f"Expiración: {EXPIRATION} minuto(s)\n"
                         f"Importe: {AMOUNT:g}\\n"
                         f"Cuenta: {ACCOUNT_TYPE}\\n"
@@ -253,63 +251,105 @@ def _is_otc_pair(value: Any) -> bool:
 
 
 def _supports_one_minute_expiration(info: Dict[str, Any]) -> bool:
-    """
-    Acepta pares cuya metadata declara expiración de 1 minuto.
-    Si IQ Option no publica ese dato en el catálogo, no descarta el par;
-    la orden se fuerza igualmente a EXPIRATION=1.
+    """Devuelve True solamente si la metadata del activo declara 1 minuto.
+
+    No busca el número ``1`` en cualquier parte del registro, porque podría
+    pertenecer a un campo ajeno a la expiración (ID, estado, versión, etc.).
+    Solo inspecciona campos explícitamente relacionados con duración/expiración.
+    Si no existe metadata clara, el activo se descarta.
     """
     if not isinstance(info, dict):
         return False
 
-    values = []
-    keys = (
-        "expiration", "expirations", "expiration_time",
-        "expiration_times", "expiration_period", "expiration_periods",
-        "durations", "duration", "available_expirations",
-    )
+    target_keys = {
+        "expiration", "expirations", "expiration_period", "expiration_periods",
+        "available_expirations", "available_durations", "duration", "durations",
+        "duration_minutes", "duration_seconds", "expiration_minutes",
+        "expiration_seconds", "binary_expirations", "binary_durations",
+    }
 
-    def collect(value: Any) -> None:
-        if isinstance(value, dict):
-            for key, item in value.items():
-                key_text = str(key).lower()
-                if any(token in key_text for token in keys):
-                    values.append(item)
+    candidates: list[tuple[str, Any]] = []
+
+    def collect(node: Any) -> None:
+        if isinstance(node, dict):
+            for key, value in node.items():
+                normalized = str(key).strip().lower().replace("-", "_")
+                if (
+                    normalized in target_keys
+                    or "available_expiration" in normalized
+                    or "available_duration" in normalized
+                    or normalized.endswith("_durations")
+                    or normalized.endswith("_expirations")
+                ):
+                    candidates.append((normalized, value))
+                collect(value)
+        elif isinstance(node, (list, tuple, set)):
+            for item in node:
                 collect(item)
-        elif isinstance(value, (list, tuple, set)):
-            for item in value:
-                collect(item)
-        elif isinstance(value, (int, float)) and not isinstance(value, bool):
-            values.append(value)
-        elif isinstance(value, str):
-            values.append(value)
 
     collect(info)
-    if not values:
-        return True
+    if not candidates:
+        return False
 
-    found_one = False
-    found_expiration_data = False
-    for value in values:
-        text = str(value).lower()
-        numbers = []
-        import re
-        for match in re.findall(r"(?<!\d)(\d+(?:\.\d+)?)\s*(m|min|mins|minute|minutes)?", text):
+    import re
+
+    def contains_one_minute(key: str, value: Any) -> bool:
+        key = key.lower()
+
+        if isinstance(value, bool) or value is None:
+            return False
+
+        if isinstance(value, dict):
+            # Se vuelve a evaluar cada valor, conservando el contexto de la clave.
+            for child_key, child_value in value.items():
+                child = str(child_key).lower().replace("-", "_")
+                if contains_one_minute(child, child_value):
+                    return True
+            return False
+
+        if isinstance(value, (list, tuple, set)):
+            return any(contains_one_minute(key, item) for item in value)
+
+        text = str(value).strip().lower()
+        matches = re.findall(
+            r"(?<!\d)(\d+(?:\.\d+)?)\s*(seconds?|secs?|minutes?|mins?|s|m)?\b",
+            text,
+        )
+
+        if not matches and isinstance(value, (int, float)):
+            matches = [(str(value), "")]
+
+        for number_text, unit in matches:
             try:
-                number = float(match[0])
+                number = float(number_text)
             except (TypeError, ValueError):
                 continue
-            unit = match[1]
-            minutes = number / 60.0 if unit in {"s"} else number
-            numbers.append(minutes)
-        if isinstance(value, (int, float)) and not isinstance(value, bool):
-            numbers.append(float(value))
-        if numbers:
-            found_expiration_data = True
-            if any(abs(number - 1.0) < 1e-9 for number in numbers):
-                found_one = True
 
-    return found_one if found_expiration_data else True
+            unit = (unit or "").lower()
+            if unit in {"s", "sec", "secs", "second", "seconds"}:
+                minutes = number / 60.0
+            elif unit in {"m", "min", "mins", "minute", "minutes"}:
+                minutes = number
+            elif "second" in key:
+                minutes = number / 60.0
+            elif "minute" in key:
+                minutes = number
+            else:
+                # En campos genéricos, los valores numéricos aceptados son
+                # 1 (minuto) o 60 (segundos), nunca otros números.
+                if number == 60:
+                    minutes = 1.0
+                elif number == 1:
+                    minutes = 1.0
+                else:
+                    continue
 
+            if abs(minutes - 1.0) < 1e-9:
+                return True
+
+        return False
+
+    return any(contains_one_minute(key, value) for key, value in candidates)
 
 def _load_binary_otc_catalog() -> Tuple[list[str], bool]:
     if IQ is None or not hasattr(IQ, "get_all_init_v2"):
@@ -388,11 +428,19 @@ def refresh_binary_otc_pairs(force: bool = False) -> list[str]:
     if STUDY_ONLY_PAIR:
         selected = [p for p in discovered if p.upper() == STUDY_PAIR]
     else:
-        # Prioriza el par de estudio y completa el universo con un segundo par.
-        # Si STUDY_PAIR no está disponible, toma los dos primeros pares OTC.
+        # Prioriza el par de estudio y completa el universo hasta el limite configurado.
+        # Si STUDY_PAIR no está disponible, toma los primeros pares OTC disponibles.
         prioritized = [p for p in discovered if p.upper() == STUDY_PAIR]
         remaining = [p for p in discovered if p.upper() != STUDY_PAIR]
         selected = (prioritized + remaining)[:MAX_OTC_PAIRS]
+
+    if len(selected) < MAX_OTC_PAIRS:
+        logger.warning(
+            "Solo %s/%s pares OTC declaran expiración de 1 minuto; "
+            "no se agregan pares sin verificación.",
+            len(selected), MAX_OTC_PAIRS,
+        )
+
     previous = set(PAIRS)
     current = set(selected)
 
@@ -1293,7 +1341,7 @@ def main() -> None:
     global BOT_RUNNING, TOTAL_TRADES
 
     logger.info("========================================")
-    logger.info("BOT BINARY OTC | BB + EMA + ATR + RSI | N-1 -> N")
+    logger.info("BOT BINARY OTC | ESTRUCTURA + CORRECCION + CONTINUACION")
     logger.info("TIMEFRAME=%s | EXPIRATION=%s (SOLO 1 MINUTO)", TIMEFRAME, EXPIRATION)
     logger.info("MAX OTC=%s | REFRESH=%ss | AMOUNT=%s | ACCOUNT=%s | MAX_TRADES=%s",
                 MAX_OTC_PAIRS, int(PAIR_REFRESH_SECONDS), AMOUNT, ACCOUNT_TYPE, MAX_TOTAL_TRADES)
@@ -1334,7 +1382,7 @@ def main() -> None:
         "⏱ Solo pares con expiración de 1 minuto\n"
         "⚡ Ejecución al detectar la señal en vela cerrada\n"
         f"⏳ Expiración: {EXPIRATION} minuto(s)\n"
-        f"🔢 Pares analizados: {MAX_OTC_PAIRS}\n"
+        f"🔢 Máximo de pares OTC: {MAX_OTC_PAIRS}\n"
         f"🔄 Actualización de pares: cada {int(PAIR_REFRESH_SECONDS // 60)} minutos\n"
         f"🚀 Inicio automático: {'SI' if AUTO_START else 'NO'}\n\n"
         + (
