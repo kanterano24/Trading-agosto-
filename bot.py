@@ -50,7 +50,7 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 TIMEFRAME = 60
 EXPIRATION = int(os.getenv("EXPIRATION", "1"))
-AMOUNT = float(os.getenv("AMOUNT", "190"))
+AMOUNT = float(os.getenv("AMOUNT", "200"))
 
 # Cuenta de IQ Option: PRACTICE o REAL
 ACCOUNT_TYPE = os.getenv("ACCOUNT_TYPE", "PRACTICE").strip().upper()
@@ -761,7 +761,7 @@ def analyze_closed_candle(pair: str, expected_closed_ts: int) -> bool:
         return True
 
     values = candle_values(closed_row)
-    execution_ts = int(expected_closed_ts + TIMEFRAME)  # Entrada al comenzar N
+    execution_ts = int(expected_closed_ts + TIMEFRAME)  # Entrada al comenzar N-1
 
     pending = {
         "signal": signal,
@@ -800,12 +800,12 @@ def analyze_closed_candle(pair: str, expected_closed_ts: int) -> bool:
         f"Score: {score}/100\n"
         f"Calidad: {analysis.get('entry_quality', result.get('entry_quality', 0))}/100\n"
         f"Estructura: {analysis.get('structure', 'unknown')}\n\n"
-        f"Entrada al comenzar N: {execution_ts}\n\n"
+        f"Entrada al comenzar N-1: {execution_ts}\n\n"
         + _telegram_candle_line("📊 N-2", pending.get("n2_candle"))
         + _telegram_candle_line("📊 N-1", pending.get("n1_candle"))
         + "\n"
-        "🚫 N-1 se analiza; N se utiliza para la entrada.\n"
-        "⚡ La entrada queda pendiente para el inicio de N.\n"
+        "🚫 N-2 se analiza; N-1 se utiliza para la entrada.\n"
+        "⚡ La entrada queda pendiente para el inicio de N-1.\n"
         f"⏳ Expiración: {EXPIRATION} minuto(s)\n\n"
         f"{result.get('reason', '')}\n\n"
         + _diagnostic_message(pair, signal, result)
@@ -1085,16 +1085,15 @@ def process_pair(pair: str) -> None:
 
     current_ts = floor_candle_timestamp(get_iq_server_timestamp())
 
-    # Primero se ejecuta, si corresponde, la señal preparada con N-1
-    # al comenzar la vela N.
+    # Primero se analiza N-2 y se prepara la entrada para el comienzo de N-1.
+    closed_ts = int(current_ts - (2 * TIMEFRAME))
+    analyze_closed_candle(pair, closed_ts)
+
+    # Después se ejecuta la señal pendiente al comenzar N-1.
     with STATE_LOCK:
         pending = PENDING_ENTRY.get(pair)
     if pending is not None:
         execute_sniper(pair, pending)
-
-    # Después se analiza la última vela completamente cerrada: N-1.
-    closed_ts = int(current_ts - TIMEFRAME)
-    analyze_closed_candle(pair, closed_ts)
 
 
 def analyze_all_pairs() -> None:
