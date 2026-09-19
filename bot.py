@@ -76,7 +76,7 @@ AUTO_START = os.getenv("AUTO_START", "true").strip().lower() in {
 # La API publica de strategy.py debe exponer solamente entry_type=force.
 REQUIRE_FORCE = True
 MIN_ACCEPTED_SCORE = int(os.getenv("MIN_ACCEPTED_SCORE", "90"))
-REQUIRE_N_PLUS_1 = True
+REQUIRE_N_PLUS_1 = False
 
 
 # ============================================================
@@ -215,7 +215,7 @@ def telegram_command_loop() -> None:
                         f"Estado: {status}\n"
                         "Mercado: BINARY OTC\n"
                         "Filtro: FUERZA\n"
-                        "Entrada: N+1\n"
+                        "Entrada: inicio de N\n"
                         f"Expiración: {EXPIRATION} minuto(s)\n"
                         f"Importe: {AMOUNT:g}\\n"
                         f"Cuenta: {ACCOUNT_TYPE}\\n"
@@ -380,7 +380,7 @@ def connect_iq() -> bool:
     telegram_send(
         "🟢 IQ OPTION CONECTADO\n\n"
         "📊 BB + ATR Trailing Stops + RSI\n"
-        "⚡ Rechazo N + confirmación N+1; ejecución en N+2\n"
+        "⚡ Análisis N-1; ejecución al comenzar N\n"
         f"⏳ Expiración: {EXPIRATION} minuto(s)"
     )
 
@@ -540,7 +540,7 @@ def revalidate_pending_location(
     """
     Revalida el espacio disponible justo antes de ejecutar N+1.
 
-    La señal se prepara con N, pero el precio puede desplazarse
+    La señal se prepara con N-1, pero el precio puede desplazarse
     durante el cambio de vela. Si el recorrido restante hasta el
     ultimo extremo estructural ya no cumple el minimo, se descarta.
     """
@@ -594,7 +594,7 @@ def revalidate_pending_location(
     valid = room_atr >= MIN_ROOM_TO_OPPOSITE_ATR
 
     logger.info(
-        "%s | revalidacion N+1 | signal=%s | room=%.2f ATR | valido=%s",
+        "%s | revalidacion inicio de N | signal=%s | room=%.2f ATR | valido=%s",
         pair,
         signal,
         room_atr,
@@ -779,9 +779,9 @@ def analyze_closed_candle(pair: str, expected_closed_ts: int) -> bool:
         f"Estructura: {analysis.get('structure', 'unknown')}\n\n"
         f"Cierre N: {_fmt_price(values['close'])}\n"
         f"N cierre: {expected_closed_ts}\n"
-        f"N+1 previsto: {execution_ts}\n\n"
-        "🚫 N no se opera.\n"
-        "⚡ La entrada queda pendiente para la vela programada.\n"
+        f"Entrada al comenzar N: {execution_ts}\n\n"
+        "🚫 N-1 se analiza; N se utiliza para la entrada.\n"
+        "⚡ La entrada queda pendiente para el inicio de N.\n"
         f"⏳ Expiración: {EXPIRATION} minuto(s)\n\n"
         f"{result.get('reason', '')}\n\n"
         + _diagnostic_message(pair, signal, result)
@@ -937,7 +937,7 @@ def execute_sniper(pair: str, pending: Dict[str, Any]) -> bool:
         with STATE_LOCK:
             PENDING_ENTRY.pop(pair, None)
 
-        logger.info("%s | señal N+1 vencida y descartada", pair)
+        logger.info("%s | señal para N vencida y descartada", pair)
         return False
 
     if LAST_TRADE_CANDLE.get(pair) == execution_ts:
@@ -1008,8 +1008,8 @@ def execute_sniper(pair: str, pending: Dict[str, Any]) -> bool:
             "❌ ORDEN RECHAZADA\n\n"
             f"Par: {pair}\n"
             f"Dirección: {signal.upper()}\n"
-            f"N+1: {execution_ts}\n"
-            "La señal no se trasladará."
+            f"Entrada en N: {execution_ts}\n"
+            "La señal no se trasladará a otra vela."
         )
         return False
 
@@ -1039,7 +1039,7 @@ def execute_sniper(pair: str, pending: Dict[str, Any]) -> bool:
     )
 
     logger.info(
-        "%s | EJECUTADO | %s | N=%s | N+1=%s | ID=%s",
+        "%s | EJECUTADO | %s | análisis N-1=%s | entrada N=%s | ID=%s",
         pair,
         signal.upper(),
         pending.get("continuity_ts"),
@@ -1066,7 +1066,7 @@ def process_pair(pair: str) -> None:
     if pending is not None:
         execute_sniper(pair, pending)
 
-    # Después se analiza únicamente la última vela completamente cerrada.
+    # Después se analiza la última vela completamente cerrada: N-1.
     closed_ts = int(current_ts - TIMEFRAME)
     analyze_closed_candle(pair, closed_ts)
 
@@ -1095,7 +1095,7 @@ def main() -> None:
     global BOT_RUNNING, TOTAL_TRADES
 
     logger.info("========================================")
-    logger.info("BOT BINARY OTC | BB + EMA + ATR + RSI | N+1")
+    logger.info("BOT BINARY OTC | BB + EMA + ATR + RSI | N-1 -> N")
     logger.info("TIMEFRAME=%s | EXPIRATION=%s", TIMEFRAME, EXPIRATION)
     logger.info("MAX OTC=%s | AMOUNT=%s | ACCOUNT=%s | MAX_TRADES=%s",
                 MAX_OTC_PAIRS, AMOUNT, ACCOUNT_TYPE, MAX_TOTAL_TRADES)
@@ -1133,7 +1133,7 @@ def main() -> None:
     telegram_send(
         "🤖 BOT LISTO\n\n"
         "📊 Filtro Bollinger + ATR Trailing Stops + RSI\n"
-        "⚡ Rechazo N + confirmación N+1; ejecución en N+2\n"
+        "⚡ Análisis N-1; ejecución al comenzar N\n"
         f"⏳ Expiración: {EXPIRATION} minuto(s)\n"
         f"🚀 Inicio automático: {'SI' if AUTO_START else 'NO'}\n\n"
         + (
