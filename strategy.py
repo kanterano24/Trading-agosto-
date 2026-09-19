@@ -59,12 +59,21 @@ def _atr(candles: List[Dict[str, Any]], period: int = 14) -> float:
     for index in range(1, len(candles)):
         _, _, low, high = _ohlc(candles[index])
         _, previous_close, _, _ = _ohlc(candles[index - 1])
-        true_ranges.append(max(high - low, abs(high - previous_close), abs(low - previous_close)))
+        true_ranges.append(
+            max(
+                high - low,
+                abs(high - previous_close),
+                abs(low - previous_close),
+            )
+        )
     values = true_ranges[-period:]
     return sum(values) / len(values) if values else 0.0
 
 
-def _zones(candles: List[Dict[str, Any]], lookback: int = DEFAULT_LOOKBACK) -> Tuple[float, float]:
+def _zones(
+    candles: List[Dict[str, Any]],
+    lookback: int = DEFAULT_LOOKBACK,
+) -> Tuple[float, float]:
     sample = candles[-max(1, lookback):]
     lows = [_ohlc(candle)[2] for candle in sample]
     highs = [_ohlc(candle)[3] for candle in sample]
@@ -141,7 +150,13 @@ def analyze_rejection(
         if close_price > support + tolerance * 0.25:
             score += 5
         if score >= int(min_score):
-            return Signal("call", min(score, 100), "bullish_support_rejection", support, resistance)
+            return Signal(
+                "call",
+                min(score, 100),
+                "bullish_support_rejection",
+                support,
+                resistance,
+            )
 
     if bearish:
         score = 90
@@ -150,7 +165,13 @@ def analyze_rejection(
         if close_price < resistance - tolerance * 0.25:
             score += 5
         if score >= int(min_score):
-            return Signal("put", min(score, 100), "bearish_resistance_rejection", support, resistance)
+            return Signal(
+                "put",
+                min(score, 100),
+                "bearish_resistance_rejection",
+                support,
+                resistance,
+            )
 
     return Signal("none", 0, "no_valid_rejection", support, resistance)
 
@@ -163,15 +184,30 @@ def analyze_market(
     min_score: int = DEFAULT_MIN_SCORE,
     **_: Any,
 ) -> Dict[str, Any]:
-    """API compatible con las llamadas de bot.py y con uso directo por DataFrame."""
+    """
+    Analiza únicamente una vela cerrada anterior.
+
+    - Cuando bot.py envía previous_m1 + candle_1m, candle_1m ya debe ser N-1.
+    - Cuando se recibe df directamente, se excluye la última vela del DataFrame
+      porque puede estar activa/en formación; se analiza la vela anterior.
+    """
     if previous_m1 is not None:
         records = _as_records(previous_m1)
         if candle_1m is not None:
-            records.append(dict(candle_1m) if isinstance(candle_1m, dict) else {})
+            current_closed = (
+                dict(candle_1m)
+                if isinstance(candle_1m, dict)
+                else {}
+            )
+            records.append(current_closed)
     elif df is not None:
-        records = _as_records(df)
+        all_records = _as_records(df)
+        # No analizar la última vela recibida: puede estar en formación.
+        records = all_records[:-1] if len(all_records) > 1 else []
     else:
-        records = _as_records(candle_1m)
+        all_records = _as_records(candle_1m)
+        # Para llamadas directas, también se descarta la última vela.
+        records = all_records[:-1] if len(all_records) > 1 else []
 
     result = _empty_result()
     if len(records) < MIN_CANDLES:
@@ -182,7 +218,13 @@ def analyze_market(
     records_last = records[-1]
     timestamp = records_last.get("from", records_last.get("timestamp"))
     atr = _atr(records[:-1]) if len(records) > 1 else 0.0
-    direction = "bullish" if signal.action == "call" else "bearish" if signal.action == "put" else "range"
+    direction = (
+        "bullish"
+        if signal.action == "call"
+        else "bearish"
+        if signal.action == "put"
+        else "range"
+    )
     force = signal.action in {"call", "put"} and signal.score >= int(min_score)
     analysis = {
         "force": force,
