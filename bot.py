@@ -13,30 +13,6 @@ from iqoptionapi.stable_api import IQ_Option
 import iqoptionapi.constants as OP_code
 
 
-# ============================================================
-# COMPATIBILIDAD IQOPTIONAPI - SOLO BINARY OTC
-# ============================================================
-
-def _binary_only_digital_underlying(self):
-    return {"underlying": []}
-
-
-def _disabled_digital_open(self, *args, **kwargs):
-    return None
-
-
-setattr(IQ_Option, "get_digital_underlying_list_data",
-        _binary_only_digital_underlying)
-
-for _name in (
-    "_IQ_Option__get_digital_open",
-    "__get_digital_open",
-    "_get_digital_open",
-):
-    if hasattr(IQ_Option, _name):
-        setattr(IQ_Option, _name, _disabled_digital_open)
-
-
 from strategy import analyze_market
 
 
@@ -51,7 +27,7 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 TIMEFRAME = 60
 EXPIRATION = 1  # Fijo: solo operaciones con expiración de 1 minuto
-AMOUNT = float(os.getenv("AMOUNT", "190"))
+AMOUNT = float(os.getenv("AMOUNT", "290"))
 
 # Cuenta de IQ Option: PRACTICE o REAL
 ACCOUNT_TYPE = os.getenv("ACCOUNT_TYPE", "PRACTICE").strip().upper()
@@ -60,11 +36,8 @@ ACCOUNT_TYPE = os.getenv("ACCOUNT_TYPE", "PRACTICE").strip().upper()
 MAX_TOTAL_TRADES = 100
 TOTAL_TRADES = 0
 CANDLE_COUNT = max(60, int(os.getenv("CANDLE_COUNT", "80")))
-MAX_OTC_PAIRS = 4  # Requisito fijo: analizar 4 pares OTC como máximo
+MAX_PAIRS = 0  # SIN LIMITE: analiza todos los activos de la libreria que cumplan el filtro
 
-# Modo de estudio: por defecto concentra el bot en FARTCOINUSD-OTC.
-STUDY_PAIR = os.getenv("STUDY_PAIR", "FARTCOINUSD-OTC").strip().upper()
-STUDY_ONLY_PAIR = False  # Desactivado: el bot debe analizar 4 pares, no solo uno
 STUDY_LOG_DIR = os.getenv("STUDY_LOG_DIR", "trade_study")
 STUDY_LOG_FILE = os.path.join(STUDY_LOG_DIR, "trades.jsonl")
 
@@ -93,6 +66,7 @@ REQUIRE_N_PLUS_1 = False
 BOT_RUNNING = False
 IQ: Optional[IQ_Option] = None
 PAIRS: list[str] = []
+PAIR_MARKET: Dict[str, str] = {}
 LAST_PAIR_REFRESH = 0.0
 
 LIVE_STATE: Dict[str, Dict[str, Any]] = {}
@@ -198,10 +172,10 @@ def telegram_command_loop() -> None:
                     BOT_RUNNING = True
                     telegram_send(
                         "🟢 BOT ACTIVADO\\n\\n"
-                        "⚡ BINARY OTC | FUERZA\\n"
+                        "⚡ MULTIMERCADO | REVERSIÓN\\n"
                         f"Cuenta: {ACCOUNT_TYPE}\\n"
                         f"Entradas: 0/{MAX_TOTAL_TRADES}\\n"
-                        "📌 Análisis de estructura y ejecución al comenzar N\\n"
+                        "📌 Análisis de estructura y reversión en tiempo real\\n"
                         f"⏱ Temporalidad: {TIMEFRAME // 60} minuto(s)\\n"
                         f"⏳ Expiración: {EXPIRATION} minuto(s)\\n"
                         f"💵 Importe: {AMOUNT:g}"
@@ -221,15 +195,15 @@ def telegram_command_loop() -> None:
                     telegram_send(
                         "📊 ESTADO\n\n"
                         f"Estado: {status}\n"
-                        "Mercado: BINARY OTC\n"
+                        "Mercados: Binary/Turbo y Digital\n"
                         "Filtro: FUERZA\n"
                         "Entrada: después de corrección y confirmación\n"
                         f"Expiración: {EXPIRATION} minuto(s)\n"
                         f"Importe: {AMOUNT:g}\\n"
                         f"Cuenta: {ACCOUNT_TYPE}\\n"
                         f"Entradas: {TOTAL_TRADES}/{MAX_TOTAL_TRADES}\\n"
-                        f"Pares OTC: {len(PAIRS)}\n"
-                        f"Estudio: {STUDY_PAIR if STUDY_ONLY_PAIR else 'todos los pares'}"
+                        f"Activos: {len(PAIRS)}\n"
+                        "Filtro: primer vencimiento disponible de 1 minuto"
                     )
 
         except Exception as exc:
@@ -238,84 +212,53 @@ def telegram_command_loop() -> None:
 
 
 # ============================================================
-# OTC
+# UNIVERSO DE ACTIVOS DISPONIBLES
 # ============================================================
 
-def _is_otc_pair(value: Any) -> bool:
-    try:
-        name = str(value).strip().upper()
-    except Exception:
-        return False
-
-    return name.endswith("-OTC") or name.endswith("_OTC") or "OTC" in name
-
-
 def _supports_one_minute_expiration(info: Dict[str, Any]) -> bool:
-    """Devuelve True solamente si la metadata del activo declara 1 minuto.
+    """Valida que el activo declare explícitamente una duración de 1 minuto.
 
-    No busca el número ``1`` en cualquier parte del registro, porque podría
-    pertenecer a un campo ajeno a la expiración (ID, estado, versión, etc.).
-    Solo inspecciona campos explícitamente relacionados con duración/expiración.
-    Si no existe metadata clara, el activo se descarta.
+    No acepta el número 1 encontrado en campos ajenos a la duración. Si no
+    existe una metadata de expiración/duración verificable, el activo se omite.
     """
     if not isinstance(info, dict):
         return False
 
-    target_keys = {
+    keys = {
         "expiration", "expirations", "expiration_period", "expiration_periods",
         "available_expirations", "available_durations", "duration", "durations",
         "duration_minutes", "duration_seconds", "expiration_minutes",
         "expiration_seconds", "binary_expirations", "binary_durations",
+        "min_duration", "max_duration", "min_expiration", "max_expiration",
     }
-
     candidates: list[tuple[str, Any]] = []
 
-    def collect(node: Any) -> None:
+    def walk(node: Any) -> None:
         if isinstance(node, dict):
             for key, value in node.items():
                 normalized = str(key).strip().lower().replace("-", "_")
-                if (
-                    normalized in target_keys
-                    or "available_expiration" in normalized
-                    or "available_duration" in normalized
-                    or normalized.endswith("_durations")
-                    or normalized.endswith("_expirations")
-                ):
+                if normalized in keys or "expiration" in normalized or "duration" in normalized:
                     candidates.append((normalized, value))
-                collect(value)
+                walk(value)
         elif isinstance(node, (list, tuple, set)):
             for item in node:
-                collect(item)
+                walk(item)
 
-    collect(info)
+    walk(info)
     if not candidates:
         return False
 
-    import re
-
-    def contains_one_minute(key: str, value: Any) -> bool:
-        key = key.lower()
-
-        if isinstance(value, bool) or value is None:
+    def one_minute(key: str, value: Any) -> bool:
+        if value is None or isinstance(value, bool):
             return False
-
         if isinstance(value, dict):
-            # Se vuelve a evaluar cada valor, conservando el contexto de la clave.
-            for child_key, child_value in value.items():
-                child = str(child_key).lower().replace("-", "_")
-                if contains_one_minute(child, child_value):
-                    return True
-            return False
-
+            return any(one_minute(str(k).lower().replace("-", "_"), v) for k, v in value.items())
         if isinstance(value, (list, tuple, set)):
-            return any(contains_one_minute(key, item) for item in value)
+            return any(one_minute(key, item) for item in value)
 
         text = str(value).strip().lower()
-        matches = re.findall(
-            r"(?<!\d)(\d+(?:\.\d+)?)\s*(seconds?|secs?|minutes?|mins?|s|m)?\b",
-            text,
-        )
-
+        import re
+        matches = re.findall(r"(?<!\d)(\d+(?:\.\d+)?)\s*(seconds?|secs?|minutes?|mins?|s|m)?\b", text)
         if not matches and isinstance(value, (int, float)):
             matches = [(str(value), "")]
 
@@ -324,144 +267,141 @@ def _supports_one_minute_expiration(info: Dict[str, Any]) -> bool:
                 number = float(number_text)
             except (TypeError, ValueError):
                 continue
-
             unit = (unit or "").lower()
-            if unit in {"s", "sec", "secs", "second", "seconds"}:
+            if unit in {"s", "sec", "secs", "second", "seconds"} or "second" in key:
                 minutes = number / 60.0
-            elif unit in {"m", "min", "mins", "minute", "minutes"}:
+            elif unit in {"m", "min", "mins", "minute", "minutes"} or "minute" in key:
                 minutes = number
-            elif "second" in key:
-                minutes = number / 60.0
-            elif "minute" in key:
-                minutes = number
+            elif "duration" in key or "expiration" in key:
+                # Campos genéricos de duración suelen estar expresados en minutos.
+                minutes = number if number == 1 else (number / 60.0 if number == 60 else -1)
             else:
-                # En campos genéricos, los valores numéricos aceptados son
-                # 1 (minuto) o 60 (segundos), nunca otros números.
-                if number == 60:
-                    minutes = 1.0
-                elif number == 1:
-                    minutes = 1.0
-                else:
-                    continue
-
+                continue
             if abs(minutes - 1.0) < 1e-9:
                 return True
-
         return False
 
-    return any(contains_one_minute(key, value) for key, value in candidates)
+    return any(one_minute(key, value) for key, value in candidates)
 
-def _load_binary_otc_catalog() -> Tuple[list[str], bool]:
+
+def _asset_name(info: Dict[str, Any]) -> Optional[str]:
+    raw_name = info.get("name") or info.get("active_name") or info.get("symbol")
+    if not isinstance(raw_name, str) or not raw_name.strip():
+        return None
+    name = raw_name.split(".", 1)[1] if "." in raw_name else raw_name
+    return name.strip()
+
+
+def _asset_is_open(info: Dict[str, Any]) -> bool:
+    if not isinstance(info, dict):
+        return False
+    for key in ("enabled", "open", "is_open", "active", "tradable"):
+        if key in info and info[key] is False:
+            return False
+    for key in ("is_suspended", "suspended", "closed"):
+        if info.get(key) is True:
+            return False
+    return True
+
+
+def _catalog_assets() -> Tuple[list[str], Dict[str, str], bool]:
+    """Obtiene activos binary/turbo/digital, sin filtrar por OTC o REAL."""
     if IQ is None or not hasattr(IQ, "get_all_init_v2"):
-        return [], False
-
+        return [], {}, False
     try:
         data = IQ.get_all_init_v2()
     except Exception as exc:
-        logger.warning("Catálogo BINARY no disponible: %s", exc)
-        return [], False
-
+        logger.warning("Catálogo de activos no disponible: %s", exc)
+        return [], {}, False
     if not isinstance(data, dict):
-        return [], False
+        return [], {}, False
 
-    binary = data.get("binary")
-    if not isinstance(binary, dict):
-        result = data.get("result")
-        if isinstance(result, dict):
-            binary = result.get("binary")
+    root = data.get("result") if isinstance(data.get("result"), dict) else data
+    names: list[str] = []
+    markets: Dict[str, str] = {}
 
-    if not isinstance(binary, dict):
-        return [], False
-
-    actives = binary.get("actives", {})
-    if not isinstance(actives, dict):
-        return [], False
-
-    pairs: list[str] = []
-
-    for active_id, info in actives.items():
-        if not isinstance(info, dict):
+    for market_key, market_type in (("binary", "binary"), ("turbo", "binary"), ("digital", "digital")):
+        market = root.get(market_key)
+        if not isinstance(market, dict):
             continue
-
-        raw_name = info.get("name")
-        if not isinstance(raw_name, str):
+        actives = market.get("actives", market.get("assets", {}))
+        if not isinstance(actives, dict):
             continue
+        for active_id, info in actives.items():
+            if not isinstance(info, dict) or not _asset_is_open(info):
+                continue
+            name = _asset_name(info)
+            if not name or not _supports_one_minute_expiration(info):
+                continue
+            try:
+                numeric_id = int(active_id)
+            except (TypeError, ValueError):
+                numeric_id = None
+            if numeric_id is not None:
+                try:
+                    OP_code.ACTIVES[name] = numeric_id
+                except Exception:
+                    pass
+            if name not in markets or (markets[name] != "digital" and market_type == "digital"):
+                markets[name] = market_type
+            if name not in names:
+                names.append(name)
 
-        name = raw_name.split(".", 1)[1] if "." in raw_name else raw_name
-        name = name.strip()
-
-        if not _is_otc_pair(name):
-            continue
-        if info.get("enabled", True) is False:
-            continue
-        if info.get("is_suspended", info.get("suspended", False)) is True:
-            continue
-
-        if not _supports_one_minute_expiration(info):
-            logger.debug("Par descartado: no declara expiración de 1 minuto: %s", name)
-            continue
-
-        try:
-            numeric_id = int(active_id)
-        except (TypeError, ValueError):
-            continue
-
-        OP_code.ACTIVES[name] = numeric_id
-        pairs.append(name)
-
-    return sorted(set(pairs)), True
+    return sorted(names), markets, True
 
 
-def discover_binary_otc_pairs() -> list[str]:
-    pairs, ok = _load_binary_otc_catalog()
-    return sorted(set(p for p in pairs if _is_otc_pair(p))) if ok else []
+def discover_available_pairs() -> list[str]:
+    names, _, ok = _catalog_assets()
+    return names if ok else []
 
 
-def refresh_binary_otc_pairs(force: bool = False) -> list[str]:
-    global PAIRS, LAST_PAIR_REFRESH
-
+def refresh_available_pairs(force: bool = False) -> list[str]:
+    global PAIRS, PAIR_MARKET, LAST_PAIR_REFRESH
     now = time.time()
     if not force and now - LAST_PAIR_REFRESH < PAIR_REFRESH_SECONDS:
         return list(PAIRS)
 
-    discovered = discover_binary_otc_pairs()
-    if STUDY_ONLY_PAIR:
-        selected = [p for p in discovered if p.upper() == STUDY_PAIR]
-    else:
-        # Prioriza el par de estudio y completa el universo hasta el limite configurado.
-        # Si STUDY_PAIR no está disponible, toma los primeros pares OTC disponibles.
-        prioritized = [p for p in discovered if p.upper() == STUDY_PAIR]
-        remaining = [p for p in discovered if p.upper() != STUDY_PAIR]
-        selected = (prioritized + remaining)[:MAX_OTC_PAIRS]
+    discovered, markets, ok = _catalog_assets_with_markets()
+    if not ok:
+        logger.warning("No se pudo actualizar el universo de activos")
+        return list(PAIRS)
 
-    if len(selected) < MAX_OTC_PAIRS:
-        logger.warning(
-            "Solo %s/%s pares OTC declaran expiración de 1 minuto; "
-            "no se agregan pares sin verificación.",
-            len(selected), MAX_OTC_PAIRS,
-        )
-
+    selected = discovered if MAX_PAIRS <= 0 else discovered[:MAX_PAIRS]
     previous = set(PAIRS)
     current = set(selected)
-
     with STATE_LOCK:
         PAIRS = list(selected)
+        PAIR_MARKET = {name: markets[name] for name in selected if name in markets}
         LAST_PAIR_REFRESH = now
-
         for pair in previous - current:
             PENDING_ENTRY.pop(pair, None)
             LIVE_STATE.pop(pair, None)
             LAST_TRADE_CANDLE.pop(pair, None)
 
     if current != previous:
-        logger.info("Universo OTC actualizado: %s pares", len(selected))
-        telegram_send(
-            "🔄 UNIVERSO OTC ACTUALIZADO\n\n"
-            f"Pares disponibles: {len(selected)}/{MAX_OTC_PAIRS}"
+        by_market = {"binary": 0, "digital": 0}
+        for pair in selected:
+            by_market[PAIR_MARKET.get(pair, "binary")] = by_market.get(PAIR_MARKET.get(pair, "binary"), 0) + 1
+        message = (
+            "🔄 UNIVERSO DE ACTIVOS ACTUALIZADO\n\n"
+            f"Activos válidos: {len(selected)}\n"
+            f"Binary/Turbo: {by_market.get('binary', 0)}\n"
+            f"Digital: {by_market.get('digital', 0)}\n"
+            "Filtro: primer reloj de expiración disponible = 1 minuto\n"
+            "Mercados: TODOS (OTC, REAL y DIGITAL) según disponibilidad"
         )
-
+        logger.info(message.replace("\n", " | "))
+        telegram_send(message)
     return list(PAIRS)
 
+
+def _catalog_assets_with_markets() -> Tuple[list[str], Dict[str, str], bool]:
+    return _catalog_assets()
+
+
+# Alias de compatibilidad para llamadas antiguas.
+def refresh_binary_otc_pairs(force: bool = False) -> list[str]:
+    return refresh_available_pairs(force=force)
 
 # ============================================================
 # RELOJ Y CONEXION
@@ -504,12 +444,12 @@ def connect_iq() -> bool:
     IQ.change_balance(ACCOUNT_TYPE)
     logger.info("Cuenta seleccionada: %s", ACCOUNT_TYPE)
 
-    refresh_binary_otc_pairs(force=True)
+    refresh_available_pairs(force=True)
 
     telegram_send(
         "🟢 IQ OPTION CONECTADO\n\n"
         "📊 BB + ATR Trailing Stops + RSI\n"
-        "⚡ Análisis de estructura; ejecución al comenzar N\n"
+        "⚡ Análisis de estructura y reversión en tiempo real\n"
         f"⏳ Expiración: {EXPIRATION} minuto(s)"
     )
 
@@ -534,7 +474,7 @@ def ensure_connection() -> bool:
             logger.error("No se pudo reconectar: %s", reason)
             return False
 
-        refresh_binary_otc_pairs(force=True)
+        refresh_available_pairs(force=True)
         telegram_send("🟢 IQ OPTION RECONECTADO")
         return True
 
@@ -1101,19 +1041,20 @@ def trade_limit_reached() -> bool:
 
 
 def buy_binary(pair: str, signal: str) -> Tuple[bool, Optional[Any]]:
+    """Envía la orden según el tipo de mercado detectado en el catálogo."""
     global TOTAL_TRADES, BOT_RUNNING
-
     if IQ is None or signal not in ("call", "put"):
         return False, None
 
-    # El bloqueo cubre la comprobación y el envío para evitar
-    # que dos hilos consuman el mismo cupo simultáneamente.
+    market = PAIR_MARKET.get(pair, "binary")
     with STATE_LOCK:
         if TOTAL_TRADES >= MAX_TOTAL_TRADES:
             return False, None
-
         try:
-            result = IQ.buy(AMOUNT, pair, signal, EXPIRATION)
+            if market == "digital" and hasattr(IQ, "buy_digital_spot"):
+                result = IQ.buy_digital_spot(pair, AMOUNT, signal, EXPIRATION)
+            else:
+                result = IQ.buy(AMOUNT, pair, signal, EXPIRATION)
 
             if isinstance(result, tuple):
                 ok = bool(result[0])
@@ -1121,38 +1062,25 @@ def buy_binary(pair: str, signal: str) -> Tuple[bool, Optional[Any]]:
             else:
                 ok = result not in (None, False, "error", -1)
                 order_id = result
-
             if not ok:
                 return False, order_id
 
             TOTAL_TRADES += 1
             current_trades = TOTAL_TRADES
-
             if TOTAL_TRADES >= MAX_TOTAL_TRADES:
                 BOT_RUNNING = False
                 PENDING_ENTRY.clear()
-
         except Exception as exc:
-            logger.error("%s | buy error: %s", pair, exc)
+            logger.error("%s | %s | error de orden: %s", pair, market, exc)
             return False, None
 
-    logger.info(
-        "%s | ENTRADA %s/%s | cuenta=%s",
-        pair,
-        current_trades,
-        MAX_TOTAL_TRADES,
-        ACCOUNT_TYPE,
-    )
-
+    logger.info("%s | mercado=%s | ENTRADA %s/%s | cuenta=%s", pair, market, current_trades, MAX_TOTAL_TRADES, ACCOUNT_TYPE)
     if current_trades >= MAX_TOTAL_TRADES:
         telegram_send(
-            "🛑 LIMITE DE ENTRADAS ALCANZADO\\n\\n"
-            f"Entradas ejecutadas: {current_trades}/{MAX_TOTAL_TRADES}\\n"
-            f"Cuenta: {ACCOUNT_TYPE}\\n"
-            "El bot se detuvo automáticamente.\\n"
-            "No se abrirán nuevas operaciones."
+            "🛑 LÍMITE DE ENTRADAS ALCANZADO\n\n"
+            f"Entradas ejecutadas: {current_trades}/{MAX_TOTAL_TRADES}\n"
+            f"Cuenta: {ACCOUNT_TYPE}"
         )
-
     return True, order_id
 
 
@@ -1321,7 +1249,7 @@ def analyze_all_pairs() -> None:
     if not BOT_RUNNING or trade_limit_reached():
         return
 
-    refresh_binary_otc_pairs()
+    refresh_available_pairs()
 
     for pair in list(PAIRS):
         if not BOT_RUNNING or trade_limit_reached():
@@ -1341,10 +1269,10 @@ def main() -> None:
     global BOT_RUNNING, TOTAL_TRADES
 
     logger.info("========================================")
-    logger.info("BOT BINARY OTC | ESTRUCTURA + CORRECCION + CONTINUACION")
+    logger.info("BOT MULTIMERCADO | ESTRUCTURA + TOQUE DE NIVEL + REVERSIÓN")
     logger.info("TIMEFRAME=%s | EXPIRATION=%s (SOLO 1 MINUTO)", TIMEFRAME, EXPIRATION)
-    logger.info("MAX OTC=%s | REFRESH=%ss | AMOUNT=%s | ACCOUNT=%s | MAX_TRADES=%s",
-                MAX_OTC_PAIRS, int(PAIR_REFRESH_SECONDS), AMOUNT, ACCOUNT_TYPE, MAX_TOTAL_TRADES)
+    logger.info("MAX PAIRS=%s | REFRESH=%ss | AMOUNT=%s | ACCOUNT=%s | MAX_TRADES=%s",
+                MAX_PAIRS, int(PAIR_REFRESH_SECONDS), AMOUNT, ACCOUNT_TYPE, MAX_TOTAL_TRADES)
     logger.info("========================================")
 
     required = {
@@ -1378,11 +1306,11 @@ def main() -> None:
 
     telegram_send(
         "🤖 BOT LISTO\n\n"
-        "📊 Filtro de estructura + pullback + continuidad\n"
+        "📊 Estructura + toque de nivel + reversión\n"
         "⏱ Solo pares con expiración de 1 minuto\n"
-        "⚡ Ejecución al detectar la señal en vela cerrada\n"
+        "⚡ Ejecución inmediata al cumplir las condiciones\n"
         f"⏳ Expiración: {EXPIRATION} minuto(s)\n"
-        f"🔢 Máximo de pares OTC: {MAX_OTC_PAIRS}\n"
+        f"🔢 Activos analizados: {len(PAIRS)} (sin límite fijo)\n"
         f"🔄 Actualización de pares: cada {int(PAIR_REFRESH_SECONDS // 60)} minutos\n"
         f"🚀 Inicio automático: {'SI' if AUTO_START else 'NO'}\n\n"
         + (
