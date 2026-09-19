@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import logging
 import os
 import threading
@@ -11,6 +10,30 @@ import pandas as pd
 import requests
 from iqoptionapi.stable_api import IQ_Option
 import iqoptionapi.constants as OP_code
+
+
+# ============================================================
+# COMPATIBILIDAD IQOPTIONAPI - SOLO BINARY OTC
+# ============================================================
+
+def _binary_only_digital_underlying(self):
+    return {"underlying": []}
+
+
+def _disabled_digital_open(self, *args, **kwargs):
+    return None
+
+
+setattr(IQ_Option, "get_digital_underlying_list_data",
+        _binary_only_digital_underlying)
+
+for _name in (
+    "_IQ_Option__get_digital_open",
+    "__get_digital_open",
+    "_get_digital_open",
+):
+    if hasattr(IQ_Option, _name):
+        setattr(IQ_Option, _name, _disabled_digital_open)
 
 
 from strategy import analyze_market
@@ -26,8 +49,8 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 TIMEFRAME = 60
-EXPIRATION = 1  # Fijo: solo operaciones con expiración de 1 minuto
-AMOUNT = float(os.getenv("AMOUNT", "190"))
+EXPIRATION = int(os.getenv("EXPIRATION", "1"))
+AMOUNT = float(os.getenv("AMOUNT", "333"))
 
 # Cuenta de IQ Option: PRACTICE o REAL
 ACCOUNT_TYPE = os.getenv("ACCOUNT_TYPE", "PRACTICE").strip().upper()
@@ -36,12 +59,9 @@ ACCOUNT_TYPE = os.getenv("ACCOUNT_TYPE", "PRACTICE").strip().upper()
 MAX_TOTAL_TRADES = 100
 TOTAL_TRADES = 0
 CANDLE_COUNT = max(60, int(os.getenv("CANDLE_COUNT", "80")))
-MAX_PAIRS = 50  # Analiza hasta 50 activos que cumplan el filtro
+MAX_OTC_PAIRS = max(1, int(os.getenv("MAX_OTC_PAIRS", "50")))
 
-STUDY_LOG_DIR = os.getenv("STUDY_LOG_DIR", "trade_study")
-STUDY_LOG_FILE = os.path.join(STUDY_LOG_DIR, "trades.jsonl")
-
-PAIR_REFRESH_SECONDS = float(os.getenv("PAIR_REFRESH_SECONDS", "900"))  # 15 minutos
+PAIR_REFRESH_SECONDS = 60.0
 SNIPER_POLL = 0.06
 TRADE_COOLDOWN = float(os.getenv("TRADE_COOLDOWN", "60"))
 MIN_HISTORY = 35
@@ -56,7 +76,7 @@ AUTO_START = os.getenv("AUTO_START", "true").strip().lower() in {
 # La API publica de strategy.py debe exponer solamente entry_type=force.
 REQUIRE_FORCE = True
 MIN_ACCEPTED_SCORE = int(os.getenv("MIN_ACCEPTED_SCORE", "90"))
-REQUIRE_N_PLUS_1 = False
+REQUIRE_N_PLUS_1 = True
 
 
 # ============================================================
@@ -66,7 +86,6 @@ REQUIRE_N_PLUS_1 = False
 BOT_RUNNING = False
 IQ: Optional[IQ_Option] = None
 PAIRS: list[str] = []
-PAIR_MARKET: Dict[str, str] = {}
 LAST_PAIR_REFRESH = 0.0
 
 LIVE_STATE: Dict[str, Dict[str, Any]] = {}
@@ -75,7 +94,6 @@ LAST_TRADE_TIME: Dict[str, float] = {}
 LAST_TRADE_CANDLE: Dict[str, int] = {}
 
 STATE_LOCK = threading.RLock()
-STUDY_LOG_LOCK = threading.RLock()
 
 
 # ============================================================
@@ -172,10 +190,10 @@ def telegram_command_loop() -> None:
                     BOT_RUNNING = True
                     telegram_send(
                         "🟢 BOT ACTIVADO\\n\\n"
-                        "⚡ MULTIMERCADO | REVERSIÓN\\n"
+                        "⚡ BINARY OTC | FUERZA\\n"
                         f"Cuenta: {ACCOUNT_TYPE}\\n"
                         f"Entradas: 0/{MAX_TOTAL_TRADES}\\n"
-                        "📌 Análisis de estructura y reversión en tiempo real\\n"
+                        "📌 Análisis en N y ejecución en N+1\\n"
                         f"⏱ Temporalidad: {TIMEFRAME // 60} minuto(s)\\n"
                         f"⏳ Expiración: {EXPIRATION} minuto(s)\\n"
                         f"💵 Importe: {AMOUNT:g}"
@@ -195,15 +213,14 @@ def telegram_command_loop() -> None:
                     telegram_send(
                         "📊 ESTADO\n\n"
                         f"Estado: {status}\n"
-                        "Mercados: Binary/Turbo y Digital\n"
+                        "Mercado: BINARY OTC\n"
                         "Filtro: FUERZA\n"
-                        "Entrada: después de corrección y confirmación\n"
+                        "Entrada: N+1\n"
                         f"Expiración: {EXPIRATION} minuto(s)\n"
                         f"Importe: {AMOUNT:g}\\n"
                         f"Cuenta: {ACCOUNT_TYPE}\\n"
                         f"Entradas: {TOTAL_TRADES}/{MAX_TOTAL_TRADES}\\n"
-                        f"Activos: {len(PAIRS)}\n"
-                        "Filtro: primer vencimiento disponible de 1 minuto"
+                        f"Pares OTC: {len(PAIRS)}"
                     )
 
         except Exception as exc:
@@ -212,196 +229,110 @@ def telegram_command_loop() -> None:
 
 
 # ============================================================
-# UNIVERSO DE ACTIVOS DISPONIBLES
+# OTC
 # ============================================================
 
-def _supports_one_minute_expiration(info: Dict[str, Any]) -> bool:
-    """Valida que el activo declare explícitamente una duración de 1 minuto.
-
-    No acepta el número 1 encontrado en campos ajenos a la duración. Si no
-    existe una metadata de expiración/duración verificable, el activo se omite.
-    """
-    if not isinstance(info, dict):
+def _is_otc_pair(value: Any) -> bool:
+    try:
+        name = str(value).strip().upper()
+    except Exception:
         return False
 
-    keys = {
-        "expiration", "expirations", "expiration_period", "expiration_periods",
-        "available_expirations", "available_durations", "duration", "durations",
-        "duration_minutes", "duration_seconds", "expiration_minutes",
-        "expiration_seconds", "binary_expirations", "binary_durations",
-        "min_duration", "max_duration", "min_expiration", "max_expiration",
-    }
-    candidates: list[tuple[str, Any]] = []
-
-    def walk(node: Any) -> None:
-        if isinstance(node, dict):
-            for key, value in node.items():
-                normalized = str(key).strip().lower().replace("-", "_")
-                if normalized in keys or "expiration" in normalized or "duration" in normalized:
-                    candidates.append((normalized, value))
-                walk(value)
-        elif isinstance(node, (list, tuple, set)):
-            for item in node:
-                walk(item)
-
-    walk(info)
-    if not candidates:
-        return False
-
-    def one_minute(key: str, value: Any) -> bool:
-        if value is None or isinstance(value, bool):
-            return False
-        if isinstance(value, dict):
-            return any(one_minute(str(k).lower().replace("-", "_"), v) for k, v in value.items())
-        if isinstance(value, (list, tuple, set)):
-            return any(one_minute(key, item) for item in value)
-
-        text = str(value).strip().lower()
-        import re
-        matches = re.findall(r"(?<!\d)(\d+(?:\.\d+)?)\s*(seconds?|secs?|minutes?|mins?|s|m)?\b", text)
-        if not matches and isinstance(value, (int, float)):
-            matches = [(str(value), "")]
-
-        for number_text, unit in matches:
-            try:
-                number = float(number_text)
-            except (TypeError, ValueError):
-                continue
-            unit = (unit or "").lower()
-            if unit in {"s", "sec", "secs", "second", "seconds"} or "second" in key:
-                minutes = number / 60.0
-            elif unit in {"m", "min", "mins", "minute", "minutes"} or "minute" in key:
-                minutes = number
-            elif "duration" in key or "expiration" in key:
-                # Campos genéricos de duración suelen estar expresados en minutos.
-                minutes = number if number == 1 else (number / 60.0 if number == 60 else -1)
-            else:
-                continue
-            if abs(minutes - 1.0) < 1e-9:
-                return True
-        return False
-
-    return any(one_minute(key, value) for key, value in candidates)
+    return name.endswith("-OTC") or name.endswith("_OTC") or "OTC" in name
 
 
-def _asset_name(info: Dict[str, Any]) -> Optional[str]:
-    raw_name = info.get("name") or info.get("active_name") or info.get("symbol")
-    if not isinstance(raw_name, str) or not raw_name.strip():
-        return None
-    name = raw_name.split(".", 1)[1] if "." in raw_name else raw_name
-    return name.strip()
-
-
-def _asset_is_open(info: Dict[str, Any]) -> bool:
-    if not isinstance(info, dict):
-        return False
-    for key in ("enabled", "open", "is_open", "active", "tradable"):
-        if key in info and info[key] is False:
-            return False
-    for key in ("is_suspended", "suspended", "closed"):
-        if info.get(key) is True:
-            return False
-    return True
-
-
-def _catalog_assets() -> Tuple[list[str], Dict[str, str], bool]:
-    """Obtiene activos binary/turbo/digital, sin filtrar por OTC o REAL."""
+def _load_binary_otc_catalog() -> Tuple[list[str], bool]:
     if IQ is None or not hasattr(IQ, "get_all_init_v2"):
-        return [], {}, False
+        return [], False
+
     try:
         data = IQ.get_all_init_v2()
     except Exception as exc:
-        logger.warning("Catálogo de activos no disponible: %s", exc)
-        return [], {}, False
+        logger.warning("Catálogo BINARY no disponible: %s", exc)
+        return [], False
+
     if not isinstance(data, dict):
-        return [], {}, False
+        return [], False
 
-    root = data.get("result") if isinstance(data.get("result"), dict) else data
-    names: list[str] = []
-    markets: Dict[str, str] = {}
+    binary = data.get("binary")
+    if not isinstance(binary, dict):
+        result = data.get("result")
+        if isinstance(result, dict):
+            binary = result.get("binary")
 
-    for market_key, market_type in (("binary", "binary"), ("turbo", "binary"), ("digital", "digital")):
-        market = root.get(market_key)
-        if not isinstance(market, dict):
+    if not isinstance(binary, dict):
+        return [], False
+
+    actives = binary.get("actives", {})
+    if not isinstance(actives, dict):
+        return [], False
+
+    pairs: list[str] = []
+
+    for active_id, info in actives.items():
+        if not isinstance(info, dict):
             continue
-        actives = market.get("actives", market.get("assets", {}))
-        if not isinstance(actives, dict):
+
+        raw_name = info.get("name")
+        if not isinstance(raw_name, str):
             continue
-        for active_id, info in actives.items():
-            if not isinstance(info, dict) or not _asset_is_open(info):
-                continue
-            name = _asset_name(info)
-            if not name or not _supports_one_minute_expiration(info):
-                continue
-            try:
-                numeric_id = int(active_id)
-            except (TypeError, ValueError):
-                numeric_id = None
-            if numeric_id is not None:
-                try:
-                    OP_code.ACTIVES[name] = numeric_id
-                except Exception:
-                    pass
-            if name not in markets or (markets[name] != "digital" and market_type == "digital"):
-                markets[name] = market_type
-            if name not in names:
-                names.append(name)
 
-    return sorted(names), markets, True
+        name = raw_name.split(".", 1)[1] if "." in raw_name else raw_name
+        name = name.strip()
 
+        if not _is_otc_pair(name):
+            continue
+        if info.get("enabled", True) is False:
+            continue
+        if info.get("is_suspended", info.get("suspended", False)) is True:
+            continue
 
-def discover_available_pairs() -> list[str]:
-    names, _, ok = _catalog_assets()
-    return names if ok else []
+        try:
+            numeric_id = int(active_id)
+        except (TypeError, ValueError):
+            continue
+
+        OP_code.ACTIVES[name] = numeric_id
+        pairs.append(name)
+
+    return sorted(set(pairs)), True
 
 
-def refresh_available_pairs(force: bool = False) -> list[str]:
-    global PAIRS, PAIR_MARKET, LAST_PAIR_REFRESH
+def discover_binary_otc_pairs() -> list[str]:
+    pairs, ok = _load_binary_otc_catalog()
+    return sorted(set(p for p in pairs if _is_otc_pair(p))) if ok else []
+
+
+def refresh_binary_otc_pairs(force: bool = False) -> list[str]:
+    global PAIRS, LAST_PAIR_REFRESH
+
     now = time.time()
     if not force and now - LAST_PAIR_REFRESH < PAIR_REFRESH_SECONDS:
         return list(PAIRS)
 
-    discovered, markets, ok = _catalog_assets_with_markets()
-    if not ok:
-        logger.warning("No se pudo actualizar el universo de activos")
-        return list(PAIRS)
-
-    selected = discovered if MAX_PAIRS <= 0 else discovered[:MAX_PAIRS]
+    discovered = discover_binary_otc_pairs()
+    selected = discovered[:MAX_OTC_PAIRS]
     previous = set(PAIRS)
     current = set(selected)
+
     with STATE_LOCK:
         PAIRS = list(selected)
-        PAIR_MARKET = {name: markets[name] for name in selected if name in markets}
         LAST_PAIR_REFRESH = now
+
         for pair in previous - current:
             PENDING_ENTRY.pop(pair, None)
             LIVE_STATE.pop(pair, None)
             LAST_TRADE_CANDLE.pop(pair, None)
 
     if current != previous:
-        by_market = {"binary": 0, "digital": 0}
-        for pair in selected:
-            by_market[PAIR_MARKET.get(pair, "binary")] = by_market.get(PAIR_MARKET.get(pair, "binary"), 0) + 1
-        message = (
-            "🔄 UNIVERSO DE ACTIVOS ACTUALIZADO\n\n"
-            f"Activos válidos: {len(selected)}\n"
-            f"Binary/Turbo: {by_market.get('binary', 0)}\n"
-            f"Digital: {by_market.get('digital', 0)}\n"
-            "Filtro: primer reloj de expiración disponible = 1 minuto\n"
-            "Mercados: TODOS (OTC, REAL y DIGITAL) según disponibilidad"
+        logger.info("Universo OTC actualizado: %s pares", len(selected))
+        telegram_send(
+            "🔄 UNIVERSO OTC ACTUALIZADO\n\n"
+            f"Pares disponibles: {len(selected)}/{MAX_OTC_PAIRS}"
         )
-        logger.info(message.replace("\n", " | "))
-        telegram_send(message)
+
     return list(PAIRS)
 
-
-def _catalog_assets_with_markets() -> Tuple[list[str], Dict[str, str], bool]:
-    return _catalog_assets()
-
-
-# Alias de compatibilidad para llamadas antiguas.
-def refresh_binary_otc_pairs(force: bool = False) -> list[str]:
-    return refresh_available_pairs(force=force)
 
 # ============================================================
 # RELOJ Y CONEXION
@@ -444,12 +375,12 @@ def connect_iq() -> bool:
     IQ.change_balance(ACCOUNT_TYPE)
     logger.info("Cuenta seleccionada: %s", ACCOUNT_TYPE)
 
-    refresh_available_pairs(force=True)
+    refresh_binary_otc_pairs(force=True)
 
     telegram_send(
         "🟢 IQ OPTION CONECTADO\n\n"
         "📊 BB + ATR Trailing Stops + RSI\n"
-        "⚡ Análisis de estructura y reversión en tiempo real\n"
+        "⚡ Rechazo N + confirmación N+1; ejecución en N+2\n"
         f"⏳ Expiración: {EXPIRATION} minuto(s)"
     )
 
@@ -474,7 +405,7 @@ def ensure_connection() -> bool:
             logger.error("No se pudo reconectar: %s", reason)
             return False
 
-        refresh_available_pairs(force=True)
+        refresh_binary_otc_pairs(force=True)
         telegram_send("🟢 IQ OPTION RECONECTADO")
         return True
 
@@ -548,112 +479,6 @@ def candle_values(row: pd.Series) -> Dict[str, float]:
     }
 
 
-def study_candles(df: pd.DataFrame, until_ts: int, count: int = 10) -> list[Dict[str, Any]]:
-    """Devuelve las últimas velas cerradas previas a la entrada, con OHLC."""
-    if df is None or df.empty:
-        return []
-
-    sample = df[df["from"].astype(int) <= int(until_ts)].tail(count)
-    result: list[Dict[str, Any]] = []
-    for _, row in sample.iterrows():
-        values = candle_values(row)
-        values["timestamp"] = int(row["from"])
-        result.append(values)
-    return result
-
-
-def _study_write(event: Dict[str, Any]) -> None:
-    """Guarda eventos de entrada y resultado en JSONL para su análisis posterior."""
-    try:
-        os.makedirs(STUDY_LOG_DIR, exist_ok=True)
-        with STUDY_LOG_LOCK:
-            with open(STUDY_LOG_FILE, "a", encoding="utf-8") as handle:
-                handle.write(json.dumps(event, ensure_ascii=False, default=str) + "\n")
-    except Exception as exc:
-        logger.warning("No se pudo guardar estudio: %s", exc)
-
-
-def _normalize_trade_result(value: Any) -> tuple[str, Optional[float]]:
-    try:
-        profit = float(value)
-    except (TypeError, ValueError):
-        return "unknown", None
-
-    if profit > 0:
-        return "win", profit
-    if profit < 0:
-        return "loss", profit
-    return "draw", profit
-
-
-def track_trade_result(pair: str, pending: Dict[str, Any], order_id: Any) -> None:
-    """Consulta el resultado de una operación binaria y lo agrega al registro."""
-    if IQ is None or order_id in (None, "", False):
-        _study_write({
-            "event": "result",
-            "pair": pair,
-            "order_id": order_id,
-            "outcome": "unknown",
-            "reason": "missing_order_id_or_iq",
-        })
-        return
-
-    checker = getattr(IQ, "check_win_v4", None) or getattr(IQ, "check_win_v3", None)
-    if checker is None:
-        _study_write({
-            "event": "result",
-            "pair": pair,
-            "order_id": order_id,
-            "outcome": "unknown",
-            "reason": "iqoptionapi_result_method_unavailable",
-        })
-        return
-
-    deadline = time.time() + max(180, EXPIRATION * 60 + 60)
-    while time.time() < deadline:
-        try:
-            raw_result = checker(order_id)
-            if (
-                raw_result is not None
-                and raw_result is not False
-                and raw_result != ""
-                and raw_result != "pending"
-            ):
-                outcome, profit = _normalize_trade_result(raw_result)
-                event = {
-                    "event": "result",
-                    "pair": pair,
-                    "order_id": order_id,
-                    "signal": pending.get("signal"),
-                    "entry_timestamp": pending.get("execution_ts"),
-                    "outcome": outcome,
-                    "profit": profit,
-                    "resolved_at": int(time.time()),
-                }
-                _study_write(event)
-                telegram_send(
-                    "📚 RESULTADO REGISTRADO\n\n"
-                    f"Par: {pair}\n"
-                    f"Dirección: {str(pending.get('signal', '')).upper()}\n"
-                    f"Resultado: {outcome.upper()}\n"
-                    f"Ganancia/Pérdida: {profit if profit is not None else 'N/D'}\n"
-                    f"ID: {order_id}"
-                )
-                return
-        except Exception as exc:
-            logger.debug("%s | error consultando resultado %s: %s", pair, order_id, exc)
-        time.sleep(2)
-
-    _study_write({
-        "event": "result",
-        "pair": pair,
-        "order_id": order_id,
-        "outcome": "unknown",
-        "reason": "result_timeout",
-        "resolved_at": int(time.time()),
-    })
-
-
 # ============================================================
 # FILTRO DE ESTRATEGIA
 # ============================================================
@@ -713,9 +538,9 @@ def revalidate_pending_location(
     pending: Dict[str, Any],
 ) -> bool:
     """
-    Revalida el espacio disponible justo antes de ejecutar N.
+    Revalida el espacio disponible justo antes de ejecutar N+1.
 
-    La señal se prepara con N-1, pero el precio puede desplazarse
+    La señal se prepara con N, pero el precio puede desplazarse
     durante el cambio de vela. Si el recorrido restante hasta el
     ultimo extremo estructural ya no cumple el minimo, se descarta.
     """
@@ -769,7 +594,7 @@ def revalidate_pending_location(
     valid = room_atr >= MIN_ROOM_TO_OPPOSITE_ATR
 
     logger.info(
-        "%s | revalidacion inicio de N | signal=%s | room=%.2f ATR | valido=%s",
+        "%s | revalidacion N+1 | signal=%s | room=%.2f ATR | valido=%s",
         pair,
         signal,
         room_atr,
@@ -779,7 +604,7 @@ def revalidate_pending_location(
 
 
 # ============================================================
-# ANALISIS DE ESTRUCTURA Y PREPARACION DE ENTRADA EN N
+# ANALISIS Y PREPARACION N+1
 # ============================================================
 
 
@@ -811,8 +636,8 @@ def _diagnostic_message(
     pair: str,
     signal: str,
     result: Dict[str, Any],
-    rejection_label: str = "RETROCESO N-2",
-    confirmation_label: str = "CONTINUACION N-1",
+    rejection_label: str = "N",
+    confirmation_label: str = "N+1",
 ) -> str:
     analysis = result.get("analysis") or {}
     rejection = analysis.get("rejection_candle") or {}
@@ -848,7 +673,7 @@ def analysis_message(pair: str, ts: int, result: Dict[str, Any]) -> str:
     return (
         "🔎 ANÁLISIS DE FUERZA\n\n"
         f"Par: {pair}\n"
-        f"Vela N-1: {ts}\n"
+        f"Vela N: {ts}\n"
         f"Dirección: {result.get('signal')}\n"
         f"Estructura: {analysis.get('structure', 'unknown')}\n"
         f"Fase: {analysis.get('impulse_phase', 'unknown')}\n"
@@ -860,7 +685,6 @@ def analysis_message(pair: str, ts: int, result: Dict[str, Any]) -> str:
 
 
 def analyze_closed_candle(pair: str, expected_closed_ts: int) -> bool:
-    """Analiza la última vela cerrada y ejecuta inmediatamente la señal válida."""
     df = realtime_dataframe(pair)
     closed_row = get_row_by_ts(df, expected_closed_ts)
 
@@ -873,6 +697,7 @@ def analyze_closed_candle(pair: str, expected_closed_ts: int) -> bool:
 
     df = df[df["from"].astype(int) <= expected_closed_ts].copy()
     df = df.sort_values("from").reset_index(drop=True)
+
     if len(df) < MIN_HISTORY:
         return False
 
@@ -886,10 +711,10 @@ def analyze_closed_candle(pair: str, expected_closed_ts: int) -> bool:
         previous_m1=df.iloc[:-1].copy(),
         pair=pair,
     )
+
     signal = result.get("signal")
     score = int(result.get("score", 0) or 0)
     analysis = result.get("analysis") or {}
-    study_rows = study_candles(df, expected_closed_ts, 10)
 
     with STATE_LOCK:
         LIVE_STATE[pair] = {
@@ -903,62 +728,65 @@ def analyze_closed_candle(pair: str, expected_closed_ts: int) -> bool:
         }
 
     logger.info(
-        "%s | VELA CERRADA | signal=%s | type=%s | score=%s | %s",
-        pair, signal, result.get("entry_type"), score, result.get("reason", ""),
+        "%s | N CERRADA | signal=%s | type=%s | score=%s | %s",
+        pair,
+        signal,
+        result.get("entry_type"),
+        score,
+        result.get("reason", ""),
     )
 
     if not is_force_signal(result, signal):
         return True
-    if trade_limit_reached() or cooldown_active(pair):
-        return True
-    if LAST_TRADE_CANDLE.get(pair) == int(expected_closed_ts):
-        return True
 
     values = candle_values(closed_row)
-    ok, order_id = buy_binary(pair, signal)
-    if not ok:
-        telegram_send(
-            "❌ ORDEN RECHAZADA\n\n"
-            f"Par: {pair}\n"
-            f"Dirección: {str(signal).upper()}\n"
-            f"Vela detectada: {expected_closed_ts}\n"
-            "La orden fue rechazada por IQ Option."
-        )
-        return False
+    execution_ts = int(expected_closed_ts + TIMEFRAME)
 
-    LAST_TRADE_TIME[pair] = time.time()
-    LAST_TRADE_CANDLE[pair] = int(expected_closed_ts)
-    _study_write({
-        "event": "entry",
-        "pair": pair,
+    pending = {
         "signal": signal,
-        "order_id": order_id,
         "score": score,
         "entry_type": result.get("entry_type"),
-        "analysis": analysis,
+        "force": bool(analysis.get("force", True)),
+        "continuity_ts": int(expected_closed_ts),
+        "execution_ts": execution_ts,
+        "open": values["open"],
+        "high": values["high"],
+        "low": values["low"],
+        "close": values["close"],
         "reason": result.get("reason", ""),
-        "signal_timestamp": int(expected_closed_ts),
-        "execution_timestamp": int(get_iq_server_timestamp()),
-        "entry_price": values["close"],
-        "candles": study_rows,
-    })
+        "analysis": analysis,
+        "created_at": time.time(),
+    }
+
+    with STATE_LOCK:
+        existing = PENDING_ENTRY.get(pair)
+
+        if existing is not None:
+            existing_ts = int(existing.get("execution_ts", 0))
+            if existing_ts >= execution_ts:
+                return True
+
+        PENDING_ENTRY[pair] = pending
 
     side = "CALL 🟢" if signal == "call" else "PUT 🔴"
     telegram_send(
-        "⚡ ENTRADA EJECUTADA INMEDIATAMENTE\n\n"
+        "🎯 SEÑAL DE FUERZA ARMADA\n\n"
         f"Par: {pair}\n"
         f"Dirección: {side}\n"
-        f"Tipo: {result.get('entry_type')}\n"
+        f"Tipo: {pending['entry_type']}\n"
         f"Score: {score}/100\n"
         f"Calidad: {analysis.get('entry_quality', result.get('entry_quality', 0))}/100\n"
-        f"Estructura: {analysis.get('structure', 'unknown')}\n"
-        f"Vela detectada: {expected_closed_ts}\n"
-        f"ID: {order_id}\n\n"
-        "✅ La operación se ejecutó al detectar la señal.\n"
+        f"Estructura: {analysis.get('structure', 'unknown')}\n\n"
+        f"Cierre N: {_fmt_price(values['close'])}\n"
+        f"N cierre: {expected_closed_ts}\n"
+        f"N+1 previsto: {execution_ts}\n\n"
+        "🚫 N no se opera.\n"
+        "⚡ La entrada queda pendiente para la vela programada.\n"
         f"⏳ Expiración: {EXPIRATION} minuto(s)\n\n"
         f"{result.get('reason', '')}\n\n"
         + _diagnostic_message(pair, signal, result)
     )
+
     return True
 
 
@@ -1041,20 +869,19 @@ def trade_limit_reached() -> bool:
 
 
 def buy_binary(pair: str, signal: str) -> Tuple[bool, Optional[Any]]:
-    """Envía la orden según el tipo de mercado detectado en el catálogo."""
     global TOTAL_TRADES, BOT_RUNNING
+
     if IQ is None or signal not in ("call", "put"):
         return False, None
 
-    market = PAIR_MARKET.get(pair, "binary")
+    # El bloqueo cubre la comprobación y el envío para evitar
+    # que dos hilos consuman el mismo cupo simultáneamente.
     with STATE_LOCK:
         if TOTAL_TRADES >= MAX_TOTAL_TRADES:
             return False, None
+
         try:
-            if market == "digital" and hasattr(IQ, "buy_digital_spot"):
-                result = IQ.buy_digital_spot(pair, AMOUNT, signal, EXPIRATION)
-            else:
-                result = IQ.buy(AMOUNT, pair, signal, EXPIRATION)
+            result = IQ.buy(AMOUNT, pair, signal, EXPIRATION)
 
             if isinstance(result, tuple):
                 ok = bool(result[0])
@@ -1062,25 +889,38 @@ def buy_binary(pair: str, signal: str) -> Tuple[bool, Optional[Any]]:
             else:
                 ok = result not in (None, False, "error", -1)
                 order_id = result
+
             if not ok:
                 return False, order_id
 
             TOTAL_TRADES += 1
             current_trades = TOTAL_TRADES
+
             if TOTAL_TRADES >= MAX_TOTAL_TRADES:
                 BOT_RUNNING = False
                 PENDING_ENTRY.clear()
+
         except Exception as exc:
-            logger.error("%s | %s | error de orden: %s", pair, market, exc)
+            logger.error("%s | buy error: %s", pair, exc)
             return False, None
 
-    logger.info("%s | mercado=%s | ENTRADA %s/%s | cuenta=%s", pair, market, current_trades, MAX_TOTAL_TRADES, ACCOUNT_TYPE)
+    logger.info(
+        "%s | ENTRADA %s/%s | cuenta=%s",
+        pair,
+        current_trades,
+        MAX_TOTAL_TRADES,
+        ACCOUNT_TYPE,
+    )
+
     if current_trades >= MAX_TOTAL_TRADES:
         telegram_send(
-            "🛑 LÍMITE DE ENTRADAS ALCANZADO\n\n"
-            f"Entradas ejecutadas: {current_trades}/{MAX_TOTAL_TRADES}\n"
-            f"Cuenta: {ACCOUNT_TYPE}"
+            "🛑 LIMITE DE ENTRADAS ALCANZADO\\n\\n"
+            f"Entradas ejecutadas: {current_trades}/{MAX_TOTAL_TRADES}\\n"
+            f"Cuenta: {ACCOUNT_TYPE}\\n"
+            "El bot se detuvo automáticamente.\\n"
+            "No se abrirán nuevas operaciones."
         )
+
     return True, order_id
 
 
@@ -1097,7 +937,7 @@ def execute_sniper(pair: str, pending: Dict[str, Any]) -> bool:
         with STATE_LOCK:
             PENDING_ENTRY.pop(pair, None)
 
-        logger.info("%s | señal para N vencida y descartada", pair)
+        logger.info("%s | señal N+1 vencida y descartada", pair)
         return False
 
     if LAST_TRADE_CANDLE.get(pair) == execution_ts:
@@ -1168,8 +1008,8 @@ def execute_sniper(pair: str, pending: Dict[str, Any]) -> bool:
             "❌ ORDEN RECHAZADA\n\n"
             f"Par: {pair}\n"
             f"Dirección: {signal.upper()}\n"
-            f"Entrada en N: {execution_ts}\n"
-            "La señal no se trasladará a otra vela."
+            f"N+1: {execution_ts}\n"
+            "La señal no se trasladará."
         )
         return False
 
@@ -1180,32 +1020,12 @@ def execute_sniper(pair: str, pending: Dict[str, Any]) -> bool:
         PENDING_ENTRY.pop(pair, None)
 
     pending_analysis = pending.get("analysis") or {}
-    _study_write({
-        "event": "entry",
-        "pair": pair,
-        "order_id": order_id,
-        "signal": signal,
-        "entry_timestamp": execution_ts,
-        "analysis_timestamp": pending.get("continuity_ts"),
-        "score": pending.get("score"),
-        "entry_type": pending.get("entry_type"),
-        "structure": pending_analysis.get("structure"),
-        "reason": pending.get("reason", ""),
-        "candles": pending.get("study_candles", []),
-        "created_at": pending.get("created_at"),
-        "recorded_at": int(time.time()),
-    })
-    threading.Thread(
-        target=track_trade_result,
-        args=(pair, dict(pending), order_id),
-        daemon=True,
-    ).start()
     telegram_send(
         "✅ FUERZA EJECUTADA\n\n"
         f"Par: {pair}\n"
         f"Dirección: {signal.upper()}\n"
         f"Tipo: {pending.get('entry_type')}\n"
-        f"Vela analizada: {pending.get('continuity_ts')}\n"
+        f"N cierre: {pending.get('continuity_ts')}\n"
         f"Entrada programada: {execution_ts}\n"
         f"Reloj IQ: {sent_at:.3f}\n"
         f"ID: {order_id}\n"
@@ -1219,7 +1039,7 @@ def execute_sniper(pair: str, pending: Dict[str, Any]) -> bool:
     )
 
     logger.info(
-        "%s | EJECUTADO | %s | análisis N-1=%s | entrada N=%s | ID=%s",
+        "%s | EJECUTADO | %s | N=%s | N+1=%s | ID=%s",
         pair,
         signal.upper(),
         pending.get("continuity_ts"),
@@ -1239,17 +1059,23 @@ def process_pair(pair: str) -> None:
 
     current_ts = floor_candle_timestamp(get_iq_server_timestamp())
 
-    # La estrategia nueva revisa la vela activa para detectar el toque
-    # del soporte/resistencia y ejecutar la reversion en el instante valido.
-    # No se espera al cierre ni se programa una entrada para la siguiente vela.
-    analyze_live_candle(pair, int(current_ts))
+    # Primero se ejecuta, si corresponde, la señal preparada en N
+    # durante la vela siguiente N+1.
+    with STATE_LOCK:
+        pending = PENDING_ENTRY.get(pair)
+    if pending is not None:
+        execute_sniper(pair, pending)
+
+    # Después se analiza únicamente la última vela completamente cerrada.
+    closed_ts = int(current_ts - TIMEFRAME)
+    analyze_closed_candle(pair, closed_ts)
 
 
 def analyze_all_pairs() -> None:
     if not BOT_RUNNING or trade_limit_reached():
         return
 
-    refresh_available_pairs()
+    refresh_binary_otc_pairs()
 
     for pair in list(PAIRS):
         if not BOT_RUNNING or trade_limit_reached():
@@ -1269,10 +1095,10 @@ def main() -> None:
     global BOT_RUNNING, TOTAL_TRADES
 
     logger.info("========================================")
-    logger.info("BOT MULTIMERCADO | ESTRUCTURA + TOQUE DE NIVEL + REVERSIÓN")
-    logger.info("TIMEFRAME=%s | EXPIRATION=%s (SOLO 1 MINUTO)", TIMEFRAME, EXPIRATION)
-    logger.info("MAX PAIRS=%s | REFRESH=%ss | AMOUNT=%s | ACCOUNT=%s | MAX_TRADES=%s",
-                MAX_PAIRS, int(PAIR_REFRESH_SECONDS), AMOUNT, ACCOUNT_TYPE, MAX_TOTAL_TRADES)
+    logger.info("BOT BINARY OTC | BB + EMA + ATR + RSI | N+1")
+    logger.info("TIMEFRAME=%s | EXPIRATION=%s", TIMEFRAME, EXPIRATION)
+    logger.info("MAX OTC=%s | AMOUNT=%s | ACCOUNT=%s | MAX_TRADES=%s",
+                MAX_OTC_PAIRS, AMOUNT, ACCOUNT_TYPE, MAX_TOTAL_TRADES)
     logger.info("========================================")
 
     required = {
@@ -1306,12 +1132,9 @@ def main() -> None:
 
     telegram_send(
         "🤖 BOT LISTO\n\n"
-        "📊 Estructura + toque de nivel + reversión\n"
-        "⏱ Solo pares con expiración de 1 minuto\n"
-        "⚡ Ejecución inmediata al cumplir las condiciones\n"
+        "📊 Filtro Bollinger + ATR Trailing Stops + RSI\n"
+        "⚡ Rechazo N + confirmación N+1; ejecución en N+2\n"
         f"⏳ Expiración: {EXPIRATION} minuto(s)\n"
-        f"🔢 Activos analizados: {len(PAIRS)} (sin límite fijo)\n"
-        f"🔄 Actualización de pares: cada {int(PAIR_REFRESH_SECONDS // 60)} minutos\n"
         f"🚀 Inicio automático: {'SI' if AUTO_START else 'NO'}\n\n"
         + (
             "🟢 Análisis automático activado."
