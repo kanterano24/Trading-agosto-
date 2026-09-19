@@ -1,22 +1,12 @@
-"""strategy.py - Rechazo de soporte/resistencia compatible con bot.py."""
+"""strategy.py - Rechazo de soporte/resistencia con confirmacion N-2/N-1."""
 from __future__ import annotations
 
-from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 import math
 
 MIN_CANDLES = 20
 DEFAULT_LOOKBACK = 60
 DEFAULT_MIN_SCORE = 75
-
-
-@dataclass
-class Signal:
-    action: str
-    score: int
-    reason: str
-    support: Optional[float] = None
-    resistance: Optional[float] = None
 
 
 def _number(value: Any, default: float = 0.0) -> float:
@@ -28,11 +18,12 @@ def _number(value: Any, default: float = 0.0) -> float:
 
 
 def _ohlc(candle: Dict[str, Any]) -> Tuple[float, float, float, float]:
-    open_price = _number(candle.get("open", candle.get("open_price")))
-    close_price = _number(candle.get("close", candle.get("close_price")))
-    low = _number(candle.get("min", candle.get("low")))
-    high = _number(candle.get("max", candle.get("high")))
-    return open_price, close_price, low, high
+    return (
+        _number(candle.get("open", candle.get("open_price"))),
+        _number(candle.get("close", candle.get("close_price"))),
+        _number(candle.get("min", candle.get("low"))),
+        _number(candle.get("max", candle.get("high"))),
+    )
 
 
 def _as_records(value: Any) -> List[Dict[str, Any]]:
@@ -40,12 +31,11 @@ def _as_records(value: Any) -> List[Dict[str, Any]]:
         return []
     if hasattr(value, "to_dict"):
         try:
-            records = value.to_dict("records")
-            return [dict(item) for item in records]
+            return [dict(item) for item in value.to_dict("records")]
         except (TypeError, ValueError):
             return []
     if isinstance(value, dict):
-        return [value]
+        return [dict(value)]
     try:
         return [dict(item) for item in value if isinstance(item, dict)]
     except TypeError:
@@ -55,29 +45,42 @@ def _as_records(value: Any) -> List[Dict[str, Any]]:
 def _atr(candles: List[Dict[str, Any]], period: int = 14) -> float:
     if len(candles) < 2:
         return 0.0
-    true_ranges: List[float] = []
+    ranges: List[float] = []
     for index in range(1, len(candles)):
-        _, _, low, high = _ohlc(candles[index])
         _, previous_close, _, _ = _ohlc(candles[index - 1])
-        true_ranges.append(
-            max(
-                high - low,
-                abs(high - previous_close),
-                abs(low - previous_close),
-            )
-        )
-    values = true_ranges[-period:]
+        _, _, low, high = _ohlc(candles[index])
+        ranges.append(max(high - low, abs(high - previous_close), abs(low - previous_close)))
+    values = ranges[-period:]
     return sum(values) / len(values) if values else 0.0
 
 
-def _zones(
-    candles: List[Dict[str, Any]],
-    lookback: int = DEFAULT_LOOKBACK,
-) -> Tuple[float, float]:
+def _zones(candles: List[Dict[str, Any]], lookback: int = DEFAULT_LOOKBACK) -> Tuple[float, float]:
     sample = candles[-max(1, lookback):]
     lows = [_ohlc(candle)[2] for candle in sample]
     highs = [_ohlc(candle)[3] for candle in sample]
     return (min(lows), max(highs)) if lows and highs else (0.0, 0.0)
+
+
+def _candle_metrics(candle: Dict[str, Any]) -> Dict[str, Any]:
+    open_price, close_price, low, high = _ohlc(candle)
+    candle_range = max(high - low, 1e-12)
+    body = abs(close_price - open_price)
+    upper = max(high - max(open_price, close_price), 0.0)
+    lower = max(min(open_price, close_price) - low, 0.0)
+    close_position = (close_price - low) / candle_range
+    return {
+        "open": open_price,
+        "high": high,
+        "low": low,
+        "close": close_price,
+        "range": candle_range,
+        "body": body,
+        "upper": upper,
+        "lower": lower,
+        "close_position": close_position,
+        "bullish": close_price > open_price,
+        "bearish": close_price < open_price,
+    }
 
 
 def _empty_result(reason: str = "no_valid_rejection") -> Dict[str, Any]:
@@ -103,170 +106,174 @@ def _empty_result(reason: str = "no_valid_rejection") -> Dict[str, Any]:
     }
 
 
+def _score_rejection(metrics: Dict[str, Any], side: str, level: float, tolerance: float, atr: float) -> Tuple[int, List[str]]:
+    body = metrics["body"]
+    wick = metrics["lower"] if side == "call" else metrics["upper"]
+    close_position = metrics["close_position"] if side == "call" else 1.0 - metrics["close_position"]
+    close_distance = (metrics["close"] - level) if side == "call" else (level - metrics["close"])
+
+    score = 0
+    reasons: List[str] = []
+    if wick >= max(body * 1.25, atr * 0.20):
+        score += 35
+        reasons.append("mecha de rechazo válida")
+    if wick >= body * 2:
+        score += 15
+        reasons.append("mecha claramente superior al cuerpo")
+    if close_position >= 0.60:
+        score += 20
+        reasons.append("cierre favorable")
+    if close_distance >= tolerance * 0.25:
+        score += 15
+        reasons.append("cierre separado de la zona")
+    if body > 0:
+        score += 10
+        reasons.append("cuerpo confirmado")
+    if metrics["range"] >= atr * 0.50:
+        score += 5
+        reasons.append("rango suficiente")
+    return min(score, 100), reasons
+
+
 def analyze_rejection(
     candles: Any,
     min_score: int = DEFAULT_MIN_SCORE,
     lookback: int = DEFAULT_LOOKBACK,
     zone_atr_factor: float = 0.35,
-) -> Signal:
+) -> Dict[str, Any]:
     records = _as_records(candles)
     if len(records) < max(MIN_CANDLES, lookback // 2):
-        return Signal("none", 0, "insufficient_candles")
+        return {"signal": None, "score": 0, "reason": "insufficient_candles"}
 
     previous = records[:-1]
     candle = records[-1]
-    open_price, close_price, low, high = _ohlc(candle)
-    body = abs(close_price - open_price)
-    candle_range = max(high - low, 1e-12)
-    upper_wick = max(high - max(open_price, close_price), 0.0)
-    lower_wick = max(min(open_price, close_price) - low, 0.0)
+    metrics = _candle_metrics(candle)
     atr = _atr(previous)
-
     if atr <= 0:
-        return Signal("none", 0, "invalid_atr")
+        return {"signal": None, "score": 0, "reason": "invalid_atr"}
 
     support, resistance = _zones(previous, lookback)
     tolerance = atr * max(zone_atr_factor, 0.01)
-    near_support = low <= support + tolerance and close_price > support
-    near_resistance = high >= resistance - tolerance and close_price < resistance
+    near_support = metrics["low"] <= support + tolerance and metrics["close"] > support
+    near_resistance = metrics["high"] >= resistance - tolerance and metrics["close"] < resistance
 
-    bullish = (
-        near_support
-        and lower_wick >= max(body * 1.25, atr * 0.20)
-        and close_price > open_price
-        and (close_price - low) / candle_range >= 0.60
-    )
-    bearish = (
-        near_resistance
-        and upper_wick >= max(body * 1.25, atr * 0.20)
-        and close_price < open_price
-        and (high - close_price) / candle_range >= 0.60
-    )
-
-    if bullish:
-        score = 90
-        if lower_wick >= body * 2:
-            score += 8
-        if close_price > support + tolerance * 0.25:
-            score += 5
+    if near_support and metrics["bullish"]:
+        score, reasons = _score_rejection(metrics, "call", support, tolerance, atr)
         if score >= int(min_score):
-            return Signal(
-                "call",
-                min(score, 100),
-                "bullish_support_rejection",
-                support,
-                resistance,
-            )
+            return {"signal": "call", "score": score, "reason": "bullish_support_rejection", "level": support, "reasons": reasons, "metrics": metrics, "atr": atr, "support": support, "resistance": resistance, "tolerance": tolerance}
 
-    if bearish:
-        score = 90
-        if upper_wick >= body * 2:
-            score += 8
-        if close_price < resistance - tolerance * 0.25:
-            score += 5
+    if near_resistance and metrics["bearish"]:
+        score, reasons = _score_rejection(metrics, "put", resistance, tolerance, atr)
         if score >= int(min_score):
-            return Signal(
-                "put",
-                min(score, 100),
-                "bearish_resistance_rejection",
-                support,
-                resistance,
-            )
+            return {"signal": "put", "score": score, "reason": "bearish_resistance_rejection", "level": resistance, "reasons": reasons, "metrics": metrics, "atr": atr, "support": support, "resistance": resistance, "tolerance": tolerance}
 
-    return Signal("none", 0, "no_valid_rejection", support, resistance)
+    return {"signal": None, "score": 0, "reason": "no_valid_rejection", "support": support, "resistance": resistance, "tolerance": tolerance, "atr": atr}
 
 
 def analyze_market(
     candle_1m: Any = None,
     previous_m1: Any = None,
-    candle_n2: Any = None,
     pair: Optional[str] = None,
     df: Any = None,
     min_score: int = DEFAULT_MIN_SCORE,
     **_: Any,
 ) -> Dict[str, Any]:
-    """
-    Analiza únicamente una vela cerrada anterior.
-
-    - Cuando bot.py envía previous_m1 + candle_1m, candle_1m es N-1 y candle_n2 es el contexto anterior.
-    - Cuando se recibe df directamente, se excluye la última vela del DataFrame
-      porque puede estar activa/en formación; se analiza la vela anterior.
-    """
     if previous_m1 is not None:
         records = _as_records(previous_m1)
-        if candle_n2 is not None:
-            # N-2 se conserva como contexto explícito; N-1 es la vela de señal.
-            n2_record = dict(candle_n2) if isinstance(candle_n2, dict) else {}
-            if not records or records[-1].get("from", records[-1].get("timestamp")) != n2_record.get("from", n2_record.get("timestamp")):
-                records.append(n2_record)
-        if candle_1m is not None:
-            current_closed = (
-                dict(candle_1m)
-                if isinstance(candle_1m, dict)
-                else {}
-            )
-            records.append(current_closed)
+        if candle_1m is not None and isinstance(candle_1m, dict):
+            records.append(dict(candle_1m))
     elif df is not None:
         all_records = _as_records(df)
-        # No analizar la última vela recibida: puede estar en formación.
         records = all_records[:-1] if len(all_records) > 1 else []
     else:
         all_records = _as_records(candle_1m)
-        # Para llamadas directas, también se descarta la última vela.
         records = all_records[:-1] if len(all_records) > 1 else []
 
     result = _empty_result()
-    if len(records) < MIN_CANDLES:
+    if len(records) < MIN_CANDLES + 1:
         result["reason"] = "insufficient_candles"
         return result
 
-    signal = analyze_rejection(records, min_score=min_score)
-    records_last = records[-1]
-    timestamp = records_last.get("from", records_last.get("timestamp"))
-    atr = _atr(records[:-1]) if len(records) > 1 else 0.0
-    direction = (
-        "bullish"
-        if signal.action == "call"
-        else "bearish"
-        if signal.action == "put"
-        else "range"
-    )
-    force = signal.action in {"call", "put"} and signal.score >= int(min_score)
-    n1_record = records_last
-    n2_record = records[-2] if len(records) >= 2 else {}
-    n2_open, n2_close, n2_low, n2_high = _ohlc(n2_record)
-    n1_open, n1_close, n1_low, n1_high = _ohlc(n1_record)
+    # La última vela de records es N-1; la anterior es N-2.
+    n2 = records[-2]
+    n1 = records[-1]
+    n2_metrics = _candle_metrics(n2)
+    n1_metrics = _candle_metrics(n1)
+    n1_result = analyze_rejection(records, min_score=min_score)
+    signal = n1_result.get("signal")
+    atr = _atr(records[:-1])
+    support = n1_result.get("support")
+    resistance = n1_result.get("resistance")
+    tolerance = n1_result.get("tolerance", atr * 0.35)
+
+    confirmation_ok = False
+    confirmation_reason = "sin confirmación de N-2"
+    if signal == "call":
+        confirmation_ok = n2_metrics["low"] <= float(support or 0.0) + tolerance and n2_metrics["bullish"] or n2_metrics["close"] >= n2_metrics["open"]
+        confirmation_reason = "N-2 acompaña el movimiento alcista" if confirmation_ok else "N-2 no confirma el movimiento alcista"
+    elif signal == "put":
+        confirmation_ok = n2_metrics["high"] >= float(resistance or 0.0) - tolerance and n2_metrics["bearish"] or n2_metrics["close"] <= n2_metrics["open"]
+        confirmation_reason = "N-2 acompaña el movimiento bajista" if confirmation_ok else "N-2 no confirma el movimiento bajista"
+
+    if not signal:
+        result["reason"] = n1_result.get("reason", "no_valid_rejection")
+        return result
+
+    # Se exige que N-2 no contradiga fuertemente la dirección de N-1.
+    if signal == "call" and n2_metrics["bearish"] and n2_metrics["body"] > n1_metrics["body"] * 1.5:
+        confirmation_ok = False
+        confirmation_reason = "N-2 contradice con cuerpo bajista dominante"
+    if signal == "put" and n2_metrics["bullish"] and n2_metrics["body"] > n1_metrics["body"] * 1.5:
+        confirmation_ok = False
+        confirmation_reason = "N-2 contradice con cuerpo alcista dominante"
+
+    score = int(n1_result.get("score", 0))
+    if confirmation_ok:
+        score = min(100, score + 10)
+    else:
+        score = max(0, score - 25)
+
+    force = bool(signal and confirmation_ok and score >= int(min_score))
+    direction = "bullish" if signal == "call" else "bearish"
+    reason = f"{n1_result.get('reason', '')}; {confirmation_reason}"
+    if not force:
+        reason = f"señal descartada: {reason}"
+
     analysis = {
         "force": force,
-        "structure": direction,
+        "structure": direction if force else "range",
         "atr": atr,
-        "support": signal.support,
-        "resistance": signal.resistance,
-        "tolerance": atr * 0.35,
-        "entry_quality": signal.score,
-        "rejection_timestamp": timestamp,
-        "confirmation_timestamp": timestamp,
-        "rejection_candle": n1_record,
-        "confirmation_candle": n1_record,
-        "n2_candle": {"from": n2_record.get("from", n2_record.get("timestamp")), "open": n2_open, "high": n2_high, "low": n2_low, "close": n2_close},
-        "n1_candle": {"from": n1_record.get("from", n1_record.get("timestamp")), "open": n1_open, "high": n1_high, "low": n1_low, "close": n1_close},
+        "support": support,
+        "resistance": resistance,
+        "tolerance": tolerance,
+        "entry_quality": score if force else 0,
+        "rejection_timestamp": n1.get("from", n1.get("timestamp")),
+        "confirmation_timestamp": n2.get("from", n2.get("timestamp")),
+        "rejection_candle": n1_metrics,
+        "confirmation_candle": n2_metrics,
+        "last_swing_high": resistance,
+        "last_swing_low": support,
+        "confirmation_ok": confirmation_ok,
+        "confirmation_reason": confirmation_reason,
+        "n2_direction": "bullish" if n2_metrics["bullish"] else "bearish" if n2_metrics["bearish"] else "neutral",
         "pullback": {
             "valid": force,
-            "previous_candle_confirmed": force,
+            "previous_candle_confirmed": confirmation_ok,
             "extreme_confirmed": force,
         },
     }
+
     return {
-        "signal": signal.action if force else None,
-        "score": signal.score if force else 0,
-        "score_100": signal.score if force else 0,
-        "entry_quality": signal.score if force else 0,
-        "quality": signal.score if force else 0,
+        "signal": signal if force else None,
+        "score": score if force else 0,
+        "score_100": score if force else 0,
+        "entry_quality": score if force else 0,
+        "quality": score if force else 0,
         "entry_type": "force" if force else "none",
-        "direction": direction,
-        "reason": signal.reason,
+        "direction": direction if force else "range",
+        "reason": reason,
         "analysis": analysis,
-        "candle_timestamp": timestamp,
+        "candle_timestamp": n1.get("from", n1.get("timestamp")),
         "pair": pair,
     }
 
