@@ -1,55 +1,43 @@
-"""Estrategia de reversion en soporte/resistencia para binarias de 1 minuto.
-
-Reglas principales:
-- Estudia la estructura previa antes de evaluar la vela activa.
-- Calcula soporte y resistencia usando velas anteriores, sin usar la vela de entrada.
-- Revisa las velas que se aproximan al nivel.
-- Solo genera CALL en soporte o PUT en resistencia cuando existe rechazo real.
-- Rechaza velas sin mecha de rechazo, con cuerpo insuficiente o con ruptura clara.
-- La señal se produce sobre la vela activa cuando toca el nivel y cumple las condiciones.
-"""
+"""strategy.py - Rechazo de soporte/resistencia compatible con bot.py."""
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 import math
 
-MIN_CANDLES = 35
+MIN_CANDLES = 20
 DEFAULT_LOOKBACK = 60
-DEFAULT_MIN_SCORE = 90
+DEFAULT_MIN_SCORE = 75
+STOCH_K_PERIOD = 13
+STOCH_D_PERIOD = 3
+STOCH_SMOOTHING = 3
+STOCH_OVERSOLD = 20.0
+STOCH_OVERBOUGHT = 80.0
 
-LEVEL_LOOKBACK = 24
-LEVEL_TOLERANCE_ATR = 0.30
-MIN_REJECTION_WICK_ATR = 0.12
-MIN_BODY_ATR = 0.08
-MIN_REJECTION_RATIO = 0.35
-MAX_BREAK_ATR = 0.20
-MAX_ENTRY_EXTENSION_ATR = 1.25
-MIN_APPROACH_CANDLES = 2
+
+@dataclass
+class Signal:
+    action: str
+    score: int
+    reason: str
+    support: Optional[float] = None
+    resistance: Optional[float] = None
 
 
 def _number(value: Any, default: float = 0.0) -> float:
     try:
-        number = float(value)
-        return number if math.isfinite(number) else default
+        value = float(value)
+        return value if math.isfinite(value) else default
     except (TypeError, ValueError):
         return default
 
 
-def _timestamp(candle: Dict[str, Any]) -> Optional[int]:
-    value = candle.get("from", candle.get("timestamp", candle.get("time")))
-    try:
-        return int(float(value)) if value is not None else None
-    except (TypeError, ValueError):
-        return None
-
-
 def _ohlc(candle: Dict[str, Any]) -> Tuple[float, float, float, float]:
-    return (
-        _number(candle.get("open", candle.get("open_price"))),
-        _number(candle.get("close", candle.get("close_price"))),
-        _number(candle.get("min", candle.get("low"))),
-        _number(candle.get("max", candle.get("high"))),
-    )
+    open_price = _number(candle.get("open", candle.get("open_price")))
+    close_price = _number(candle.get("close", candle.get("close_price")))
+    low = _number(candle.get("min", candle.get("low")))
+    high = _number(candle.get("max", candle.get("high")))
+    return open_price, close_price, low, high
 
 
 def _as_records(value: Any) -> List[Dict[str, Any]]:
@@ -57,266 +45,277 @@ def _as_records(value: Any) -> List[Dict[str, Any]]:
         return []
     if hasattr(value, "to_dict"):
         try:
-            return [dict(item) for item in value.to_dict("records")]
+            records = value.to_dict("records")
+            return [dict(item) for item in records]
         except (TypeError, ValueError):
             return []
     if isinstance(value, dict):
-        return [dict(value)]
+        return [value]
     try:
         return [dict(item) for item in value if isinstance(item, dict)]
     except TypeError:
         return []
 
 
-def _clean_records(records: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    prepared = [item for item in records if isinstance(item, dict)]
-    prepared.sort(key=lambda item: (_timestamp(item) is None, _timestamp(item) or 0))
-    unique: Dict[int, Dict[str, Any]] = {}
-    without_ts: List[Dict[str, Any]] = []
-    for item in prepared:
-        ts = _timestamp(item)
-        if ts is None:
-            without_ts.append(item)
-        else:
-            unique[ts] = item
-    return list(unique.values()) + without_ts
-
-
 def _atr(candles: List[Dict[str, Any]], period: int = 14) -> float:
     if len(candles) < 2:
         return 0.0
-    ranges: List[float] = []
+    true_ranges: List[float] = []
     for index in range(1, len(candles)):
-        _, previous_close, _, _ = _ohlc(candles[index - 1])
         _, _, low, high = _ohlc(candles[index])
-        ranges.append(max(high - low, abs(high - previous_close), abs(low - previous_close)))
-    values = ranges[-period:]
+        _, previous_close, _, _ = _ohlc(candles[index - 1])
+        true_ranges.append(
+            max(
+                high - low,
+                abs(high - previous_close),
+                abs(low - previous_close),
+            )
+        )
+    values = true_ranges[-period:]
     return sum(values) / len(values) if values else 0.0
 
 
-def _ema(values: List[float], period: int) -> float:
-    if not values:
-        return 0.0
-    alpha = 2.0 / (period + 1.0)
-    result = values[0]
-    for value in values[1:]:
-        result = alpha * value + (1.0 - alpha) * result
-    return result
+def _zones(
+    candles: List[Dict[str, Any]],
+    lookback: int = DEFAULT_LOOKBACK,
+) -> Tuple[float, float]:
+    sample = candles[-max(1, lookback):]
+    lows = [_ohlc(candle)[2] for candle in sample]
+    highs = [_ohlc(candle)[3] for candle in sample]
+    return (min(lows), max(highs)) if lows and highs else (0.0, 0.0)
 
 
-def _metrics(candle: Dict[str, Any]) -> Dict[str, Any]:
-    open_price, close_price, low, high = _ohlc(candle)
-    candle_range = max(high - low, 1e-12)
-    body = abs(close_price - open_price)
+def _stochastic(candles: List[Dict[str, Any]], k_period: int = STOCH_K_PERIOD,
+                d_period: int = STOCH_D_PERIOD, slowing: int = STOCH_SMOOTHING) -> Tuple[float, float]:
+    """Calcula Stochastic %K y %D usando únicamente velas cerradas."""
+    if len(candles) < max(k_period + d_period + slowing, 5):
+        return 50.0, 50.0
+
+    highs = [_ohlc(c)[3] for c in candles]
+    lows = [_ohlc(c)[2] for c in candles]
+    closes = [_ohlc(c)[1] for c in candles]
+    raw_k: List[float] = []
+    for i in range(k_period - 1, len(candles)):
+        window_high = max(highs[i - k_period + 1:i + 1])
+        window_low = min(lows[i - k_period + 1:i + 1])
+        span = window_high - window_low
+        raw_k.append(50.0 if span <= 0 else 100.0 * (closes[i] - window_low) / span)
+
+    if not raw_k:
+        return 50.0, 50.0
+    smoothed_k = [sum(raw_k[max(0, i - slowing + 1):i + 1]) /
+                  len(raw_k[max(0, i - slowing + 1):i + 1]) for i in range(len(raw_k))]
+    k_value = smoothed_k[-1]
+    d_window = smoothed_k[-d_period:]
+    d_value = sum(d_window) / len(d_window)
+    return max(0.0, min(100.0, k_value)), max(0.0, min(100.0, d_value))
+
+
+def _stochastic_confirms(direction: str, k_value: float, d_value: float) -> bool:
+    """Filtro adicional estricto usando los niveles 20/80 del gráfico.
+
+    CALL: Stochastic en sobreventa y %K cruzando/por encima de %D.
+    PUT:  Stochastic en sobrecompra y %K cruzando/por debajo de %D.
+    """
+    if direction == "call":
+        return k_value <= STOCH_OVERSOLD and k_value >= d_value
+    if direction == "put":
+        return k_value >= STOCH_OVERBOUGHT and k_value <= d_value
+    return False
+
+
+def _empty_result(reason: str = "no_valid_rejection") -> Dict[str, Any]:
     return {
-        "timestamp": _timestamp(candle),
-        "open": open_price,
-        "high": high,
-        "low": low,
-        "close": close_price,
-        "range": candle_range,
-        "body": body,
-        "upper": max(high - max(open_price, close_price), 0.0),
-        "lower": max(min(open_price, close_price) - low, 0.0),
-        "close_position": (close_price - low) / candle_range,
-        "bullish": close_price > open_price,
-        "bearish": close_price < open_price,
-    }
-
-
-def _empty(reason: str) -> Dict[str, Any]:
-    return {
-        "signal": None, "score": 0, "score_100": 0, "entry_quality": 0,
-        "quality": 0, "entry_type": "none", "direction": "range",
+        "signal": None,
+        "score": 0,
+        "score_100": 0,
+        "entry_quality": 0,
+        "quality": 0,
+        "entry_type": "none",
+        "direction": "range",
         "reason": reason,
-        "analysis": {"force": False, "structure": "range", "atr": 0.0,
-                      "support": None, "resistance": None, "tolerance": 0.0,
-                      "entry_quality": 0, "reversal": {"valid": False}},
+        "analysis": {
+            "force": False,
+            "structure": "range",
+            "atr": 0.0,
+            "support": None,
+            "resistance": None,
+            "tolerance": 0.0,
+            "entry_quality": 0,
+            "pullback": {"valid": False},
+        },
     }
 
 
-def _structure(records: List[Dict[str, Any]], lookback: int) -> Dict[str, Any]:
-    sample = records[-max(LEVEL_LOOKBACK, min(lookback, len(records))):]
-    closes = [_ohlc(item)[1] for item in sample]
-    highs = [_ohlc(item)[3] for item in sample]
-    lows = [_ohlc(item)[2] for item in sample]
-    fast = _ema(closes[-9:], 9)
-    slow = _ema(closes[-21:], 21)
-    half = max(6, len(sample) // 2)
-    recent = sample[-half:]
-    older = sample[:-half] or sample
-    recent_high = max(_ohlc(item)[3] for item in recent)
-    recent_low = min(_ohlc(item)[2] for item in recent)
-    older_high = max(_ohlc(item)[3] for item in older)
-    older_low = min(_ohlc(item)[2] for item in older)
-    bullish = fast > slow and recent_high >= older_high and recent_low >= older_low
-    bearish = fast < slow and recent_high <= older_high and recent_low <= older_low
-    direction = "bullish" if bullish else "bearish" if bearish else "range"
-    return {
-        "direction": direction, "fast_ema": fast, "slow_ema": slow,
-        "support": min(lows), "resistance": max(highs),
-        "recent_high": recent_high, "recent_low": recent_low,
-        "older_high": older_high, "older_low": older_low,
-    }
+def analyze_rejection(
+    candles: Any,
+    min_score: int = DEFAULT_MIN_SCORE,
+    lookback: int = DEFAULT_LOOKBACK,
+    zone_atr_factor: float = 0.35,
+    stochastic_k: float = 50.0,
+    stochastic_d: float = 50.0,
+) -> Signal:
+    records = _as_records(candles)
+    if len(records) < max(MIN_CANDLES, lookback // 2):
+        return Signal("none", 0, "insufficient_candles")
+
+    previous = records[:-1]
+    candle = records[-1]
+    open_price, close_price, low, high = _ohlc(candle)
+    body = abs(close_price - open_price)
+    candle_range = max(high - low, 1e-12)
+    upper_wick = max(high - max(open_price, close_price), 0.0)
+    lower_wick = max(min(open_price, close_price) - low, 0.0)
+    atr = _atr(previous)
+
+    if atr <= 0:
+        return Signal("none", 0, "invalid_atr")
+
+    support, resistance = _zones(previous, lookback)
+    tolerance = atr * max(zone_atr_factor, 0.01)
+    near_support = low <= support + tolerance and close_price > support
+    near_resistance = high >= resistance - tolerance and close_price < resistance
+
+    bullish = (
+        near_support
+        and lower_wick >= max(body * 1.25, atr * 0.20)
+        and close_price > open_price
+        and (close_price - low) / candle_range >= 0.60
+        and _stochastic_confirms("call", stochastic_k, stochastic_d)
+    )
+    bearish = (
+        near_resistance
+        and upper_wick >= max(body * 1.25, atr * 0.20)
+        and close_price < open_price
+        and (high - close_price) / candle_range >= 0.60
+        and _stochastic_confirms("put", stochastic_k, stochastic_d)
+    )
+
+    if bullish:
+        score = 90
+        if lower_wick >= body * 2:
+            score += 8
+        if close_price > support + tolerance * 0.25:
+            score += 5
+        if score >= int(min_score):
+            return Signal(
+                "call",
+                min(score, 100),
+                "bullish_support_rejection",
+                support,
+                resistance,
+            )
+
+    if bearish:
+        score = 90
+        if upper_wick >= body * 2:
+            score += 8
+        if close_price < resistance - tolerance * 0.25:
+            score += 5
+        if score >= int(min_score):
+            return Signal(
+                "put",
+                min(score, 100),
+                "bearish_resistance_rejection",
+                support,
+                resistance,
+            )
+
+    return Signal("none", 0, "no_valid_rejection", support, resistance)
 
 
-def _approach_ok(history: List[Dict[str, Any]], level: float, side: str, atr: float) -> bool:
-    if len(history) < MIN_APPROACH_CANDLES:
-        return False
-    recent = [_metrics(item) for item in history[-MIN_APPROACH_CANDLES:]]
-    if side == "support":
-        # El precio debe venir descendiendo hacia el soporte, sin una caída extrema.
-        return recent[-1]["close"] <= recent[0]["close"] + atr * 0.35
-    # El precio debe venir ascendiendo hacia la resistencia.
-    return recent[-1]["close"] >= recent[0]["close"] - atr * 0.35
+def analyze_market(
+    candle_1m: Any = None,
+    previous_m1: Any = None,
+    pair: Optional[str] = None,
+    df: Any = None,
+    min_score: int = DEFAULT_MIN_SCORE,
+    **_: Any,
+) -> Dict[str, Any]:
+    """
+    Analiza únicamente una vela cerrada anterior.
 
-
-def _reversal_at_level(current: Dict[str, Any], side: str, level: float, atr: float) -> Tuple[bool, str, int]:
-    tolerance = atr * LEVEL_TOLERANCE_ATR
-    touched = current["low"] <= level + tolerance if side == "support" else current["high"] >= level - tolerance
-    if not touched:
-        return False, "no toco el nivel", 0
-
-    body_ok = current["body"] >= atr * MIN_BODY_ATR
-    if side == "support":
-        wick_ok = current["lower"] >= atr * MIN_REJECTION_WICK_ATR
-        rejection_ratio_ok = current["lower"] >= max(current["body"] * MIN_REJECTION_RATIO, 1e-12)
-        close_ok = current["close"] > current["open"] and current["close_position"] >= 0.55
-        break_ok = current["close"] >= level - atr * MAX_BREAK_ATR
-        valid = all((body_ok, wick_ok, rejection_ratio_ok, close_ok, break_ok))
-        missing = []
-        if not body_ok: missing.append("cuerpo insuficiente")
-        if not wick_ok or not rejection_ratio_ok: missing.append("mecha inferior de rechazo insuficiente")
-        if not close_ok: missing.append("cierre no alcista")
-        if not break_ok: missing.append("ruptura del soporte")
-    else:
-        wick_ok = current["upper"] >= atr * MIN_REJECTION_WICK_ATR
-        rejection_ratio_ok = current["upper"] >= max(current["body"] * MIN_REJECTION_RATIO, 1e-12)
-        close_ok = current["close"] < current["open"] and current["close_position"] <= 0.45
-        break_ok = current["close"] <= level + atr * MAX_BREAK_ATR
-        valid = all((body_ok, wick_ok, rejection_ratio_ok, close_ok, break_ok))
-        missing = []
-        if not body_ok: missing.append("cuerpo insuficiente")
-        if not wick_ok or not rejection_ratio_ok: missing.append("mecha superior de rechazo insuficiente")
-        if not close_ok: missing.append("cierre no bajista")
-        if not break_ok: missing.append("ruptura de la resistencia")
-
-    return valid, "; ".join(missing) if missing else "rechazo confirmado", 70 if valid else 0
-
-
-def analyze_market(candle_1m: Any = None, previous_m1: Any = None, pair: Optional[str] = None,
-                   df: Any = None, min_score: int = DEFAULT_MIN_SCORE,
-                   lookback: int = DEFAULT_LOOKBACK, **_: Any) -> Dict[str, Any]:
+    - Cuando bot.py envía previous_m1 + candle_1m, candle_1m ya debe ser N-1.
+    - Cuando se recibe df directamente, se excluye la última vela del DataFrame
+      porque puede estar activa/en formación; se analiza la vela anterior.
+    """
     if previous_m1 is not None:
         records = _as_records(previous_m1)
-        if isinstance(candle_1m, dict):
-            records.append(dict(candle_1m))
+        if candle_1m is not None:
+            current_closed = (
+                dict(candle_1m)
+                if isinstance(candle_1m, dict)
+                else {}
+            )
+            records.append(current_closed)
     elif df is not None:
-        records = _as_records(df)
+        all_records = _as_records(df)
+        # No analizar la última vela recibida: puede estar en formación.
+        records = all_records[:-1] if len(all_records) > 1 else []
     else:
-        records = _as_records(candle_1m)
-    records = _clean_records(records)
+        all_records = _as_records(candle_1m)
+        # Para llamadas directas, también se descarta la última vela.
+        records = all_records[:-1] if len(all_records) > 1 else []
+
+    result = _empty_result()
     if len(records) < MIN_CANDLES:
-        return _empty("insufficient_candles")
+        result["reason"] = "insufficient_candles"
+        return result
 
-    current = _metrics(records[-1])
-    history = records[:-1]
-    atr = _atr(records)
-    if atr <= 0:
-        return _empty("invalid_atr")
-
-    structure = _structure(history, lookback)
-    support = float(structure["support"])
-    resistance = float(structure["resistance"])
-    near_support = current["low"] <= support + atr * LEVEL_TOLERANCE_ATR
-    near_resistance = current["high"] >= resistance - atr * LEVEL_TOLERANCE_ATR
-
-    support_approach = _approach_ok(history, support, "support", atr)
-    resistance_approach = _approach_ok(history, resistance, "resistance", atr)
-    call_valid, call_reason, call_points = _reversal_at_level(current, "support", support, atr)
-    put_valid, put_reason, put_points = _reversal_at_level(current, "resistance", resistance, atr)
-
-    signal: Optional[str] = None
-    reversal_side = "none"
-    reversal_valid = False
-    score = 0
-    reasons: List[str] = []
-
-    # En soporte se busca CALL; en resistencia se busca PUT.
-    if near_support and support_approach and call_valid:
-        signal, reversal_side, reversal_valid, score = "call", "support", True, call_points
-        reasons.extend(["precio toco soporte", "velas llegaron al soporte", call_reason])
-    elif near_resistance and resistance_approach and put_valid:
-        signal, reversal_side, reversal_valid, score = "put", "resistance", True, put_points
-        reasons.extend(["precio toco resistencia", "velas llegaron a la resistencia", put_reason])
-    else:
-        if near_support or near_resistance:
-            reasons.append("nivel tocado pero condiciones de reversion no cumplidas")
-        if near_support and not support_approach:
-            reasons.append("llegada al soporte sin aproximacion valida")
-        if near_resistance and not resistance_approach:
-            reasons.append("llegada a resistencia sin aproximacion valida")
-        if near_support and support_approach and not call_valid:
-            reasons.append(f"CALL rechazado: {call_reason}")
-        if near_resistance and resistance_approach and not put_valid:
-            reasons.append(f"PUT rechazado: {put_reason}")
-
-    if signal:
-        distance_ema = abs(current["close"] - structure["fast_ema"]) / atr
-        if distance_ema > MAX_ENTRY_EXTENSION_ATR:
-            signal = None
-            reversal_valid = False
-            score = 0
-            reasons.append("entrada descartada por extension excesiva")
-        else:
-            score += 20 if structure["direction"] != "range" else 10
-            score += 10 if distance_ema <= 0.75 else 0
-            reasons.append(f"estructura previa: {structure['direction']}")
-            reasons.append("entrada de reversion validada")
-
-    force = bool(signal and reversal_valid and score >= int(min_score))
-    if not force:
-        signal = None
-        score = 0
-        reason = "; ".join(reasons) if reasons else "sin toque ni rechazo valido"
-        reason = "senal descartada: " + reason
-    else:
-        reason = "; ".join(reasons)
-
+    stochastic_k, stochastic_d = _stochastic(records)
+    signal = analyze_rejection(
+        records,
+        min_score=min_score,
+        stochastic_k=stochastic_k,
+        stochastic_d=stochastic_d,
+    )
+    records_last = records[-1]
+    timestamp = records_last.get("from", records_last.get("timestamp"))
+    atr = _atr(records[:-1]) if len(records) > 1 else 0.0
+    direction = (
+        "bullish"
+        if signal.action == "call"
+        else "bearish"
+        if signal.action == "put"
+        else "range"
+    )
+    force = signal.action in {"call", "put"} and signal.score >= int(min_score)
     analysis = {
-        "force": force, "structure": structure["direction"],
-        "structure_direction": structure["direction"], "atr": atr,
-        "support": support, "resistance": resistance,
-        # Campos de compatibilidad consumidos por bot.py para revalidar el espacio.
-        "last_swing_high": resistance,
-        "last_swing_low": support,
-        "tolerance": atr * LEVEL_TOLERANCE_ATR,
-        "entry_quality": score if force else 0,
-        "fast_ema": structure["fast_ema"], "slow_ema": structure["slow_ema"],
-        "room_atr": None, "location_ok": True,
-        "impulse_phase": "touch_reversal" if force else "waiting_touch_or_reversal",
-        "reversal_side": reversal_side, "reversal_valid": reversal_valid,
-        "support_approach": support_approach, "resistance_approach": resistance_approach,
-        "rejection_timestamp": current["timestamp"],
-        "confirmation_timestamp": current["timestamp"],
-        "rejection_candle": current, "confirmation_candle": current,
-        "current_candle": current, "structure_reasons": reasons,
-        "reversal": {"valid": reversal_valid, "side": reversal_side},
+        "force": force,
+        "structure": direction,
+        "atr": atr,
+        "support": signal.support,
+        "resistance": signal.resistance,
+        "tolerance": atr * 0.35,
+        "entry_quality": signal.score,
+        "stochastic_k": round(stochastic_k, 2),
+        "stochastic_d": round(stochastic_d, 2),
+        "stochastic_oversold": STOCH_OVERSOLD,
+        "stochastic_overbought": STOCH_OVERBOUGHT,
+        "last_swing_high": signal.resistance,
+        "last_swing_low": signal.support,
+        "rejection_timestamp": timestamp,
+        "confirmation_timestamp": timestamp,
+        "rejection_candle": records_last,
+        "confirmation_candle": records_last,
         "pullback": {
-            "valid": bool(reversal_valid),
-            "previous_candle_confirmed": bool(reversal_valid),
-            "extreme_confirmed": bool(reversal_valid),
+            "valid": force,
+            "previous_candle_confirmed": force,
+            "extreme_confirmed": force,
         },
     }
     return {
-        "signal": signal if force else None,
-        "score": score if force else 0,
-        "score_100": score if force else 0,
-        "entry_quality": score if force else 0,
-        "quality": score if force else 0,
+        "signal": signal.action if force else None,
+        "score": signal.score if force else 0,
+        "score_100": signal.score if force else 0,
+        "entry_quality": signal.score if force else 0,
+        "quality": signal.score if force else 0,
         "entry_type": "force" if force else "none",
-        "direction": structure["direction"], "reason": reason,
-        "analysis": analysis, "candle_timestamp": current["timestamp"], "pair": pair,
+        "direction": direction,
+        "reason": f"{signal.reason} | STOCH K={stochastic_k:.1f} D={stochastic_d:.1f}",
+        "analysis": analysis,
+        "candle_timestamp": timestamp,
+        "pair": pair,
     }
 
 
