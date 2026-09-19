@@ -50,8 +50,8 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 TIMEFRAME = 60
-EXPIRATION = int(os.getenv("EXPIRATION", "1"))
-AMOUNT = float(os.getenv("AMOUNT", "500"))
+EXPIRATION = 1  # Fijo: solo operaciones con expiración de 1 minuto
+AMOUNT = float(os.getenv("AMOUNT", "800"))
 
 # Cuenta de IQ Option: PRACTICE o REAL
 ACCOUNT_TYPE = os.getenv("ACCOUNT_TYPE", "PRACTICE").strip().upper()
@@ -252,6 +252,65 @@ def _is_otc_pair(value: Any) -> bool:
     return name.endswith("-OTC") or name.endswith("_OTC") or "OTC" in name
 
 
+def _supports_one_minute_expiration(info: Dict[str, Any]) -> bool:
+    """
+    Acepta pares cuya metadata declara expiración de 1 minuto.
+    Si IQ Option no publica ese dato en el catálogo, no descarta el par;
+    la orden se fuerza igualmente a EXPIRATION=1.
+    """
+    if not isinstance(info, dict):
+        return False
+
+    values = []
+    keys = (
+        "expiration", "expirations", "expiration_time",
+        "expiration_times", "expiration_period", "expiration_periods",
+        "durations", "duration", "available_expirations",
+    )
+
+    def collect(value: Any) -> None:
+        if isinstance(value, dict):
+            for key, item in value.items():
+                key_text = str(key).lower()
+                if any(token in key_text for token in keys):
+                    values.append(item)
+                collect(item)
+        elif isinstance(value, (list, tuple, set)):
+            for item in value:
+                collect(item)
+        elif isinstance(value, (int, float)) and not isinstance(value, bool):
+            values.append(value)
+        elif isinstance(value, str):
+            values.append(value)
+
+    collect(info)
+    if not values:
+        return True
+
+    found_one = False
+    found_expiration_data = False
+    for value in values:
+        text = str(value).lower()
+        numbers = []
+        import re
+        for match in re.findall(r"(?<!\d)(\d+(?:\.\d+)?)\s*(m|min|mins|minute|minutes)?", text):
+            try:
+                number = float(match[0])
+            except (TypeError, ValueError):
+                continue
+            unit = match[1]
+            minutes = number / 60.0 if unit in {"s"} else number
+            numbers.append(minutes)
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            numbers.append(float(value))
+        if numbers:
+            found_expiration_data = True
+            if any(abs(number - 1.0) < 1e-9 for number in numbers):
+                found_one = True
+
+    return found_one if found_expiration_data else True
+
+
 def _load_binary_otc_catalog() -> Tuple[list[str], bool]:
     if IQ is None or not hasattr(IQ, "get_all_init_v2"):
         return [], False
@@ -296,6 +355,10 @@ def _load_binary_otc_catalog() -> Tuple[list[str], bool]:
         if info.get("enabled", True) is False:
             continue
         if info.get("is_suspended", info.get("suspended", False)) is True:
+            continue
+
+        if not _supports_one_minute_expiration(info):
+            logger.debug("Par descartado: no declara expiración de 1 minuto: %s", name)
             continue
 
         try:
@@ -1231,7 +1294,7 @@ def main() -> None:
 
     logger.info("========================================")
     logger.info("BOT BINARY OTC | BB + EMA + ATR + RSI | N-1 -> N")
-    logger.info("TIMEFRAME=%s | EXPIRATION=%s", TIMEFRAME, EXPIRATION)
+    logger.info("TIMEFRAME=%s | EXPIRATION=%s (SOLO 1 MINUTO)", TIMEFRAME, EXPIRATION)
     logger.info("MAX OTC=%s | REFRESH=%ss | AMOUNT=%s | ACCOUNT=%s | MAX_TRADES=%s",
                 MAX_OTC_PAIRS, int(PAIR_REFRESH_SECONDS), AMOUNT, ACCOUNT_TYPE, MAX_TOTAL_TRADES)
     logger.info("========================================")
@@ -1268,6 +1331,7 @@ def main() -> None:
     telegram_send(
         "🤖 BOT LISTO\n\n"
         "📊 Filtro de estructura + pullback + continuidad\n"
+        "⏱ Solo pares con expiración de 1 minuto\n"
         "⚡ Ejecución al detectar la señal en vela cerrada\n"
         f"⏳ Expiración: {EXPIRATION} minuto(s)\n"
         f"🔢 Pares analizados: {MAX_OTC_PAIRS}\n"
