@@ -11,8 +11,16 @@ DEFAULT_MIN_SCORE = 75
 STOCH_K_PERIOD = 13
 STOCH_D_PERIOD = 3
 STOCH_SMOOTHING = 3
-STOCH_OVERSOLD = 37.0
-STOCH_OVERBOUGHT = 63.0
+STOCH_OVERSOLD = 20.0
+STOCH_OVERBOUGHT = 80.0
+
+# Perfil conservador basado en los registros compartidos hasta ahora.
+# No es una garantía de ganancia: bloquea configuraciones fuera del patrón observado.
+CALL_K_MAX = 15.0
+CALL_D_MAX = 15.0
+PUT_K_MIN = 83.0
+PUT_D_MIN = 83.0
+MIN_STOCH_SEPARATION = 0.5
 
 
 @dataclass
@@ -112,15 +120,31 @@ def _stochastic(candles: List[Dict[str, Any]], k_period: int = STOCH_K_PERIOD,
 
 
 def _stochastic_confirms(direction: str, k_value: float, d_value: float) -> bool:
-    """Filtro adicional estricto usando los niveles 20/80 del gráfico.
+    """Filtro estocástico conservador basado en los registros compartidos.
 
-    CALL: Stochastic en sobreventa y %K cruzando/por encima de %D.
-    PUT:  Stochastic en sobrecompra y %K cruzando/por debajo de %D.
+    CALL: K/D en zona baja, K por encima de D y separación mínima.
+    PUT: K/D en zona alta, K por debajo de D y separación mínima.
     """
+    separation = abs(k_value - d_value)
+    if separation < MIN_STOCH_SEPARATION:
+        return False
+
     if direction == "call":
-        return k_value <= STOCH_OVERSOLD and k_value >= d_value
+        return (
+            k_value <= CALL_K_MAX
+            and d_value <= CALL_D_MAX
+            and k_value <= STOCH_OVERSOLD
+            and k_value >= d_value
+        )
+
     if direction == "put":
-        return k_value >= STOCH_OVERBOUGHT and k_value <= d_value
+        return (
+            k_value >= PUT_K_MIN
+            and d_value >= PUT_D_MIN
+            and k_value >= STOCH_OVERBOUGHT
+            and k_value <= d_value
+        )
+
     return False
 
 
