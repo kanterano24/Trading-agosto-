@@ -179,6 +179,7 @@ def analyze_rejection(
 def analyze_market(
     candle_1m: Any = None,
     previous_m1: Any = None,
+    candle_n2: Any = None,
     pair: Optional[str] = None,
     df: Any = None,
     min_score: int = DEFAULT_MIN_SCORE,
@@ -187,12 +188,17 @@ def analyze_market(
     """
     Analiza únicamente una vela cerrada anterior.
 
-    - Cuando bot.py envía previous_m1 + candle_1m, candle_1m ya debe ser N-1.
+    - Cuando bot.py envía previous_m1 + candle_1m, candle_1m es N-1 y candle_n2 es el contexto anterior.
     - Cuando se recibe df directamente, se excluye la última vela del DataFrame
       porque puede estar activa/en formación; se analiza la vela anterior.
     """
     if previous_m1 is not None:
         records = _as_records(previous_m1)
+        if candle_n2 is not None:
+            # N-2 se conserva como contexto explícito; N-1 es la vela de señal.
+            n2_record = dict(candle_n2) if isinstance(candle_n2, dict) else {}
+            if not records or records[-1].get("from", records[-1].get("timestamp")) != n2_record.get("from", n2_record.get("timestamp")):
+                records.append(n2_record)
         if candle_1m is not None:
             current_closed = (
                 dict(candle_1m)
@@ -226,6 +232,10 @@ def analyze_market(
         else "range"
     )
     force = signal.action in {"call", "put"} and signal.score >= int(min_score)
+    n1_record = records_last
+    n2_record = records[-2] if len(records) >= 2 else {}
+    n2_open, n2_close, n2_low, n2_high = _ohlc(n2_record)
+    n1_open, n1_close, n1_low, n1_high = _ohlc(n1_record)
     analysis = {
         "force": force,
         "structure": direction,
@@ -236,8 +246,10 @@ def analyze_market(
         "entry_quality": signal.score,
         "rejection_timestamp": timestamp,
         "confirmation_timestamp": timestamp,
-        "rejection_candle": records_last,
-        "confirmation_candle": records_last,
+        "rejection_candle": n1_record,
+        "confirmation_candle": n1_record,
+        "n2_candle": {"from": n2_record.get("from", n2_record.get("timestamp")), "open": n2_open, "high": n2_high, "low": n2_low, "close": n2_close},
+        "n1_candle": {"from": n1_record.get("from", n1_record.get("timestamp")), "open": n1_open, "high": n1_high, "low": n1_low, "close": n1_close},
         "pullback": {
             "valid": force,
             "previous_candle_confirmed": force,
