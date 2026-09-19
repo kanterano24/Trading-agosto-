@@ -50,7 +50,7 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 TIMEFRAME = 60
 EXPIRATION = int(os.getenv("EXPIRATION", "1"))
-AMOUNT = float(os.getenv("AMOUNT", "200"))
+AMOUNT = float(os.getenv("AMOUNT", "190"))
 
 # Cuenta de IQ Option: PRACTICE o REAL
 ACCOUNT_TYPE = os.getenv("ACCOUNT_TYPE", "PRACTICE").strip().upper()
@@ -636,8 +636,8 @@ def _diagnostic_message(
     pair: str,
     signal: str,
     result: Dict[str, Any],
-    rejection_label: str = "N",
-    confirmation_label: str = "N",
+    rejection_label: str = "N-1",
+    confirmation_label: str = "N-2",
 ) -> str:
     analysis = result.get("analysis") or {}
     rejection = analysis.get("rejection_candle") or {}
@@ -684,22 +684,6 @@ def analysis_message(pair: str, ts: int, result: Dict[str, Any]) -> str:
     )
 
 
-def _telegram_candle_line(label: str, candle: Any) -> str:
-    if candle is None:
-        return f"{label}: no disponible\n"
-    if hasattr(candle, "to_dict"):
-        candle = candle.to_dict()
-    values = candle_values(candle)
-    ts = candle.get("from", candle.get("timestamp", "?")) if isinstance(candle, dict) else "?"
-    return (
-        f"{label} (ts={ts})\n"
-        f"  Apertura: {_fmt_price(values.get('open'))}\n"
-        f"  Máximo: {_fmt_price(values.get('high'))}\n"
-        f"  Mínimo: {_fmt_price(values.get('low'))}\n"
-        f"  Cierre: {_fmt_price(values.get('close'))}\n"
-    )
-
-
 def analyze_closed_candle(pair: str, expected_closed_ts: int) -> bool:
     df = realtime_dataframe(pair)
     closed_row = get_row_by_ts(df, expected_closed_ts)
@@ -722,13 +706,8 @@ def analyze_closed_candle(pair: str, expected_closed_ts: int) -> bool:
         if state and int(state.get("analyzed_ts", -1)) == expected_closed_ts:
             return True
 
-    n1_index = df.index[df["from"].astype(int) == int(expected_closed_ts)].tolist()
-    n1_pos = n1_index[-1] if n1_index else len(df) - 1
-    n2_row = df.iloc[n1_pos - 1] if n1_pos >= 1 else None
-
     result = analyze_market(
         candle_1m=closed_row.to_dict(),
-        candle_n2=n2_row.to_dict() if n2_row is not None else None,
         previous_m1=df.iloc[:-1].copy(),
         pair=pair,
     )
@@ -761,7 +740,7 @@ def analyze_closed_candle(pair: str, expected_closed_ts: int) -> bool:
         return True
 
     values = candle_values(closed_row)
-    execution_ts = int(expected_closed_ts + TIMEFRAME)  # Entrada al comenzar N-1
+    execution_ts = int(expected_closed_ts + TIMEFRAME)  # Entrada al comenzar N
 
     pending = {
         "signal": signal,
@@ -774,8 +753,6 @@ def analyze_closed_candle(pair: str, expected_closed_ts: int) -> bool:
         "high": values["high"],
         "low": values["low"],
         "close": values["close"],
-        "n2_candle": analysis.get("n2_candle"),
-        "n1_candle": analysis.get("n1_candle"),
         "reason": result.get("reason", ""),
         "analysis": analysis,
         "created_at": time.time(),
@@ -800,12 +777,11 @@ def analyze_closed_candle(pair: str, expected_closed_ts: int) -> bool:
         f"Score: {score}/100\n"
         f"Calidad: {analysis.get('entry_quality', result.get('entry_quality', 0))}/100\n"
         f"Estructura: {analysis.get('structure', 'unknown')}\n\n"
-        f"Entrada al comenzar N-1: {execution_ts}\n\n"
-        + _telegram_candle_line("📊 N-2", pending.get("n2_candle"))
-        + _telegram_candle_line("📊 N-1", pending.get("n1_candle"))
-        + "\n"
-        "🚫 N-2 se analiza; N-1 se utiliza para la entrada.\n"
-        "⚡ La entrada queda pendiente para el inicio de N-1.\n"
+        f"Cierre N-1: {_fmt_price(values['close'])}\n"
+        f"N-1 cierre: {expected_closed_ts}\n"
+        f"Entrada al comenzar N: {execution_ts}\n\n"
+        "🚫 N-2 confirma contexto; N-1 confirma rechazo; N ejecuta.\n"
+        "⚡ La entrada queda pendiente para el inicio de N.\n"
         f"⏳ Expiración: {EXPIRATION} minuto(s)\n\n"
         f"{result.get('reason', '')}\n\n"
         + _diagnostic_message(pair, signal, result)
@@ -1053,9 +1029,7 @@ def execute_sniper(pair: str, pending: Dict[str, Any]) -> bool:
         f"Entrada programada: {execution_ts}\n"
         f"Reloj IQ: {sent_at:.3f}\n"
         f"ID: {order_id}\n"
-        + _telegram_candle_line("📊 N-2", pending.get("n2_candle"))
-        + _telegram_candle_line("📊 N-1", pending.get("n1_candle"))
-        + "\n"
+        f"Precio de cierre N: {_fmt_price(pending.get('close'))}\n\n"
         f"⏳ Expiración: {EXPIRATION} minuto(s)\n\n"
         f"Estructura: {pending_analysis.get('structure', 'unknown')}\n"
         f"ATR: {_fmt_price(pending_analysis.get('atr'))}\n"
@@ -1085,15 +1059,16 @@ def process_pair(pair: str) -> None:
 
     current_ts = floor_candle_timestamp(get_iq_server_timestamp())
 
-    # Primero se analiza N-2 y se prepara la entrada para el comienzo de N-1.
-    closed_ts = int(current_ts - (2 * TIMEFRAME))
-    analyze_closed_candle(pair, closed_ts)
-
-    # Después se ejecuta la señal pendiente al comenzar N-1.
+    # Primero se ejecuta, si corresponde, la señal preparada con N-1
+    # al comenzar la vela N.
     with STATE_LOCK:
         pending = PENDING_ENTRY.get(pair)
     if pending is not None:
         execute_sniper(pair, pending)
+
+    # Después se analiza la última vela completamente cerrada: N-1.
+    closed_ts = int(current_ts - TIMEFRAME)
+    analyze_closed_candle(pair, closed_ts)
 
 
 def analyze_all_pairs() -> None:
