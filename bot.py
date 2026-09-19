@@ -51,7 +51,7 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 TIMEFRAME = 60
 EXPIRATION = int(os.getenv("EXPIRATION", "1"))
-AMOUNT = float(os.getenv("AMOUNT", "750"))
+AMOUNT = float(os.getenv("AMOUNT", "500"))
 
 # Cuenta de IQ Option: PRACTICE o REAL
 ACCOUNT_TYPE = os.getenv("ACCOUNT_TYPE", "PRACTICE").strip().upper()
@@ -60,17 +60,17 @@ ACCOUNT_TYPE = os.getenv("ACCOUNT_TYPE", "PRACTICE").strip().upper()
 MAX_TOTAL_TRADES = 100
 TOTAL_TRADES = 0
 CANDLE_COUNT = max(60, int(os.getenv("CANDLE_COUNT", "80")))
-MAX_OTC_PAIRS = max(1, int(os.getenv("MAX_OTC_PAIRS", "50")))
+MAX_OTC_PAIRS = max(1, int(os.getenv("MAX_OTC_PAIRS", "2")))
 
 # Modo de estudio: por defecto concentra el bot en FARTCOINUSD-OTC.
 STUDY_PAIR = os.getenv("STUDY_PAIR", "FARTCOINUSD-OTC").strip().upper()
-STUDY_ONLY_PAIR = os.getenv("STUDY_ONLY_PAIR", "true").strip().lower() in {
+STUDY_ONLY_PAIR = os.getenv("STUDY_ONLY_PAIR", "false").strip().lower() in {
     "1", "true", "yes", "on"
 }
 STUDY_LOG_DIR = os.getenv("STUDY_LOG_DIR", "trade_study")
 STUDY_LOG_FILE = os.path.join(STUDY_LOG_DIR, "trades.jsonl")
 
-PAIR_REFRESH_SECONDS = 60.0
+PAIR_REFRESH_SECONDS = float(os.getenv("PAIR_REFRESH_SECONDS", "900"))  # 15 minutos
 SNIPER_POLL = 0.06
 TRADE_COOLDOWN = float(os.getenv("TRADE_COOLDOWN", "60"))
 MIN_HISTORY = 35
@@ -325,7 +325,11 @@ def refresh_binary_otc_pairs(force: bool = False) -> list[str]:
     if STUDY_ONLY_PAIR:
         selected = [p for p in discovered if p.upper() == STUDY_PAIR]
     else:
-        selected = discovered[:MAX_OTC_PAIRS]
+        # Prioriza el par de estudio y completa el universo con un segundo par.
+        # Si STUDY_PAIR no está disponible, toma los dos primeros pares OTC.
+        prioritized = [p for p in discovered if p.upper() == STUDY_PAIR]
+        remaining = [p for p in discovered if p.upper() != STUDY_PAIR]
+        selected = (prioritized + remaining)[:MAX_OTC_PAIRS]
     previous = set(PAIRS)
     current = set(selected)
 
@@ -756,8 +760,8 @@ def _diagnostic_message(
     pair: str,
     signal: str,
     result: Dict[str, Any],
-    rejection_label: str = "N-1",
-    confirmation_label: str = "N-2",
+    rejection_label: str = "RETROCESO N-2",
+    confirmation_label: str = "CONTINUACION N-1",
 ) -> str:
     analysis = result.get("analysis") or {}
     rejection = analysis.get("rejection_candle") or {}
@@ -805,6 +809,7 @@ def analysis_message(pair: str, ts: int, result: Dict[str, Any]) -> str:
 
 
 def analyze_closed_candle(pair: str, expected_closed_ts: int) -> bool:
+    """Analiza la última vela cerrada y ejecuta inmediatamente la señal válida."""
     df = realtime_dataframe(pair)
     closed_row = get_row_by_ts(df, expected_closed_ts)
 
@@ -817,7 +822,6 @@ def analyze_closed_candle(pair: str, expected_closed_ts: int) -> bool:
 
     df = df[df["from"].astype(int) <= expected_closed_ts].copy()
     df = df.sort_values("from").reset_index(drop=True)
-
     if len(df) < MIN_HISTORY:
         return False
 
@@ -831,10 +835,10 @@ def analyze_closed_candle(pair: str, expected_closed_ts: int) -> bool:
         previous_m1=df.iloc[:-1].copy(),
         pair=pair,
     )
-
     signal = result.get("signal")
     score = int(result.get("score", 0) or 0)
     analysis = result.get("analysis") or {}
+    study_rows = study_candles(df, expected_closed_ts, 10)
 
     with STATE_LOCK:
         LIVE_STATE[pair] = {
@@ -848,66 +852,62 @@ def analyze_closed_candle(pair: str, expected_closed_ts: int) -> bool:
         }
 
     logger.info(
-        "%s | VELA CERRADA / ESTRUCTURA | signal=%s | type=%s | score=%s | %s",
-        pair,
-        signal,
-        result.get("entry_type"),
-        score,
-        result.get("reason", ""),
+        "%s | VELA CERRADA | signal=%s | type=%s | score=%s | %s",
+        pair, signal, result.get("entry_type"), score, result.get("reason", ""),
     )
 
     if not is_force_signal(result, signal):
         return True
+    if trade_limit_reached() or cooldown_active(pair):
+        return True
+    if LAST_TRADE_CANDLE.get(pair) == int(expected_closed_ts):
+        return True
 
     values = candle_values(closed_row)
-    execution_ts = int(expected_closed_ts + TIMEFRAME)  # Entrada al comenzar N
+    ok, order_id = buy_binary(pair, signal)
+    if not ok:
+        telegram_send(
+            "❌ ORDEN RECHAZADA\n\n"
+            f"Par: {pair}\n"
+            f"Dirección: {str(signal).upper()}\n"
+            f"Vela detectada: {expected_closed_ts}\n"
+            "La orden fue rechazada por IQ Option."
+        )
+        return False
 
-    pending = {
+    LAST_TRADE_TIME[pair] = time.time()
+    LAST_TRADE_CANDLE[pair] = int(expected_closed_ts)
+    _study_write({
+        "event": "entry",
+        "pair": pair,
         "signal": signal,
+        "order_id": order_id,
         "score": score,
         "entry_type": result.get("entry_type"),
-        "force": bool(analysis.get("force", True)),
-        "continuity_ts": int(expected_closed_ts),
-        "execution_ts": execution_ts,
-        "open": values["open"],
-        "high": values["high"],
-        "low": values["low"],
-        "close": values["close"],
-        "reason": result.get("reason", ""),
         "analysis": analysis,
-        "study_candles": study_candles(df, expected_closed_ts, 10),
-        "created_at": time.time(),
-    }
-
-    with STATE_LOCK:
-        existing = PENDING_ENTRY.get(pair)
-
-        if existing is not None:
-            existing_ts = int(existing.get("execution_ts", 0))
-            if existing_ts >= execution_ts:
-                return True
-
-        PENDING_ENTRY[pair] = pending
+        "reason": result.get("reason", ""),
+        "signal_timestamp": int(expected_closed_ts),
+        "execution_timestamp": int(get_iq_server_timestamp()),
+        "entry_price": values["close"],
+        "candles": study_rows,
+    })
 
     side = "CALL 🟢" if signal == "call" else "PUT 🔴"
     telegram_send(
-        "🎯 SEÑAL DE FUERZA ARMADA\n\n"
+        "⚡ ENTRADA EJECUTADA INMEDIATAMENTE\n\n"
         f"Par: {pair}\n"
         f"Dirección: {side}\n"
-        f"Tipo: {pending['entry_type']}\n"
+        f"Tipo: {result.get('entry_type')}\n"
         f"Score: {score}/100\n"
         f"Calidad: {analysis.get('entry_quality', result.get('entry_quality', 0))}/100\n"
-        f"Estructura: {analysis.get('structure', 'unknown')}\n\n"
-        f"Cierre N-1: {_fmt_price(values['close'])}\n"
-        f"Vela analizada: {expected_closed_ts}\n"
-        f"Entrada al comenzar N: {execution_ts}\n\n"
-        "🚫 N-2 confirma contexto; N-1 confirma rechazo; N ejecuta.\n"
-        "⚡ La entrada queda pendiente para el inicio de N.\n"
+        f"Estructura: {analysis.get('structure', 'unknown')}\n"
+        f"Vela detectada: {expected_closed_ts}\n"
+        f"ID: {order_id}\n\n"
+        "✅ La operación se ejecutó al detectar la señal.\n"
         f"⏳ Expiración: {EXPIRATION} minuto(s)\n\n"
         f"{result.get('reason', '')}\n\n"
         + _diagnostic_message(pair, signal, result)
     )
-
     return True
 
 
@@ -1200,14 +1200,8 @@ def process_pair(pair: str) -> None:
 
     current_ts = floor_candle_timestamp(get_iq_server_timestamp())
 
-    # Primero se ejecuta, si corresponde, la señal preparada con N-1
-    # al comenzar la vela N.
-    with STATE_LOCK:
-        pending = PENDING_ENTRY.get(pair)
-    if pending is not None:
-        execute_sniper(pair, pending)
-
-    # Después se analiza la última vela completamente cerrada: N-1.
+    # La señal se ejecuta inmediatamente al ser detectada en la vela cerrada.
+    # No se utiliza una entrada pendiente para la siguiente vela.
     closed_ts = int(current_ts - TIMEFRAME)
     analyze_closed_candle(pair, closed_ts)
 
@@ -1238,8 +1232,8 @@ def main() -> None:
     logger.info("========================================")
     logger.info("BOT BINARY OTC | BB + EMA + ATR + RSI | N-1 -> N")
     logger.info("TIMEFRAME=%s | EXPIRATION=%s", TIMEFRAME, EXPIRATION)
-    logger.info("MAX OTC=%s | AMOUNT=%s | ACCOUNT=%s | MAX_TRADES=%s",
-                MAX_OTC_PAIRS, AMOUNT, ACCOUNT_TYPE, MAX_TOTAL_TRADES)
+    logger.info("MAX OTC=%s | REFRESH=%ss | AMOUNT=%s | ACCOUNT=%s | MAX_TRADES=%s",
+                MAX_OTC_PAIRS, int(PAIR_REFRESH_SECONDS), AMOUNT, ACCOUNT_TYPE, MAX_TOTAL_TRADES)
     logger.info("========================================")
 
     required = {
@@ -1273,9 +1267,11 @@ def main() -> None:
 
     telegram_send(
         "🤖 BOT LISTO\n\n"
-        "📊 Filtro Bollinger + ATR Trailing Stops + RSI\n"
-        "⚡ Análisis de estructura; ejecución al comenzar N\n"
+        "📊 Filtro de estructura + pullback + continuidad\n"
+        "⚡ Ejecución al detectar la señal en vela cerrada\n"
         f"⏳ Expiración: {EXPIRATION} minuto(s)\n"
+        f"🔢 Pares analizados: {MAX_OTC_PAIRS}\n"
+        f"🔄 Actualización de pares: cada {int(PAIR_REFRESH_SECONDS // 60)} minutos\n"
         f"🚀 Inicio automático: {'SI' if AUTO_START else 'NO'}\n\n"
         + (
             "🟢 Análisis automático activado."
