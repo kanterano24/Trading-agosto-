@@ -673,7 +673,7 @@ def analysis_message(pair: str, ts: int, result: Dict[str, Any]) -> str:
     return (
         "🔎 ANÁLISIS DE FUERZA\n\n"
         f"Par: {pair}\n"
-        f"Vela N: {ts}\n"
+        f"Vela N-1: {ts}\n"
         f"Dirección: {result.get('signal')}\n"
         f"Estructura: {analysis.get('structure', 'unknown')}\n"
         f"Fase: {analysis.get('impulse_phase', 'unknown')}\n"
@@ -728,7 +728,7 @@ def analyze_closed_candle(pair: str, expected_closed_ts: int) -> bool:
         }
 
     logger.info(
-        "%s | N CERRADA | signal=%s | type=%s | score=%s | %s",
+        "%s | N-1 CERRADA | signal=%s | type=%s | score=%s | %s",
         pair,
         signal,
         result.get("entry_type"),
@@ -778,7 +778,7 @@ def analyze_closed_candle(pair: str, expected_closed_ts: int) -> bool:
         f"Calidad: {analysis.get('entry_quality', result.get('entry_quality', 0))}/100\n"
         f"Estructura: {analysis.get('structure', 'unknown')}\n\n"
         f"Cierre N: {_fmt_price(values['close'])}\n"
-        f"N cierre: {expected_closed_ts}\n"
+        f"N-1 cierre: {expected_closed_ts}\n"
         f"Entrada al comenzar N: {execution_ts}\n\n"
         "🚫 N-1 se analiza; N se utiliza para la entrada.\n"
         "⚡ La entrada queda pendiente para el inicio de N.\n"
@@ -1025,7 +1025,7 @@ def execute_sniper(pair: str, pending: Dict[str, Any]) -> bool:
         f"Par: {pair}\n"
         f"Dirección: {signal.upper()}\n"
         f"Tipo: {pending.get('entry_type')}\n"
-        f"N cierre: {pending.get('continuity_ts')}\n"
+        f"N-1 cierre: {pending.get('continuity_ts')}\n"
         f"Entrada programada: {execution_ts}\n"
         f"Reloj IQ: {sent_at:.3f}\n"
         f"ID: {order_id}\n"
