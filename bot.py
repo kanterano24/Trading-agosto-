@@ -27,7 +27,7 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 TIMEFRAME = 60
 EXPIRATION = 1  # Fijo: solo operaciones con expiración de 1 minuto
-AMOUNT = float(os.getenv("AMOUNT", "290"))
+AMOUNT = float(os.getenv("AMOUNT", "190"))
 
 # Cuenta de IQ Option: PRACTICE o REAL
 ACCOUNT_TYPE = os.getenv("ACCOUNT_TYPE", "PRACTICE").strip().upper()
@@ -36,7 +36,7 @@ ACCOUNT_TYPE = os.getenv("ACCOUNT_TYPE", "PRACTICE").strip().upper()
 MAX_TOTAL_TRADES = 100
 TOTAL_TRADES = 0
 CANDLE_COUNT = max(60, int(os.getenv("CANDLE_COUNT", "80")))
-MAX_PAIRS = 0  # SIN LIMITE: analiza todos los activos de la libreria que cumplan el filtro
+MAX_PAIRS = 50  # Analiza hasta 50 activos que cumplan el filtro
 
 STUDY_LOG_DIR = os.getenv("STUDY_LOG_DIR", "trade_study")
 STUDY_LOG_FILE = os.path.join(STUDY_LOG_DIR, "trades.jsonl")
