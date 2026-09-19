@@ -684,6 +684,22 @@ def analysis_message(pair: str, ts: int, result: Dict[str, Any]) -> str:
     )
 
 
+def _telegram_candle_line(label: str, candle: Any) -> str:
+    if candle is None:
+        return f"{label}: no disponible\n"
+    if hasattr(candle, "to_dict"):
+        candle = candle.to_dict()
+    values = candle_values(candle)
+    ts = candle.get("from", candle.get("timestamp", "?")) if isinstance(candle, dict) else "?"
+    return (
+        f"{label} (ts={ts})\n"
+        f"  Apertura: {_fmt_price(values.get('open'))}\n"
+        f"  Máximo: {_fmt_price(values.get('high'))}\n"
+        f"  Mínimo: {_fmt_price(values.get('low'))}\n"
+        f"  Cierre: {_fmt_price(values.get('close'))}\n"
+    )
+
+
 def analyze_closed_candle(pair: str, expected_closed_ts: int) -> bool:
     df = realtime_dataframe(pair)
     closed_row = get_row_by_ts(df, expected_closed_ts)
@@ -706,8 +722,13 @@ def analyze_closed_candle(pair: str, expected_closed_ts: int) -> bool:
         if state and int(state.get("analyzed_ts", -1)) == expected_closed_ts:
             return True
 
+    n1_index = df.index[df["from"].astype(int) == int(expected_closed_ts)].tolist()
+    n1_pos = n1_index[-1] if n1_index else len(df) - 1
+    n2_row = df.iloc[n1_pos - 1] if n1_pos >= 1 else None
+
     result = analyze_market(
         candle_1m=closed_row.to_dict(),
+        candle_n2=n2_row.to_dict() if n2_row is not None else None,
         previous_m1=df.iloc[:-1].copy(),
         pair=pair,
     )
@@ -753,6 +774,8 @@ def analyze_closed_candle(pair: str, expected_closed_ts: int) -> bool:
         "high": values["high"],
         "low": values["low"],
         "close": values["close"],
+        "n2_candle": analysis.get("n2_candle"),
+        "n1_candle": analysis.get("n1_candle"),
         "reason": result.get("reason", ""),
         "analysis": analysis,
         "created_at": time.time(),
@@ -777,9 +800,10 @@ def analyze_closed_candle(pair: str, expected_closed_ts: int) -> bool:
         f"Score: {score}/100\n"
         f"Calidad: {analysis.get('entry_quality', result.get('entry_quality', 0))}/100\n"
         f"Estructura: {analysis.get('structure', 'unknown')}\n\n"
-        f"Cierre N: {_fmt_price(values['close'])}\n"
-        f"N-1 cierre: {expected_closed_ts}\n"
         f"Entrada al comenzar N: {execution_ts}\n\n"
+        + _telegram_candle_line("📊 N-2", pending.get("n2_candle"))
+        + _telegram_candle_line("📊 N-1", pending.get("n1_candle"))
+        + "\n"
         "🚫 N-1 se analiza; N se utiliza para la entrada.\n"
         "⚡ La entrada queda pendiente para el inicio de N.\n"
         f"⏳ Expiración: {EXPIRATION} minuto(s)\n\n"
@@ -1029,7 +1053,9 @@ def execute_sniper(pair: str, pending: Dict[str, Any]) -> bool:
         f"Entrada programada: {execution_ts}\n"
         f"Reloj IQ: {sent_at:.3f}\n"
         f"ID: {order_id}\n"
-        f"Precio de cierre N: {_fmt_price(pending.get('close'))}\n\n"
+        + _telegram_candle_line("📊 N-2", pending.get("n2_candle"))
+        + _telegram_candle_line("📊 N-1", pending.get("n1_candle"))
+        + "\n"
         f"⏳ Expiración: {EXPIRATION} minuto(s)\n\n"
         f"Estructura: {pending_analysis.get('structure', 'unknown')}\n"
         f"ATR: {_fmt_price(pending_analysis.get('atr'))}\n"
