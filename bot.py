@@ -36,7 +36,7 @@ ACCOUNT_TYPE = os.getenv("ACCOUNT_TYPE", "PRACTICE").strip().upper()
 MAX_TOTAL_TRADES = 1000
 TOTAL_TRADES = 0
 CANDLE_COUNT = max(60, int(os.getenv("CANDLE_COUNT", "80")))
-MAX_PAIRS = 59  # Analiza hasta 59 activos que cumplan el filtro
+MAX_PAIRS = 50  # Analiza hasta 50 activos que cumplan el filtro
 
 STUDY_LOG_DIR = os.getenv("STUDY_LOG_DIR", "trade_study")
 STUDY_LOG_FILE = os.path.join(STUDY_LOG_DIR, "trades.jsonl")
@@ -1251,7 +1251,9 @@ def analyze_all_pairs() -> None:
 
     refresh_available_pairs()
 
-    for pair in list(PAIRS):
+    # Mantiene el análisis limitado a los 50 pares configurados.
+    # La ejecución continúa usando la validación existente de cada par.
+    for pair in list(PAIRS)[:MAX_PAIRS]:
         if not BOT_RUNNING or trade_limit_reached():
             return
 
@@ -1259,7 +1261,6 @@ def analyze_all_pairs() -> None:
             process_pair(pair)
         except Exception:
             logger.exception("Error procesando %s", pair)
-
 
 # ============================================================
 # MAIN
