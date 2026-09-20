@@ -33,7 +33,7 @@ AMOUNT = float(os.getenv("AMOUNT", "1"))
 ACCOUNT_TYPE = os.getenv("ACCOUNT_TYPE", "PRACTICE").strip().upper()
 
 # Límite total de entradas por ejecución del bot
-MAX_TOTAL_TRADES = 100
+MAX_TOTAL_TRADES = 1000
 TOTAL_TRADES = 0
 CANDLE_COUNT = max(60, int(os.getenv("CANDLE_COUNT", "80")))
 MAX_PAIRS = 59  # Analiza hasta 59 activos que cumplan el filtro
