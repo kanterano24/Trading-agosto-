@@ -966,23 +966,32 @@ def analyze_closed_candle(pair: str, expected_closed_ts: int) -> bool:
 # ANALISIS Y EJECUCION EN LA MISMA VELA
 # ============================================================
 
-def analyze_live_candle(pair: str, current_ts: int) -> bool:
-    """Analiza la vela activa y ejecuta una sola vez por vela de señal."""
+def analyze_live_candle(
+    pair: str,
+    current_ts: int,
+    execute: bool = True,
+) -> Optional[Dict[str, Any]]:
+    """Analiza una vela y devuelve la señal; ejecuta solo cuando execute=True."""
     if trade_limit_reached():
-        return False
+        return None
+
     df = get_closed_candles(pair)
     if df is None or df.empty or "from" not in df.columns:
-        return False
+        return None
 
-    df = df.sort_values("from").drop_duplicates("from", keep="last").reset_index(drop=True)
+    df = (
+        df.sort_values("from")
+        .drop_duplicates("from", keep="last")
+        .reset_index(drop=True)
+    )
     current_rows = df[df["from"].astype(int) == int(current_ts)]
     if current_rows.empty:
-        return False
+        return None
 
     current_row = current_rows.iloc[-1]
     history = df[df["from"].astype(int) < int(current_ts)].copy()
     if len(history) < MIN_HISTORY - 1:
-        return False
+        return None
 
     result = analyze_market(
         candle_1m=current_row.to_dict(),
@@ -991,28 +1000,40 @@ def analyze_live_candle(pair: str, current_ts: int) -> bool:
     )
     signal = result.get("signal")
     if not is_force_signal(result, signal):
-        return False
+        return None
 
-    if LAST_TRADE_CANDLE.get(pair) == int(current_ts):
-        return False
-    if cooldown_active(pair):
-        return False
+    candidate = {
+        "pair": pair,
+        "timestamp": int(current_ts),
+        "result": result,
+        "signal": signal,
+        "score": int(result.get("score", 0) or 0),
+    }
+
+    if not execute:
+        return candidate
+
+    if (
+        LAST_TRADE_CANDLE.get(pair) == int(current_ts)
+        or cooldown_active(pair)
+    ):
+        return None
 
     analysis = result.get("analysis") or {}
     ok, order_id = buy_binary(pair, signal)
     if not ok:
         logger.warning("%s | orden rechazada | señal=%s", pair, signal)
-        return False
+        return None
 
     LAST_TRADE_TIME[pair] = time.time()
     LAST_TRADE_CANDLE[pair] = int(current_ts)
 
     telegram_send(
-        "✅ ENTRADA EJECUTADA EN VELA DE SEÑAL\n\n"
+        "✅ ENTRADA EJECUTADA: MEJOR SEÑAL ENTRE LOS 50 PARES\n\n"
         f"Par: {pair}\n"
         f"Dirección: {signal.upper()}\n"
         f"Tipo: {result.get('entry_type')}\n"
-        f"Score: {result.get('score', 0)}/100\n"
+        f"Score: {candidate['score']}/100\n"
         f"RSI: {analysis.get('rsi')}\n"
         f"ATR posición: {analysis.get('atr_position')}\n"
         f"Vela: {current_ts}\n"
@@ -1021,10 +1042,15 @@ def analyze_live_candle(pair: str, current_ts: int) -> bool:
         f"{result.get('reason', '')}"
     )
     logger.info(
-        "%s | EJECUTADO MISMA VELA | %s | ts=%s | ID=%s",
-        pair, signal.upper(), current_ts, order_id,
+        "%s | MEJOR SEÑAL EJECUTADA | %s | score=%s | ts=%s | ID=%s",
+        pair,
+        signal.upper(),
+        candidate["score"],
+        current_ts,
+        order_id,
     )
-    return True
+    candidate["order_id"] = order_id
+    return candidate
 
 
 # ============================================================
@@ -1233,16 +1259,17 @@ def execute_sniper(pair: str, pending: Dict[str, Any]) -> bool:
 # MOTOR
 # ============================================================
 
-def process_pair(pair: str) -> None:
+def process_pair(
+    pair: str,
+    current_ts: Optional[int] = None,
+) -> Optional[Dict[str, Any]]:
     if IQ is None:
-        return
+        return None
 
-    current_ts = floor_candle_timestamp(get_iq_server_timestamp())
+    if current_ts is None:
+        current_ts = floor_candle_timestamp(get_iq_server_timestamp())
 
-    # La estrategia nueva revisa la vela activa para detectar el toque
-    # del soporte/resistencia y ejecutar la reversion en el instante valido.
-    # No se espera al cierre ni se programa una entrada para la siguiente vela.
-    analyze_live_candle(pair, int(current_ts))
+    return analyze_live_candle(pair, int(current_ts), execute=False)
 
 
 def analyze_all_pairs() -> None:
@@ -1250,17 +1277,47 @@ def analyze_all_pairs() -> None:
         return
 
     refresh_available_pairs()
+    current_ts = int(floor_candle_timestamp(get_iq_server_timestamp()))
+    candidates: list[Dict[str, Any]] = []
 
-    # Mantiene el análisis limitado a los 50 pares configurados.
-    # La ejecución continúa usando la validación existente de cada par.
     for pair in list(PAIRS)[:MAX_PAIRS]:
         if not BOT_RUNNING or trade_limit_reached():
             return
 
         try:
-            process_pair(pair)
+            candidate = process_pair(pair, current_ts)
+            if candidate:
+                candidates.append(candidate)
         except Exception:
             logger.exception("Error procesando %s", pair)
+
+    if not candidates:
+        return
+
+    # Solo se ejecuta la señal de mayor score encontrada en este ciclo.
+    candidates.sort(
+        key=lambda item: int(item.get("score", 0)),
+        reverse=True,
+    )
+    best = candidates[0]
+    best_pair = str(best["pair"])
+
+    logger.info(
+        "MEJOR CANDIDATO | par=%s | score=%s | señal=%s | candidatos=%s",
+        best_pair,
+        best.get("score", 0),
+        str(best.get("signal", "")).upper(),
+        len(candidates),
+    )
+
+    if (
+        LAST_TRADE_CANDLE.get(best_pair) == current_ts
+        or cooldown_active(best_pair)
+    ):
+        return
+
+    analyze_live_candle(best_pair, current_ts, execute=True)
+
 
 # ============================================================
 # MAIN
