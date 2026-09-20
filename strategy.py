@@ -112,7 +112,7 @@ def _stochastic(candles: List[Dict[str, Any]], k_period: int = STOCH_K_PERIOD,
 
 
 def _stochastic_confirms(direction: str, k_value: float, d_value: float) -> bool:
-    """Filtro adicional estricto usando los niveles 20/80 del gráfico.
+    """Filtro adicional estricto usando niveles extremos 7/98.
 
     CALL: Stochastic en sobreventa y %K cruzando/por encima de %D.
     PUT:  Stochastic en sobrecompra y %K cruzando/por debajo de %D.
