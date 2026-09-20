@@ -82,7 +82,29 @@ def _zones(
     sample = candles[-max(1, lookback):]
     lows = [_ohlc(candle)[2] for candle in sample]
     highs = [_ohlc(candle)[3] for candle in sample]
-    return (min(lows), max(highs)) if lows and highs else (0.0, 0.0)
+    if not lows or not highs:
+        return 0.0, 0.0
+
+    # Usa pivotes locales como niveles estructurales; evita depender
+    # exclusivamente del mínimo y máximo absolutos del historial.
+    pivot_lows: List[float] = []
+    pivot_highs: List[float] = []
+    for index in range(1, len(sample) - 1):
+        previous_low = lows[index - 1]
+        current_low = lows[index]
+        next_low = lows[index + 1]
+        previous_high = highs[index - 1]
+        current_high = highs[index]
+        next_high = highs[index + 1]
+
+        if current_low <= previous_low and current_low <= next_low:
+            pivot_lows.append(current_low)
+        if current_high >= previous_high and current_high >= next_high:
+            pivot_highs.append(current_high)
+
+    support = min(pivot_lows) if pivot_lows else min(lows)
+    resistance = max(pivot_highs) if pivot_highs else max(highs)
+    return support, resistance
 
 
 def _stochastic(candles: List[Dict[str, Any]], k_period: int = STOCH_K_PERIOD,
