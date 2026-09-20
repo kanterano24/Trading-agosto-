@@ -175,9 +175,16 @@ def analyze_rejection(
     tolerance = atr * max(zone_atr_factor, 0.01)
     near_support = low <= support + tolerance and close_price > support
     near_resistance = high >= resistance - tolerance and close_price < resistance
+    # Confirma que el precio atravesó/visitó el nivel y cerró de vuelta
+    # dentro de la zona; evita señales por simple proximidad al nivel.
+    support_reclaimed = low <= support and close_price >= support + tolerance * 0.15
+    resistance_rejected = high >= resistance and close_price <= resistance - tolerance * 0.15
+    meaningful_body = body >= atr * 0.05
 
     bullish = (
         near_support
+        and support_reclaimed
+        and meaningful_body
         and lower_wick >= max(body * 1.25, atr * 0.20)
         and close_price > open_price
         and (close_price - low) / candle_range >= 0.60
@@ -185,6 +192,8 @@ def analyze_rejection(
     )
     bearish = (
         near_resistance
+        and resistance_rejected
+        and meaningful_body
         and upper_wick >= max(body * 1.25, atr * 0.20)
         and close_price < open_price
         and (high - close_price) / candle_range >= 0.60
