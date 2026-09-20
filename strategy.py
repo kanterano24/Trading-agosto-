@@ -12,12 +12,12 @@ STOCH_K_PERIOD = 13
 STOCH_D_PERIOD = 3
 STOCH_SMOOTHING = 3
 STOCH_OVERSOLD = 7.0
-STOCH_OVERBOUGHT = 98.0
+STOCH_OVERBOUGHT = 97.0
 
 
 @dataclass
 class Signal:
-    action: str
+    action: stra
     score: int
     reason: str
     support: Optional[float] = None
@@ -82,29 +82,7 @@ def _zones(
     sample = candles[-max(1, lookback):]
     lows = [_ohlc(candle)[2] for candle in sample]
     highs = [_ohlc(candle)[3] for candle in sample]
-    if not lows or not highs:
-        return 0.0, 0.0
-
-    # Usa pivotes locales como niveles estructurales; evita depender
-    # exclusivamente del mínimo y máximo absolutos del historial.
-    pivot_lows: List[float] = []
-    pivot_highs: List[float] = []
-    for index in range(1, len(sample) - 1):
-        previous_low = lows[index - 1]
-        current_low = lows[index]
-        next_low = lows[index + 1]
-        previous_high = highs[index - 1]
-        current_high = highs[index]
-        next_high = highs[index + 1]
-
-        if current_low <= previous_low and current_low <= next_low:
-            pivot_lows.append(current_low)
-        if current_high >= previous_high and current_high >= next_high:
-            pivot_highs.append(current_high)
-
-    support = min(pivot_lows) if pivot_lows else min(lows)
-    resistance = max(pivot_highs) if pivot_highs else max(highs)
-    return support, resistance
+    return (min(lows), max(highs)) if lows and highs else (0.0, 0.0)
 
 
 def _stochastic(candles: List[Dict[str, Any]], k_period: int = STOCH_K_PERIOD,
@@ -134,7 +112,7 @@ def _stochastic(candles: List[Dict[str, Any]], k_period: int = STOCH_K_PERIOD,
 
 
 def _stochastic_confirms(direction: str, k_value: float, d_value: float) -> bool:
-    """Filtro adicional estricto usando niveles extremos 7/98.
+    """Filtro adicional estricto usando los niveles 20/80 del gráfico.
 
     CALL: Stochastic en sobreventa y %K cruzando/por encima de %D.
     PUT:  Stochastic en sobrecompra y %K cruzando/por debajo de %D.
@@ -197,16 +175,9 @@ def analyze_rejection(
     tolerance = atr * max(zone_atr_factor, 0.01)
     near_support = low <= support + tolerance and close_price > support
     near_resistance = high >= resistance - tolerance and close_price < resistance
-    # Confirma que el precio atravesó/visitó el nivel y cerró de vuelta
-    # dentro de la zona; evita señales por simple proximidad al nivel.
-    support_reclaimed = low <= support and close_price >= support + tolerance * 0.15
-    resistance_rejected = high >= resistance and close_price <= resistance - tolerance * 0.15
-    meaningful_body = body >= atr * 0.05
 
     bullish = (
         near_support
-        and support_reclaimed
-        and meaningful_body
         and lower_wick >= max(body * 1.25, atr * 0.20)
         and close_price > open_price
         and (close_price - low) / candle_range >= 0.60
@@ -214,8 +185,6 @@ def analyze_rejection(
     )
     bearish = (
         near_resistance
-        and resistance_rejected
-        and meaningful_body
         and upper_wick >= max(body * 1.25, atr * 0.20)
         and close_price < open_price
         and (high - close_price) / candle_range >= 0.60
