@@ -27,7 +27,7 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 TIMEFRAME = 60
 EXPIRATION = 1  # Fijo: solo operaciones con expiración de 1 minuto
-AMOUNT = float(os.getenv("AMOUNT", "3"))
+AMOUNT = float(os.getenv("AMOUNT", "30"))
 
 # Cuenta de IQ Option: PRACTICE o REAL
 ACCOUNT_TYPE = os.getenv("ACCOUNT_TYPE", "PRACTICE").strip().upper()
