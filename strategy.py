@@ -17,7 +17,7 @@ STOCH_OVERBOUGHT = 97.0
 
 @dataclass
 class Signal:
-    action: str
+    action: stra
     score: int
     reason: str
     support: Optional[float] = None
@@ -85,12 +85,8 @@ def _zones(
     return (min(lows), max(highs)) if lows and highs else (0.0, 0.0)
 
 
-def _stochastic(
-    candles: List[Dict[str, Any]],
-    k_period: int = STOCH_K_PERIOD,
-    d_period: int = STOCH_D_PERIOD,
-    slowing: int = STOCH_SMOOTHING,
-) -> Tuple[float, float]:
+def _stochastic(candles: List[Dict[str, Any]], k_period: int = STOCH_K_PERIOD,
+                d_period: int = STOCH_D_PERIOD, slowing: int = STOCH_SMOOTHING) -> Tuple[float, float]:
     """Calcula Stochastic %K y %D usando únicamente velas cerradas."""
     if len(candles) < max(k_period + d_period + slowing, 5):
         return 50.0, 50.0
@@ -99,51 +95,32 @@ def _stochastic(
     lows = [_ohlc(c)[2] for c in candles]
     closes = [_ohlc(c)[1] for c in candles]
     raw_k: List[float] = []
-
     for i in range(k_period - 1, len(candles)):
         window_high = max(highs[i - k_period + 1:i + 1])
         window_low = min(lows[i - k_period + 1:i + 1])
         span = window_high - window_low
-        raw_k.append(
-            50.0 if span <= 0 else 100.0 * (closes[i] - window_low) / span
-        )
+        raw_k.append(50.0 if span <= 0 else 100.0 * (closes[i] - window_low) / span)
 
     if not raw_k:
         return 50.0, 50.0
-
-    smoothed_k = [
-        sum(raw_k[max(0, i - slowing + 1):i + 1]) /
-        len(raw_k[max(0, i - slowing + 1):i + 1])
-        for i in range(len(raw_k))
-    ]
-
+    smoothed_k = [sum(raw_k[max(0, i - slowing + 1):i + 1]) /
+                  len(raw_k[max(0, i - slowing + 1):i + 1]) for i in range(len(raw_k))]
     k_value = smoothed_k[-1]
     d_window = smoothed_k[-d_period:]
     d_value = sum(d_window) / len(d_window)
-
-    return (
-        max(0.0, min(100.0, k_value)),
-        max(0.0, min(100.0, d_value)),
-    )
+    return max(0.0, min(100.0, k_value)), max(0.0, min(100.0, d_value))
 
 
 def _stochastic_confirms(direction: str, k_value: float, d_value: float) -> bool:
-    """Filtro Stochastic.
+    """Filtro adicional estricto usando los niveles 20/80 del gráfico.
 
-    CALL:
-    - %D debe ser <= 6.0
-    - %K debe estar por encima o igual a %D
-
-    PUT:
-    - Se mantiene el filtro original de sobrecompra:
-      %K >= 97 y %K <= %D
+    CALL: Stochastic en sobreventa y %K cruzando/por encima de %D.
+    PUT:  Stochastic en sobrecompra y %K cruzando/por debajo de %D.
     """
     if direction == "call":
-        return d_value <= 6.0 and k_value >= d_value
-
+        return k_value <= STOCH_OVERSOLD and k_value >= d_value
     if direction == "put":
         return k_value >= STOCH_OVERBOUGHT and k_value <= d_value
-
     return False
 
 
@@ -179,13 +156,11 @@ def analyze_rejection(
     stochastic_d: float = 50.0,
 ) -> Signal:
     records = _as_records(candles)
-
     if len(records) < max(MIN_CANDLES, lookback // 2):
         return Signal("none", 0, "insufficient_candles")
 
     previous = records[:-1]
     candle = records[-1]
-
     open_price, close_price, low, high = _ohlc(candle)
     body = abs(close_price - open_price)
     candle_range = max(high - low, 1e-12)
@@ -198,7 +173,6 @@ def analyze_rejection(
 
     support, resistance = _zones(previous, lookback)
     tolerance = atr * max(zone_atr_factor, 0.01)
-
     near_support = low <= support + tolerance and close_price > support
     near_resistance = high >= resistance - tolerance and close_price < resistance
 
@@ -209,7 +183,6 @@ def analyze_rejection(
         and (close_price - low) / candle_range >= 0.60
         and _stochastic_confirms("call", stochastic_k, stochastic_d)
     )
-
     bearish = (
         near_resistance
         and upper_wick >= max(body * 1.25, atr * 0.20)
@@ -220,13 +193,10 @@ def analyze_rejection(
 
     if bullish:
         score = 90
-
         if lower_wick >= body * 2:
             score += 8
-
         if close_price > support + tolerance * 0.25:
             score += 5
-
         if score >= int(min_score):
             return Signal(
                 "call",
@@ -238,13 +208,10 @@ def analyze_rejection(
 
     if bearish:
         score = 90
-
         if upper_wick >= body * 2:
             score += 8
-
         if close_price < resistance - tolerance * 0.25:
             score += 5
-
         if score >= int(min_score):
             return Signal(
                 "put",
@@ -274,7 +241,6 @@ def analyze_market(
     """
     if previous_m1 is not None:
         records = _as_records(previous_m1)
-
         if candle_1m is not None:
             current_closed = (
                 dict(candle_1m)
@@ -282,42 +248,30 @@ def analyze_market(
                 else {}
             )
             records.append(current_closed)
-
     elif df is not None:
         all_records = _as_records(df)
-
         # No analizar la última vela recibida: puede estar en formación.
         records = all_records[:-1] if len(all_records) > 1 else []
-
     else:
         all_records = _as_records(candle_1m)
-
         # Para llamadas directas, también se descarta la última vela.
         records = all_records[:-1] if len(all_records) > 1 else []
 
     result = _empty_result()
-
     if len(records) < MIN_CANDLES:
         result["reason"] = "insufficient_candles"
         return result
 
     stochastic_k, stochastic_d = _stochastic(records)
-
     signal = analyze_rejection(
         records,
         min_score=min_score,
         stochastic_k=stochastic_k,
         stochastic_d=stochastic_d,
     )
-
     records_last = records[-1]
-    timestamp = records_last.get(
-        "from",
-        records_last.get("timestamp"),
-    )
-
+    timestamp = records_last.get("from", records_last.get("timestamp"))
     atr = _atr(records[:-1]) if len(records) > 1 else 0.0
-
     direction = (
         "bullish"
         if signal.action == "call"
@@ -325,12 +279,7 @@ def analyze_market(
         if signal.action == "put"
         else "range"
     )
-
-    force = (
-        signal.action in {"call", "put"}
-        and signal.score >= int(min_score)
-    )
-
+    force = signal.action in {"call", "put"} and signal.score >= int(min_score)
     analysis = {
         "force": force,
         "structure": direction,
@@ -343,7 +292,6 @@ def analyze_market(
         "stochastic_d": round(stochastic_d, 2),
         "stochastic_oversold": STOCH_OVERSOLD,
         "stochastic_overbought": STOCH_OVERBOUGHT,
-        "stochastic_call_d_max": 6.0,
         "last_swing_high": signal.resistance,
         "last_swing_low": signal.support,
         "rejection_timestamp": timestamp,
@@ -356,7 +304,6 @@ def analyze_market(
             "extreme_confirmed": force,
         },
     }
-
     return {
         "signal": signal.action if force else None,
         "score": signal.score if force else 0,
@@ -365,10 +312,7 @@ def analyze_market(
         "quality": signal.score if force else 0,
         "entry_type": "force" if force else "none",
         "direction": direction,
-        "reason": (
-            f"{signal.reason} | "
-            f"STOCH K={stochastic_k:.1f} D={stochastic_d:.1f}"
-        ),
+        "reason": f"{signal.reason} | STOCH K={stochastic_k:.1f} D={stochastic_d:.1f}",
         "analysis": analysis,
         "candle_timestamp": timestamp,
         "pair": pair,
