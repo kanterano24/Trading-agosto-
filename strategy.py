@@ -1,21 +1,61 @@
 """strategy.py - Stochastic expansion + soporte/resistencia compatible con bot.py."""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 import math
 
+
+# ==========================================================
+# CONFIGURACIÓN GENERAL
+# ==========================================================
+
 MIN_CANDLES = 20
 DEFAULT_LOOKBACK = 60
 DEFAULT_MIN_SCORE = 75
+
+
+# ==========================================================
+# STOCHASTIC
+# ==========================================================
 
 STOCH_K_PERIOD = 13
 STOCH_D_PERIOD = 3
 STOCH_SMOOTHING = 3
 
-# Ventana utilizada para determinar la máxima separación reciente.
+# Número de velas utilizadas para estudiar expansión.
 STOCH_EXPANSION_LOOKBACK = 5
 
+# ==========================================================
+# NUEVOS FILTROS DE CALIDAD
+# ==========================================================
+
+# CALL:
+# El Stochastic debe estar en una zona de sobreventa.
+CALL_MAX_STOCH = 30.0
+
+# PUT:
+# El Stochastic debe estar en una zona de sobrecompra.
+PUT_MIN_STOCH = 70.0
+
+# Separación mínima entre K y D.
+#
+# Antes una separación de 1.08 podía terminar con score 95.
+# Ahora una separación demasiado pequeña no se considera
+# suficiente para confirmar expansión.
+MIN_STOCH_SEPARATION = 3.0
+
+# Separación considerada fuerte.
+STRONG_STOCH_SEPARATION = 8.0
+
+# Separación considerada muy fuerte.
+VERY_STRONG_STOCH_SEPARATION = 12.0
+
+
+# ==========================================================
+# DATACLASS
+# ==========================================================
 
 @dataclass
 class Signal:
@@ -26,93 +66,170 @@ class Signal:
     resistance: Optional[float] = None
 
 
-def _number(value: Any, default: float = 0.0) -> float:
+# ==========================================================
+# UTILIDADES
+# ==========================================================
+
+def _number(
+    value: Any,
+    default: float = 0.0,
+) -> float:
+
     try:
         value = float(value)
-        return value if math.isfinite(value) else default
+
+        return (
+            value
+            if math.isfinite(value)
+            else default
+        )
+
     except (TypeError, ValueError):
         return default
 
 
-def _ohlc(candle: Dict[str, Any]) -> Tuple[float, float, float, float]:
+def _ohlc(
+    candle: Dict[str, Any],
+) -> Tuple[float, float, float, float]:
+
     open_price = _number(
-        candle.get("open", candle.get("open_price"))
+        candle.get(
+            "open",
+            candle.get("open_price"),
+        )
     )
+
     close_price = _number(
-        candle.get("close", candle.get("close_price"))
+        candle.get(
+            "close",
+            candle.get("close_price"),
+        )
     )
+
     low = _number(
-        candle.get("min", candle.get("low"))
+        candle.get(
+            "min",
+            candle.get("low"),
+        )
     )
+
     high = _number(
-        candle.get("max", candle.get("high"))
+        candle.get(
+            "max",
+            candle.get("high"),
+        )
     )
 
-    return open_price, close_price, low, high
+    return (
+        open_price,
+        close_price,
+        low,
+        high,
+    )
 
 
-def _as_records(value: Any) -> List[Dict[str, Any]]:
+def _as_records(
+    value: Any,
+) -> List[Dict[str, Any]]:
+
     if value is None:
         return []
 
     if hasattr(value, "to_dict"):
+
         try:
-            records = value.to_dict("records")
-            return [dict(item) for item in records]
-        except (TypeError, ValueError):
+
+            records = value.to_dict(
+                "records"
+            )
+
+            return [
+                dict(item)
+                for item in records
+            ]
+
+        except (
+            TypeError,
+            ValueError,
+        ):
             return []
 
     if isinstance(value, dict):
         return [value]
 
     try:
+
         return [
             dict(item)
             for item in value
             if isinstance(item, dict)
         ]
+
     except TypeError:
         return []
 
+
+# ==========================================================
+# ATR
+# ==========================================================
 
 def _atr(
     candles: List[Dict[str, Any]],
     period: int = 14,
 ) -> float:
+
     if len(candles) < 2:
         return 0.0
 
     true_ranges: List[float] = []
 
-    for index in range(1, len(candles)):
-        _, _, low, high = _ohlc(candles[index])
+    for index in range(
+        1,
+        len(candles),
+    ):
+
+        _, _, low, high = _ohlc(
+            candles[index]
+        )
+
         _, previous_close, _, _ = _ohlc(
             candles[index - 1]
         )
 
+        true_range = max(
+            high - low,
+            abs(
+                high - previous_close
+            ),
+            abs(
+                low - previous_close
+            ),
+        )
+
         true_ranges.append(
-            max(
-                high - low,
-                abs(high - previous_close),
-                abs(low - previous_close),
-            )
+            true_range
         )
 
     values = true_ranges[-period:]
 
-    return (
-        sum(values) / len(values)
-        if values
-        else 0.0
-    )
+    if not values:
+        return 0.0
 
+    return sum(values) / len(values)
+
+
+# ==========================================================
+# SOPORTE / RESISTENCIA
+# ==========================================================
 
 def _zones(
     candles: List[Dict[str, Any]],
     lookback: int = DEFAULT_LOOKBACK,
 ) -> Tuple[float, float]:
 
-    sample = candles[-max(1, lookback):]
+    sample = candles[
+        -max(1, lookback):
+    ]
 
     lows = [
         _ohlc(candle)[2]
@@ -124,12 +241,18 @@ def _zones(
         for candle in sample
     ]
 
+    if not lows or not highs:
+        return 0.0, 0.0
+
     return (
-        (min(lows), max(highs))
-        if lows and highs
-        else (0.0, 0.0)
+        min(lows),
+        max(highs),
     )
 
+
+# ==========================================================
+# STOCHASTIC
+# ==========================================================
 
 def _stochastic_series(
     candles: List[Dict[str, Any]],
@@ -137,31 +260,34 @@ def _stochastic_series(
     d_period: int = STOCH_D_PERIOD,
     slowing: int = STOCH_SMOOTHING,
 ) -> Tuple[List[float], List[float]]:
+
     """
     Calcula las series completas de Stochastic K y D.
 
-    Solamente utiliza velas cerradas.
+    Utiliza únicamente las velas recibidas.
     """
 
-    if len(candles) < max(
+    minimum_candles = max(
         k_period + d_period + slowing,
         5,
-    ):
+    )
+
+    if len(candles) < minimum_candles:
         return [], []
 
     highs = [
-        _ohlc(c)[3]
-        for c in candles
+        _ohlc(candle)[3]
+        for candle in candles
     ]
 
     lows = [
-        _ohlc(c)[2]
-        for c in candles
+        _ohlc(candle)[2]
+        for candle in candles
     ]
 
     closes = [
-        _ohlc(c)[1]
-        for c in candles
+        _ohlc(candle)[1]
+        for candle in candles
     ]
 
     raw_k: List[float] = []
@@ -170,63 +296,111 @@ def _stochastic_series(
         k_period - 1,
         len(candles),
     ):
+
         window_high = max(
-            highs[i - k_period + 1:i + 1]
+            highs[
+                i - k_period + 1:i + 1
+            ]
         )
 
         window_low = min(
-            lows[i - k_period + 1:i + 1]
+            lows[
+                i - k_period + 1:i + 1
+            ]
         )
 
-        span = window_high - window_low
+        span = (
+            window_high
+            - window_low
+        )
 
         if span <= 0:
-            raw_k.append(50.0)
+
+            raw_k.append(
+                50.0
+            )
+
         else:
+
             raw_k.append(
                 100.0
-                * (closes[i] - window_low)
+                * (
+                    closes[i]
+                    - window_low
+                )
                 / span
             )
 
     if not raw_k:
         return [], []
 
+    # ------------------------------------------------------
+    # SMOOTH K
+    # ------------------------------------------------------
+
     smoothed_k: List[float] = []
 
-    for i in range(len(raw_k)):
+    for i in range(
+        len(raw_k)
+    ):
+
         start = max(
             0,
             i - slowing + 1,
         )
 
-        window = raw_k[start:i + 1]
+        window = raw_k[
+            start:i + 1
+        ]
 
         smoothed_k.append(
-            sum(window) / len(window)
+            sum(window)
+            / len(window)
         )
+
+    # ------------------------------------------------------
+    # D
+    # ------------------------------------------------------
 
     d_values: List[float] = []
 
-    for i in range(len(smoothed_k)):
+    for i in range(
+        len(smoothed_k)
+    ):
+
         start = max(
             0,
             i - d_period + 1,
         )
 
-        window = smoothed_k[start:i + 1]
+        window = smoothed_k[
+            start:i + 1
+        ]
 
         d_values.append(
-            sum(window) / len(window)
+            sum(window)
+            / len(window)
         )
 
     return (
         [
-            max(0.0, min(100.0, value))
+            max(
+                0.0,
+                min(
+                    100.0,
+                    value,
+                ),
+            )
             for value in smoothed_k
         ],
         [
-            max(0.0, min(100.0, value))
+            max(
+                0.0,
+                min(
+                    100.0,
+                    value,
+                ),
+            )
             for value in d_values
         ],
     )
@@ -239,11 +413,13 @@ def _stochastic(
     slowing: int = STOCH_SMOOTHING,
 ) -> Tuple[float, float]:
 
-    k_values, d_values = _stochastic_series(
-        candles,
-        k_period,
-        d_period,
-        slowing,
+    k_values, d_values = (
+        _stochastic_series(
+            candles,
+            k_period,
+            d_period,
+            slowing,
+        )
     )
 
     if not k_values or not d_values:
@@ -255,32 +431,52 @@ def _stochastic(
     )
 
 
+# ==========================================================
+# STOCHASTIC EXPANSION
+# ==========================================================
+
 def _stochastic_expansion(
     candles: List[Dict[str, Any]],
 ) -> Dict[str, Any]:
+
     """
-    Detecta expansión del Stochastic.
+    Detecta expansión real del Stochastic.
+
+    IMPORTANTE:
+    La máxima separación se calcula sobre las velas
+    ANTERIORES a la vela actual.
+
+    Esto evita que la vela actual sea considerada
+    automáticamente como su propio máximo.
 
     CALL:
         K > D
-        K está subiendo
-        separación K-D está aumentando
-        separación actual es la máxima de la ventana
+        K subiendo
+        separación aumentando
+        separación actual >= separación previa
+        separación actual suficientemente grande
+        Stochastic en zona de sobreventa
 
     PUT:
         K < D
-        K está bajando
-        separación D-K está aumentando
-        separación actual es la máxima de la ventana
+        K bajando
+        separación aumentando
+        separación actual >= separación previa
+        separación actual suficientemente grande
+        Stochastic en zona de sobrecompra
     """
 
-    k_values, d_values = _stochastic_series(
-        candles
+    k_values, d_values = (
+        _stochastic_series(candles)
     )
 
-    minimum = STOCH_EXPANSION_LOOKBACK + 2
+    minimum = (
+        STOCH_EXPANSION_LOOKBACK
+        + 2
+    )
 
     if len(k_values) < minimum:
+
         return {
             "valid": False,
             "direction": None,
@@ -293,6 +489,8 @@ def _stochastic_expansion(
             "d_change": 0.0,
             "expanding": False,
             "maximum": False,
+            "oversold": False,
+            "overbought": False,
         }
 
     current_k = k_values[-1]
@@ -302,33 +500,54 @@ def _stochastic_expansion(
     previous_d = d_values[-2]
 
     current_separation = abs(
-        current_k - current_d
+        current_k
+        - current_d
     )
 
     previous_separation = abs(
-        previous_k - previous_d
+        previous_k
+        - previous_d
     )
 
-    start = max(
+    # ------------------------------------------------------
+    # IMPORTANTE:
+    # La ventana histórica NO incluye la vela actual.
+    # ------------------------------------------------------
+
+    history_end = len(k_values) - 1
+
+    history_start = max(
         0,
-        len(k_values)
+        history_end
         - STOCH_EXPANSION_LOOKBACK,
     )
 
-    recent_separations = [
-        abs(k_values[i] - d_values[i])
+    historical_separations = [
+        abs(
+            k_values[i]
+            - d_values[i]
+        )
         for i in range(
-            start,
-            len(k_values),
+            history_start,
+            history_end,
         )
     ]
 
-    maximum_separation = max(
-        recent_separations
+    maximum_separation = (
+        max(historical_separations)
+        if historical_separations
+        else 0.0
     )
 
-    k_change = current_k - previous_k
-    d_change = current_d - previous_d
+    k_change = (
+        current_k
+        - previous_k
+    )
+
+    d_change = (
+        current_d
+        - previous_d
+    )
 
     expanding = (
         current_separation
@@ -337,7 +556,26 @@ def _stochastic_expansion(
 
     maximum = (
         current_separation
-        >= maximum_separation - 0.000001
+        >= maximum_separation
+    )
+
+    oversold = (
+        current_k
+        <= CALL_MAX_STOCH
+        and current_d
+        <= CALL_MAX_STOCH
+    )
+
+    overbought = (
+        current_k
+        >= PUT_MIN_STOCH
+        and current_d
+        >= PUT_MIN_STOCH
+    )
+
+    enough_separation = (
+        current_separation
+        >= MIN_STOCH_SEPARATION
     )
 
     bullish = (
@@ -345,6 +583,8 @@ def _stochastic_expansion(
         and k_change > 0
         and expanding
         and maximum
+        and enough_separation
+        and oversold
     )
 
     bearish = (
@@ -352,12 +592,16 @@ def _stochastic_expansion(
         and k_change < 0
         and expanding
         and maximum
+        and enough_separation
+        and overbought
     )
 
     if bullish:
         direction = "call"
+
     elif bearish:
         direction = "put"
+
     else:
         direction = None
 
@@ -373,8 +617,15 @@ def _stochastic_expansion(
         "d_change": d_change,
         "expanding": expanding,
         "maximum": maximum,
+        "oversold": oversold,
+        "overbought": overbought,
+        "enough_separation": enough_separation,
     }
 
+
+# ==========================================================
+# RESULTADO VACÍO
+# ==========================================================
 
 def _empty_result(
     reason: str = "no_valid_rejection",
@@ -404,6 +655,10 @@ def _empty_result(
     }
 
 
+# ==========================================================
+# ANÁLISIS DE RECHAZO
+# ==========================================================
+
 def analyze_rejection(
     candles: Any,
     min_score: int = DEFAULT_MIN_SCORE,
@@ -413,12 +668,15 @@ def analyze_rejection(
     stochastic_d: float = 50.0,
 ) -> Signal:
 
-    records = _as_records(candles)
+    records = _as_records(
+        candles
+    )
 
     if len(records) < max(
         MIN_CANDLES,
         lookback // 2,
     ):
+
         return Signal(
             "none",
             0,
@@ -436,7 +694,8 @@ def analyze_rejection(
     ) = _ohlc(candle)
 
     body = abs(
-        close_price - open_price
+        close_price
+        - open_price
     )
 
     candle_range = max(
@@ -445,7 +704,8 @@ def analyze_rejection(
     )
 
     upper_wick = max(
-        high - max(
+        high
+        - max(
             open_price,
             close_price,
         ),
@@ -456,13 +716,17 @@ def analyze_rejection(
         min(
             open_price,
             close_price,
-        ) - low,
+        )
+        - low,
         0.0,
     )
 
-    atr = _atr(previous)
+    atr = _atr(
+        previous
+    )
 
     if atr <= 0:
+
         return Signal(
             "none",
             0,
@@ -482,118 +746,441 @@ def analyze_rejection(
         )
     )
 
+    # ------------------------------------------------------
+    # PROXIMIDAD A SOPORTE
+    # ------------------------------------------------------
+
     near_support = (
-        low <= support + tolerance
-        and close_price > support
+        low
+        <= support + tolerance
+        and close_price
+        > support
     )
 
+    # ------------------------------------------------------
+    # PROXIMIDAD A RESISTENCIA
+    # ------------------------------------------------------
+
     near_resistance = (
-        high >= resistance - tolerance
-        and close_price < resistance
+        high
+        >= resistance - tolerance
+        and close_price
+        < resistance
     )
+
+    # ------------------------------------------------------
+    # STOCHASTIC
+    # ------------------------------------------------------
 
     stoch = _stochastic_expansion(
         records
     )
 
-    # ==========================================================
+    # ======================================================
+    # MÉTRICAS DE RECHAZO
+    # ======================================================
+
+    bullish_close_position = (
+        (close_price - low)
+        / candle_range
+    )
+
+    bearish_close_position = (
+        (high - close_price)
+        / candle_range
+    )
+
+    strong_lower_wick = (
+        lower_wick
+        >= max(
+            body * 1.25,
+            atr * 0.20,
+        )
+    )
+
+    strong_upper_wick = (
+        upper_wick
+        >= max(
+            body * 1.25,
+            atr * 0.20,
+        )
+    )
+
+    bullish_body = (
+        close_price
+        > open_price
+    )
+
+    bearish_body = (
+        close_price
+        < open_price
+    )
+
+    # ======================================================
     # CALL
-    # ==========================================================
+    # ======================================================
 
     bullish = (
         stoch["valid"]
-        and stoch["direction"] == "call"
+        and stoch["direction"]
+        == "call"
+
+        # Rechazo obligatorio
         and near_support
-        and lower_wick >= max(
-            body * 1.25,
-            atr * 0.20,
-        )
-        and close_price > open_price
-        and (
-            (close_price - low)
-            / candle_range
-        ) >= 0.60
+
+        # Mecha inferior
+        and strong_lower_wick
+
+        # Cuerpo alcista
+        and bullish_body
+
+        # Cierre fuerte dentro de la vela
+        and bullish_close_position
+        >= 0.60
     )
 
-    # ==========================================================
+    # ======================================================
     # PUT
-    # ==========================================================
+    # ======================================================
 
     bearish = (
         stoch["valid"]
-        and stoch["direction"] == "put"
+        and stoch["direction"]
+        == "put"
+
+        # Rechazo obligatorio
         and near_resistance
-        and upper_wick >= max(
-            body * 1.25,
-            atr * 0.20,
-        )
-        and close_price < open_price
-        and (
-            (high - close_price)
-            / candle_range
-        ) >= 0.60
+
+        # Mecha superior
+        and strong_upper_wick
+
+        # Cuerpo bajista
+        and bearish_body
+
+        # Cierre fuerte debajo del máximo
+        and bearish_close_position
+        >= 0.60
     )
 
+    # ======================================================
+    # SCORE CALL
+    # ======================================================
+
     if bullish:
-        score = 90
 
-        # Mayor separación = mayor puntuación.
-        if stoch["separation"] >= 5:
-            score += 3
+        score = 0
+        reasons: List[str] = []
 
-        if stoch["separation"] >= 10:
-            score += 3
+        # --------------------------------------------------
+        # SOPORTE
+        # --------------------------------------------------
 
-        if stoch["separation"] >= 15:
-            score += 4
+        score += 25
+        reasons.append(
+            "support_rejection"
+        )
+
+        # --------------------------------------------------
+        # MECHA
+        # --------------------------------------------------
 
         if lower_wick >= body * 2:
-            score += 3
+
+            score += 20
+            reasons.append(
+                "strong_lower_wick"
+            )
+
+        else:
+
+            score += 15
+            reasons.append(
+                "lower_wick"
+            )
+
+        # --------------------------------------------------
+        # CUERPO / CIERRE
+        # --------------------------------------------------
+
+        if (
+            bullish_close_position
+            >= 0.75
+        ):
+
+            score += 15
+            reasons.append(
+                "strong_bullish_close"
+            )
+
+        else:
+
+            score += 10
+            reasons.append(
+                "bullish_close"
+            )
+
+        # --------------------------------------------------
+        # STOCHASTIC
+        # --------------------------------------------------
+
+        if (
+            stochastic_k <= 20
+            and stochastic_d <= 20
+        ):
+
+            score += 15
+            reasons.append(
+                "deep_oversold"
+            )
+
+        elif (
+            stochastic_k <= 30
+            and stochastic_d <= 30
+        ):
+
+            score += 12
+            reasons.append(
+                "oversold"
+            )
+
+        # --------------------------------------------------
+        # EXPANSIÓN
+        # --------------------------------------------------
+
+        separation = (
+            stoch["separation"]
+        )
+
+        if (
+            separation
+            >= VERY_STRONG_STOCH_SEPARATION
+        ):
+
+            score += 15
+            reasons.append(
+                "very_strong_stoch_expansion"
+            )
+
+        elif (
+            separation
+            >= STRONG_STOCH_SEPARATION
+        ):
+
+            score += 12
+            reasons.append(
+                "strong_stoch_expansion"
+            )
+
+        else:
+
+            score += 8
+            reasons.append(
+                "stoch_expansion"
+            )
+
+        # --------------------------------------------------
+        # DISTANCIA DEL PRECIO AL SOPORTE
+        # --------------------------------------------------
 
         if (
             close_price
-            > support + tolerance * 0.25
+            <= support
+            + tolerance * 0.50
         ):
-            score += 2
 
-        if score >= int(min_score):
+            score += 10
+            reasons.append(
+                "close_to_support"
+            )
+
+        # --------------------------------------------------
+        # LIMITAR A 100
+        # --------------------------------------------------
+
+        score = min(
+            score,
+            100,
+        )
+
+        if score >= int(
+            min_score
+        ):
+
             return Signal(
                 "call",
-                min(score, 100),
-                "bullish_stochastic_expansion_support_rejection",
+                score,
+                (
+                    "bullish_"
+                    "stochastic_expansion_"
+                    "support_rejection"
+                    " | "
+                    + ",".join(reasons)
+                ),
                 support,
                 resistance,
             )
 
+    # ======================================================
+    # SCORE PUT
+    # ======================================================
+
     if bearish:
-        score = 90
 
-        if stoch["separation"] >= 5:
-            score += 3
+        score = 0
+        reasons = []
 
-        if stoch["separation"] >= 10:
-            score += 3
+        # --------------------------------------------------
+        # RESISTENCIA
+        # --------------------------------------------------
 
-        if stoch["separation"] >= 15:
-            score += 4
+        score += 25
+        reasons.append(
+            "resistance_rejection"
+        )
+
+        # --------------------------------------------------
+        # MECHA
+        # --------------------------------------------------
 
         if upper_wick >= body * 2:
-            score += 3
+
+            score += 20
+            reasons.append(
+                "strong_upper_wick"
+            )
+
+        else:
+
+            score += 15
+            reasons.append(
+                "upper_wick"
+            )
+
+        # --------------------------------------------------
+        # CUERPO / CIERRE
+        # --------------------------------------------------
+
+        if (
+            bearish_close_position
+            >= 0.75
+        ):
+
+            score += 15
+            reasons.append(
+                "strong_bearish_close"
+            )
+
+        else:
+
+            score += 10
+            reasons.append(
+                "bearish_close"
+            )
+
+        # --------------------------------------------------
+        # STOCHASTIC
+        # --------------------------------------------------
+
+        if (
+            stochastic_k >= 80
+            and stochastic_d >= 80
+        ):
+
+            score += 15
+            reasons.append(
+                "deep_overbought"
+            )
+
+        elif (
+            stochastic_k >= 70
+            and stochastic_d >= 70
+        ):
+
+            score += 12
+            reasons.append(
+                "overbought"
+            )
+
+        # --------------------------------------------------
+        # EXPANSIÓN
+        # --------------------------------------------------
+
+        separation = (
+            stoch["separation"]
+        )
+
+        if (
+            separation
+            >= VERY_STRONG_STOCH_SEPARATION
+        ):
+
+            score += 15
+            reasons.append(
+                "very_strong_stoch_expansion"
+            )
+
+        elif (
+            separation
+            >= STRONG_STOCH_SEPARATION
+        ):
+
+            score += 12
+            reasons.append(
+                "strong_stoch_expansion"
+            )
+
+        else:
+
+            score += 8
+            reasons.append(
+                "stoch_expansion"
+            )
+
+        # --------------------------------------------------
+        # DISTANCIA DEL PRECIO A RESISTENCIA
+        # --------------------------------------------------
 
         if (
             close_price
-            < resistance - tolerance * 0.25
+            >= resistance
+            - tolerance * 0.50
         ):
-            score += 2
 
-        if score >= int(min_score):
+            score += 10
+            reasons.append(
+                "close_to_resistance"
+            )
+
+        # --------------------------------------------------
+        # LIMITAR A 100
+        # --------------------------------------------------
+
+        score = min(
+            score,
+            100,
+        )
+
+        if score >= int(
+            min_score
+        ):
+
             return Signal(
                 "put",
-                min(score, 100),
-                "bearish_stochastic_expansion_resistance_rejection",
+                score,
+                (
+                    "bearish_"
+                    "stochastic_expansion_"
+                    "resistance_rejection"
+                    " | "
+                    + ",".join(reasons)
+                ),
                 support,
                 resistance,
             )
+
+    # ======================================================
+    # SIN SEÑAL
+    # ======================================================
 
     return Signal(
         "none",
@@ -604,6 +1191,10 @@ def analyze_rejection(
     )
 
 
+# ==========================================================
+# ANALYZE MARKET
+# ==========================================================
+
 def analyze_market(
     candle_1m: Any = None,
     previous_m1: Any = None,
@@ -613,6 +1204,10 @@ def analyze_market(
     **_: Any,
 ) -> Dict[str, Any]:
 
+    # ======================================================
+    # CONSTRUIR REGISTROS
+    # ======================================================
+
     if previous_m1 is not None:
 
         records = _as_records(
@@ -620,6 +1215,7 @@ def analyze_market(
         )
 
         if candle_1m is not None:
+
             current_closed = (
                 dict(candle_1m)
                 if isinstance(
@@ -629,13 +1225,16 @@ def analyze_market(
                 else {}
             )
 
-            records.append(
-                current_closed
-            )
+            if current_closed:
+                records.append(
+                    current_closed
+                )
 
     elif df is not None:
 
-        all_records = _as_records(df)
+        all_records = _as_records(
+            df
+        )
 
         records = (
             all_records[:-1]
@@ -655,21 +1254,39 @@ def analyze_market(
             else []
         )
 
+    # ======================================================
+    # RESULTADO VACÍO
+    # ======================================================
+
     result = _empty_result()
 
     if len(records) < MIN_CANDLES:
+
         result["reason"] = (
             "insufficient_candles"
         )
+
         return result
 
-    stochastic_k, stochastic_d = _stochastic(
-        records
+    # ======================================================
+    # STOCHASTIC
+    # ======================================================
+
+    stochastic_k, stochastic_d = (
+        _stochastic(
+            records
+        )
     )
 
     stochastic_expansion = (
-        _stochastic_expansion(records)
+        _stochastic_expansion(
+            records
+        )
     )
+
+    # ======================================================
+    # ANÁLISIS
+    # ======================================================
 
     signal = analyze_rejection(
         records,
@@ -678,42 +1295,169 @@ def analyze_market(
         stochastic_d=stochastic_d,
     )
 
+    # ======================================================
+    # ÚLTIMA VELA
+    # ======================================================
+
     records_last = records[-1]
 
     timestamp = records_last.get(
         "from",
-        records_last.get("timestamp"),
+        records_last.get(
+            "timestamp"
+        ),
     )
 
+    # ======================================================
+    # ATR
+    # ======================================================
+
     atr = (
-        _atr(records[:-1])
+        _atr(
+            records[:-1]
+        )
         if len(records) > 1
         else 0.0
     )
 
+    # ======================================================
+    # DIRECCIÓN
+    # ======================================================
+
     direction = (
         "bullish"
         if signal.action == "call"
+
         else
         "bearish"
         if signal.action == "put"
+
         else
         "range"
     )
 
+    # ======================================================
+    # FORCE
+    # ======================================================
+
     force = (
-        signal.action in {"call", "put"}
-        and signal.score >= int(min_score)
+        signal.action
+        in {
+            "call",
+            "put",
+        }
+
+        and signal.score
+        >= int(min_score)
     )
 
+    # ======================================================
+    # DATOS DE VELA
+    # ======================================================
+
+    (
+        open_price,
+        close_price,
+        low,
+        high,
+    ) = _ohlc(
+        records_last
+    )
+
+    body = abs(
+        close_price
+        - open_price
+    )
+
+    candle_range = max(
+        high - low,
+        1e-12,
+    )
+
+    upper_wick = max(
+        high
+        - max(
+            open_price,
+            close_price,
+        ),
+        0.0,
+    )
+
+    lower_wick = max(
+        min(
+            open_price,
+            close_price,
+        )
+        - low,
+        0.0,
+    )
+
+    # ======================================================
+    # ANÁLISIS DETALLADO
+    # ======================================================
+
     analysis = {
+
         "force": force,
+
         "structure": direction,
+
         "atr": atr,
+
         "support": signal.support,
+
         "resistance": signal.resistance,
-        "tolerance": atr * 0.35,
-        "entry_quality": signal.score,
+
+        "tolerance": (
+            atr * 0.35
+        ),
+
+        "entry_quality": (
+            signal.score
+        ),
+
+        # --------------------------------------------------
+        # VELA
+        # --------------------------------------------------
+
+        "candle_open": open_price,
+
+        "candle_close": close_price,
+
+        "candle_high": high,
+
+        "candle_low": low,
+
+        "candle_body": body,
+
+        "candle_range": candle_range,
+
+        "upper_wick": upper_wick,
+
+        "lower_wick": lower_wick,
+
+        "bullish_candle": (
+            close_price
+            > open_price
+        ),
+
+        "bearish_candle": (
+            close_price
+            < open_price
+        ),
+
+        "close_position": round(
+            (
+                close_price
+                - low
+            )
+            / candle_range,
+            4,
+        ),
+
+        # --------------------------------------------------
+        # STOCHASTIC
+        # --------------------------------------------------
 
         "stochastic_k": round(
             stochastic_k,
@@ -785,6 +1529,31 @@ def analyze_market(
             )
         ),
 
+        "stochastic_oversold": (
+            stochastic_expansion.get(
+                "oversold",
+                False,
+            )
+        ),
+
+        "stochastic_overbought": (
+            stochastic_expansion.get(
+                "overbought",
+                False,
+            )
+        ),
+
+        "stochastic_enough_separation": (
+            stochastic_expansion.get(
+                "enough_separation",
+                False,
+            )
+        ),
+
+        # --------------------------------------------------
+        # ESTRUCTURA
+        # --------------------------------------------------
+
         "last_swing_high": (
             signal.resistance
         ),
@@ -793,22 +1562,50 @@ def analyze_market(
             signal.support
         ),
 
+        # --------------------------------------------------
+        # TIEMPOS
+        # --------------------------------------------------
+
         "rejection_timestamp": timestamp,
 
         "confirmation_timestamp": timestamp,
 
-        "rejection_candle": records_last,
+        # --------------------------------------------------
+        # VELAS
+        # --------------------------------------------------
 
-        "confirmation_candle": records_last,
+        "rejection_candle": (
+            records_last
+        ),
+
+        "confirmation_candle": (
+            records_last
+        ),
+
+        # --------------------------------------------------
+        # PULLBACK
+        # --------------------------------------------------
 
         "pullback": {
+
             "valid": force,
-            "previous_candle_confirmed": force,
-            "extreme_confirmed": force,
+
+            "previous_candle_confirmed": (
+                force
+            ),
+
+            "extreme_confirmed": (
+                force
+            ),
         },
     }
 
+    # ======================================================
+    # RESULTADO
+    # ======================================================
+
     return {
+
         "signal": (
             signal.action
             if force
@@ -851,7 +1648,8 @@ def analyze_market(
             f"{signal.reason} | "
             f"STOCH K={stochastic_k:.1f} "
             f"D={stochastic_d:.1f} | "
-            f"SEP={stochastic_expansion.get('separation', 0.0):.2f}"
+            f"SEP="
+            f"{stochastic_expansion.get('separation', 0.0):.2f}"
         ),
 
         "analysis": analysis,
@@ -862,15 +1660,29 @@ def analyze_market(
     }
 
 
+# ==========================================================
+# GET SIGNAL
+# ==========================================================
+
 def get_signal(
     df: Any,
 ) -> Optional[str]:
+
     return analyze_market(
         df=df
-    ).get("signal")
+    ).get(
+        "signal"
+    )
 
+
+# ==========================================================
+# SIGNAL
+# ==========================================================
 
 def signal(
     df: Any,
 ) -> Optional[str]:
-    return get_signal(df)
+
+    return get_signal(
+        df
+    )
