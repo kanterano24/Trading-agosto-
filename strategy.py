@@ -1,4 +1,4 @@
-"""strategy.py - Rechazo de soporte/resistencia compatible con bot.py."""
+"""strategy.py - Stochastic expansion + soporte/resistencia compatible con bot.py."""
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -13,8 +13,8 @@ STOCH_K_PERIOD = 13
 STOCH_D_PERIOD = 3
 STOCH_SMOOTHING = 3
 
-# Separación requerida entre STOCH K y D
-STOCH_KD_SEPARATION = 0.3
+# Ventana utilizada para determinar la máxima separación reciente.
+STOCH_EXPANSION_LOOKBACK = 5
 
 
 @dataclass
@@ -75,7 +75,10 @@ def _as_records(value: Any) -> List[Dict[str, Any]]:
         return []
 
 
-def _atr(candles: List[Dict[str, Any]], period: int = 14) -> float:
+def _atr(
+    candles: List[Dict[str, Any]],
+    period: int = 14,
+) -> float:
     if len(candles) < 2:
         return 0.0
 
@@ -83,7 +86,9 @@ def _atr(candles: List[Dict[str, Any]], period: int = 14) -> float:
 
     for index in range(1, len(candles)):
         _, _, low, high = _ohlc(candles[index])
-        _, previous_close, _, _ = _ohlc(candles[index - 1])
+        _, previous_close, _, _ = _ohlc(
+            candles[index - 1]
+        )
 
         true_ranges.append(
             max(
@@ -126,19 +131,23 @@ def _zones(
     )
 
 
-def _stochastic(
+def _stochastic_series(
     candles: List[Dict[str, Any]],
     k_period: int = STOCH_K_PERIOD,
     d_period: int = STOCH_D_PERIOD,
     slowing: int = STOCH_SMOOTHING,
-) -> Tuple[float, float]:
-    """Calcula Stochastic %K y %D usando únicamente velas cerradas."""
+) -> Tuple[List[float], List[float]]:
+    """
+    Calcula las series completas de Stochastic K y D.
+
+    Solamente utiliza velas cerradas.
+    """
 
     if len(candles) < max(
         k_period + d_period + slowing,
         5,
     ):
-        return 50.0, 50.0
+        return [], []
 
     highs = [
         _ohlc(c)[3]
@@ -171,87 +180,200 @@ def _stochastic(
 
         span = window_high - window_low
 
-        raw_k.append(
-            50.0
-            if span <= 0
-            else 100.0
-            * (closes[i] - window_low)
-            / span
-        )
+        if span <= 0:
+            raw_k.append(50.0)
+        else:
+            raw_k.append(
+                100.0
+                * (closes[i] - window_low)
+                / span
+            )
 
     if not raw_k:
-        return 50.0, 50.0
+        return [], []
 
-    smoothed_k = [
-        sum(
-            raw_k[
-                max(0, i - slowing + 1):i + 1
-            ]
+    smoothed_k: List[float] = []
+
+    for i in range(len(raw_k)):
+        start = max(
+            0,
+            i - slowing + 1,
         )
-        / len(
-            raw_k[
-                max(0, i - slowing + 1):i + 1
-            ]
+
+        window = raw_k[start:i + 1]
+
+        smoothed_k.append(
+            sum(window) / len(window)
         )
-        for i in range(len(raw_k))
-    ]
 
-    k_value = smoothed_k[-1]
+    d_values: List[float] = []
 
-    d_window = smoothed_k[-d_period:]
+    for i in range(len(smoothed_k)):
+        start = max(
+            0,
+            i - d_period + 1,
+        )
 
-    d_value = (
-        sum(d_window) / len(d_window)
-    )
+        window = smoothed_k[start:i + 1]
+
+        d_values.append(
+            sum(window) / len(window)
+        )
 
     return (
-        max(0.0, min(100.0, k_value)),
-        max(0.0, min(100.0, d_value)),
+        [
+            max(0.0, min(100.0, value))
+            for value in smoothed_k
+        ],
+        [
+            max(0.0, min(100.0, value))
+            for value in d_values
+        ],
     )
 
 
-def _stochastic_confirms(
-    direction: str,
-    k_value: float,
-    d_value: float,
-) -> bool:
+def _stochastic(
+    candles: List[Dict[str, Any]],
+    k_period: int = STOCH_K_PERIOD,
+    d_period: int = STOCH_D_PERIOD,
+    slowing: int = STOCH_SMOOTHING,
+) -> Tuple[float, float]:
+
+    k_values, d_values = _stochastic_series(
+        candles,
+        k_period,
+        d_period,
+        slowing,
+    )
+
+    if not k_values or not d_values:
+        return 50.0, 50.0
+
+    return (
+        k_values[-1],
+        d_values[-1],
+    )
+
+
+def _stochastic_expansion(
+    candles: List[Dict[str, Any]],
+) -> Dict[str, Any]:
     """
-    Filtro de Stochastic basado únicamente en la separación K-D.
+    Detecta expansión del Stochastic.
 
     CALL:
-        - K debe estar por encima de D.
-        - La separación debe ser 0.3.
-
-    Ejemplos válidos:
-        K=2.6 D=2.3
-        K=4.3 D=4.0
-        K=6.8 D=6.5
-        K=7.5 D=7.2
-        K=10.0 D=9.7
+        K > D
+        K está subiendo
+        separación K-D está aumentando
+        separación actual es la máxima de la ventana
 
     PUT:
-        - K debe estar por debajo de D.
-        - La separación debe ser 0.3.
+        K < D
+        K está bajando
+        separación D-K está aumentando
+        separación actual es la máxima de la ventana
     """
 
-    separation = abs(k_value - d_value)
-
-    separation_valid = math.isclose(
-        separation,
-        STOCH_KD_SEPARATION,
-        abs_tol=0.02,
+    k_values, d_values = _stochastic_series(
+        candles
     )
 
-    if not separation_valid:
-        return False
+    minimum = STOCH_EXPANSION_LOOKBACK + 2
 
-    if direction == "call":
-        return k_value > d_value
+    if len(k_values) < minimum:
+        return {
+            "valid": False,
+            "direction": None,
+            "k": 50.0,
+            "d": 50.0,
+            "separation": 0.0,
+            "previous_separation": 0.0,
+            "maximum_separation": 0.0,
+            "k_change": 0.0,
+            "d_change": 0.0,
+            "expanding": False,
+            "maximum": False,
+        }
 
-    if direction == "put":
-        return k_value < d_value
+    current_k = k_values[-1]
+    current_d = d_values[-1]
 
-    return False
+    previous_k = k_values[-2]
+    previous_d = d_values[-2]
+
+    current_separation = abs(
+        current_k - current_d
+    )
+
+    previous_separation = abs(
+        previous_k - previous_d
+    )
+
+    start = max(
+        0,
+        len(k_values)
+        - STOCH_EXPANSION_LOOKBACK,
+    )
+
+    recent_separations = [
+        abs(k_values[i] - d_values[i])
+        for i in range(
+            start,
+            len(k_values),
+        )
+    ]
+
+    maximum_separation = max(
+        recent_separations
+    )
+
+    k_change = current_k - previous_k
+    d_change = current_d - previous_d
+
+    expanding = (
+        current_separation
+        > previous_separation
+    )
+
+    maximum = (
+        current_separation
+        >= maximum_separation - 0.000001
+    )
+
+    bullish = (
+        current_k > current_d
+        and k_change > 0
+        and expanding
+        and maximum
+    )
+
+    bearish = (
+        current_k < current_d
+        and k_change < 0
+        and expanding
+        and maximum
+    )
+
+    if bullish:
+        direction = "call"
+    elif bearish:
+        direction = "put"
+    else:
+        direction = None
+
+    return {
+        "valid": direction is not None,
+        "direction": direction,
+        "k": current_k,
+        "d": current_d,
+        "separation": current_separation,
+        "previous_separation": previous_separation,
+        "maximum_separation": maximum_separation,
+        "k_change": k_change,
+        "d_change": d_change,
+        "expanding": expanding,
+        "maximum": maximum,
+    }
 
 
 def _empty_result(
@@ -276,7 +398,7 @@ def _empty_result(
             "tolerance": 0.0,
             "entry_quality": 0,
             "pullback": {
-                "valid": False
+                "valid": False,
             },
         },
     }
@@ -323,12 +445,18 @@ def analyze_rejection(
     )
 
     upper_wick = max(
-        high - max(open_price, close_price),
+        high - max(
+            open_price,
+            close_price,
+        ),
         0.0,
     )
 
     lower_wick = max(
-        min(open_price, close_price) - low,
+        min(
+            open_price,
+            close_price,
+        ) - low,
         0.0,
     )
 
@@ -348,7 +476,10 @@ def analyze_rejection(
 
     tolerance = (
         atr
-        * max(zone_atr_factor, 0.01)
+        * max(
+            zone_atr_factor,
+            0.01,
+        )
     )
 
     near_support = (
@@ -361,12 +492,18 @@ def analyze_rejection(
         and close_price < resistance
     )
 
+    stoch = _stochastic_expansion(
+        records
+    )
+
     # ==========================================================
-    # CALL - RECHAZO ALCISTA DE SOPORTE
+    # CALL
     # ==========================================================
 
     bullish = (
-        near_support
+        stoch["valid"]
+        and stoch["direction"] == "call"
+        and near_support
         and lower_wick >= max(
             body * 1.25,
             atr * 0.20,
@@ -376,19 +513,16 @@ def analyze_rejection(
             (close_price - low)
             / candle_range
         ) >= 0.60
-        and _stochastic_confirms(
-            "call",
-            stochastic_k,
-            stochastic_d,
-        )
     )
 
     # ==========================================================
-    # PUT - RECHAZO BAJISTA DE RESISTENCIA
+    # PUT
     # ==========================================================
 
     bearish = (
-        near_resistance
+        stoch["valid"]
+        and stoch["direction"] == "put"
+        and near_resistance
         and upper_wick >= max(
             body * 1.25,
             atr * 0.20,
@@ -398,59 +532,65 @@ def analyze_rejection(
             (high - close_price)
             / candle_range
         ) >= 0.60
-        and _stochastic_confirms(
-            "put",
-            stochastic_k,
-            stochastic_d,
-        )
     )
-
-    # ==========================================================
-    # SEÑAL CALL
-    # ==========================================================
 
     if bullish:
         score = 90
 
+        # Mayor separación = mayor puntuación.
+        if stoch["separation"] >= 5:
+            score += 3
+
+        if stoch["separation"] >= 10:
+            score += 3
+
+        if stoch["separation"] >= 15:
+            score += 4
+
         if lower_wick >= body * 2:
-            score += 8
+            score += 3
 
         if (
             close_price
             > support + tolerance * 0.25
         ):
-            score += 5
+            score += 2
 
         if score >= int(min_score):
             return Signal(
                 "call",
                 min(score, 100),
-                "bullish_support_rejection",
+                "bullish_stochastic_expansion_support_rejection",
                 support,
                 resistance,
             )
 
-    # ==========================================================
-    # SEÑAL PUT
-    # ==========================================================
-
     if bearish:
         score = 90
 
+        if stoch["separation"] >= 5:
+            score += 3
+
+        if stoch["separation"] >= 10:
+            score += 3
+
+        if stoch["separation"] >= 15:
+            score += 4
+
         if upper_wick >= body * 2:
-            score += 8
+            score += 3
 
         if (
             close_price
             < resistance - tolerance * 0.25
         ):
-            score += 5
+            score += 2
 
         if score >= int(min_score):
             return Signal(
                 "put",
                 min(score, 100),
-                "bearish_resistance_rejection",
+                "bearish_stochastic_expansion_resistance_rejection",
                 support,
                 resistance,
             )
@@ -458,7 +598,7 @@ def analyze_rejection(
     return Signal(
         "none",
         0,
-        "no_valid_rejection",
+        "no_valid_stochastic_expansion",
         support,
         resistance,
     )
@@ -472,16 +612,6 @@ def analyze_market(
     min_score: int = DEFAULT_MIN_SCORE,
     **_: Any,
 ) -> Dict[str, Any]:
-    """
-    Analiza únicamente una vela cerrada anterior.
-
-    - Cuando bot.py envía previous_m1 + candle_1m,
-      candle_1m ya debe ser N-1.
-
-    - Cuando se recibe df directamente,
-      se excluye la última vela del DataFrame
-      porque puede estar activa/en formación.
-    """
 
     if previous_m1 is not None:
 
@@ -490,10 +620,12 @@ def analyze_market(
         )
 
         if candle_1m is not None:
-
             current_closed = (
                 dict(candle_1m)
-                if isinstance(candle_1m, dict)
+                if isinstance(
+                    candle_1m,
+                    dict,
+                )
                 else {}
             )
 
@@ -505,8 +637,6 @@ def analyze_market(
 
         all_records = _as_records(df)
 
-        # No analizar la última vela:
-        # puede estar en formación.
         records = (
             all_records[:-1]
             if len(all_records) > 1
@@ -519,8 +649,6 @@ def analyze_market(
             candle_1m
         )
 
-        # Para llamadas directas,
-        # también se descarta la última vela.
         records = (
             all_records[:-1]
             if len(all_records) > 1
@@ -537,6 +665,10 @@ def analyze_market(
 
     stochastic_k, stochastic_d = _stochastic(
         records
+    )
+
+    stochastic_expansion = (
+        _stochastic_expansion(records)
     )
 
     signal = analyze_rejection(
@@ -593,16 +725,64 @@ def analyze_market(
             2,
         ),
 
-        "stochastic_kd_separation": round(
-            abs(
-                stochastic_k
-                - stochastic_d
+        "stochastic_separation": round(
+            stochastic_expansion.get(
+                "separation",
+                0.0,
             ),
             2,
         ),
 
-        "stochastic_required_separation": (
-            STOCH_KD_SEPARATION
+        "stochastic_previous_separation": round(
+            stochastic_expansion.get(
+                "previous_separation",
+                0.0,
+            ),
+            2,
+        ),
+
+        "stochastic_maximum_separation": round(
+            stochastic_expansion.get(
+                "maximum_separation",
+                0.0,
+            ),
+            2,
+        ),
+
+        "stochastic_k_change": round(
+            stochastic_expansion.get(
+                "k_change",
+                0.0,
+            ),
+            2,
+        ),
+
+        "stochastic_d_change": round(
+            stochastic_expansion.get(
+                "d_change",
+                0.0,
+            ),
+            2,
+        ),
+
+        "stochastic_expanding": (
+            stochastic_expansion.get(
+                "expanding",
+                False,
+            )
+        ),
+
+        "stochastic_maximum": (
+            stochastic_expansion.get(
+                "maximum",
+                False,
+            )
+        ),
+
+        "stochastic_direction": (
+            stochastic_expansion.get(
+                "direction"
+            )
         ),
 
         "last_swing_high": (
@@ -615,17 +795,11 @@ def analyze_market(
 
         "rejection_timestamp": timestamp,
 
-        "confirmation_timestamp": (
-            timestamp
-        ),
+        "confirmation_timestamp": timestamp,
 
-        "rejection_candle": (
-            records_last
-        ),
+        "rejection_candle": records_last,
 
-        "confirmation_candle": (
-            records_last
-        ),
+        "confirmation_candle": records_last,
 
         "pullback": {
             "valid": force,
@@ -676,7 +850,8 @@ def analyze_market(
         "reason": (
             f"{signal.reason} | "
             f"STOCH K={stochastic_k:.1f} "
-            f"D={stochastic_d:.1f}"
+            f"D={stochastic_d:.1f} | "
+            f"SEP={stochastic_expansion.get('separation', 0.0):.2f}"
         ),
 
         "analysis": analysis,
