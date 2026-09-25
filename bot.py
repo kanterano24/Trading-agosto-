@@ -28,7 +28,7 @@ EXPIRATION = 1
 AMOUNT = float(os.getenv("AMOUNT", "30"))
 ACCOUNT_TYPE = os.getenv("ACCOUNT_TYPE", "PRACTICE").strip().upper()
 
-MAX_TOTAL_TRADES = 1
+MAX_TOTAL_TRADES = 100
 TOTAL_TRADES = 0
 CANDLE_COUNT = max(60, int(os.getenv("CANDLE_COUNT", "80")))
 MAX_PAIRS = 50
