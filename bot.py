@@ -25,10 +25,10 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 TIMEFRAME = 60
 EXPIRATION = 5
-AMOUNT = float(os.getenv("AMOUNT", "40"))
+AMOUNT = float(os.getenv("AMOUNT", "50"))
 ACCOUNT_TYPE = os.getenv("ACCOUNT_TYPE", "PRACTICE").strip().upper()
 
-MAX_TOTAL_TRADES = 200
+MAX_TOTAL_TRADES = 30
 TOTAL_TRADES = 0
 CANDLE_COUNT = max(60, int(os.getenv("CANDLE_COUNT", "80")))
 MAX_PAIRS = 50
@@ -153,8 +153,8 @@ def telegram_command_loop() -> None:
                         "⚡ MULTIMERCADO | REVERSIÓN\n"
                         f"Cuenta: {ACCOUNT_TYPE}\n"
                         f"Entradas: 0/{MAX_TOTAL_TRADES}\n"
-                        "📌 Rechazo N-2 + confirmación N-1 + entrada N\n"
-                        f"⏱ Temporalidad: {TIMEFRAME // 60} minuto(s)\n"
+                        "📌 Cruce ATR M1 + confirmación de vela M5\n"
+                        f"⏱ Análisis: M1 | Confirmación: M5\n"
                         f"⏳ Expiración: {EXPIRATION} minuto(s)\n"
                         f"💵 Importe: {AMOUNT:g}"
                     )
@@ -172,13 +172,13 @@ def telegram_command_loop() -> None:
                         f"Estado: {status}\n"
                         "Mercados: Binary/Turbo y Digital\n"
                         "Filtro: FUERZA\n"
-                        "Entrada: rechazo N-2 + confirmación N-1\n"
+                        "Entrada: cruce ATR M1 + confirmación M5\n"
                         f"Expiración: {EXPIRATION} minuto(s)\n"
                         f"Importe: {AMOUNT:g}\n"
                         f"Cuenta: {ACCOUNT_TYPE}\n"
                         f"Entradas: {TOTAL_TRADES}/{MAX_TOTAL_TRADES}\n"
                         f"Activos: {len(PAIRS)}\n"
-                        "Filtro: primer vencimiento disponible de 1 minuto"
+                        "Filtro: expiración disponible de 5 minutos"
                     )
 
         except Exception as exc:
@@ -189,7 +189,7 @@ def telegram_command_loop() -> None:
 # UNIVERSO DE ACTIVOS
 # ============================================================
 
-def _supports_one_minute_expiration(info: Dict[str, Any]) -> bool:
+def _supports_five_minute_expiration(info: Dict[str, Any]) -> bool:
     if not isinstance(info, dict):
         return False
 
@@ -245,7 +245,7 @@ def _supports_one_minute_expiration(info: Dict[str, Any]) -> bool:
                 minutes = number if number == 1 else (number / 60.0 if number == 60 else -1)
             else:
                 continue
-            if abs(minutes - 1.0) < 1e-9:
+            if abs(minutes - 5.0) < 1e-9:
                 return True
         return False
 
@@ -299,7 +299,7 @@ def _catalog_assets() -> Tuple[list[str], Dict[str, str], bool]:
             if not isinstance(info, dict) or not _asset_is_open(info):
                 continue
             name = _asset_name(info)
-            if not name or not _supports_one_minute_expiration(info):
+            if not name or not _supports_five_minute_expiration(info):
                 continue
 
             try:
@@ -360,7 +360,7 @@ def refresh_available_pairs(force: bool = False) -> list[str]:
             f"Activos válidos: {len(selected)}\n"
             f"Binary/Turbo: {by_market.get('binary', 0)}\n"
             f"Digital: {by_market.get('digital', 0)}\n"
-            "Filtro: primer reloj de expiración disponible = 1 minuto\n"
+            "Filtro: reloj de expiración disponible = 5 minutos\n"
             "Mercados: TODOS (OTC, REAL y DIGITAL) según disponibilidad"
         )
         logger.info(message.replace("\n", " | "))
@@ -418,7 +418,7 @@ def connect_iq() -> bool:
 
     telegram_send(
         "🟢 IQ OPTION CONECTADO\n\n"
-        "📊 Rechazo N-2 + confirmación N-1\n"
+        "📊 Cruce ATR M1 + confirmación M5\n"
         "⚡ Selección de la mejor señal entre los pares\n"
         f"⏳ Expiración: {EXPIRATION} minuto(s)"
     )
@@ -688,7 +688,7 @@ def _candle_diagnostic(label: str, candle: Any) -> str:
     )
 
 
-def _diagnostic_message(pair: str, signal: str, result: Dict[str, Any], rejection_label: str = "RECHAZO N-2", confirmation_label: str = "CONFIRMACIÓN N-1") -> str:
+def _diagnostic_message(pair: str, signal: str, result: Dict[str, Any], rejection_label: str = "CRUCE ATR M1", confirmation_label: str = "CONFIRMACIÓN M5") -> str:
     analysis = result.get("analysis") or {}
     rejection = analysis.get("rejection_candle") or {}
     confirmation = analysis.get("confirmation_candle") or {}
@@ -716,7 +716,7 @@ def analysis_message(pair: str, ts: int, result: Dict[str, Any]) -> str:
     return (
         "🔎 ANÁLISIS DE FUERZA\n\n"
         f"Par: {pair}\n"
-        f"Vela N-1: {ts}\n"
+        f"Vela M1: {ts}\n"
         f"Dirección: {result.get('signal')}\n"
         f"Estructura: {analysis.get('structure', 'unknown')}\n"
         f"Fase: {analysis.get('impulse_phase', 'unknown')}\n"
@@ -787,9 +787,9 @@ def analyze_live_candle(pair: str, current_ts: int, execute: bool = True) -> Opt
         f"Dirección: {signal.upper()}\n"
         f"Tipo: {result.get('entry_type')}\n"
         f"Score: {candidate['score']}/100\n"
-        f"STOCH K: {analysis.get('stochastic_k')}\n"
-        f"STOCH D: {analysis.get('stochastic_d')}\n"
-        f"Separación: {analysis.get('stochastic_separation')}\n"
+        f"ATR: {analysis.get('atr')}\n"
+        f"Línea ATR: {analysis.get('atr_line')}\n"
+        f"Confirmación M5: {analysis.get('confirmation_m5')}\n"
         f"Vela N-1: {current_ts}\n"
         f"ID: {order_id}\n\n"
         f"⏳ Expiración: {EXPIRATION} minuto(s)\n\n"
@@ -874,7 +874,7 @@ def analyze_all_pairs() -> None:
         return
 
     refresh_available_pairs()
-    current_ts = int(floor_candle_timestamp(get_iq_server_timestamp()))
+    current_ts = int(floor_candle_timestamp(get_iq_server_timestamp()) - TIMEFRAME)
     candidates: list[Dict[str, Any]] = []
 
     for pair in list(PAIRS)[:MAX_PAIRS]:
@@ -920,8 +920,8 @@ def main() -> None:
     global BOT_RUNNING, TOTAL_TRADES
 
     logger.info("========================================")
-    logger.info("BOT MULTIMERCADO | N-2 RECHAZO + N-1 CONFIRMACION + N")
-    logger.info("TIMEFRAME=%s | EXPIRATION=%s (SOLO 1 MINUTO)", TIMEFRAME, EXPIRATION)
+    logger.info("BOT MULTIMERCADO | CRUCE ATR M1 + CONFIRMACION M5")
+    logger.info("TIMEFRAME=%s | EXPIRATION=%s (5 MINUTOS)", TIMEFRAME, EXPIRATION)
     logger.info("MAX PAIRS=%s | REFRESH=%ss | AMOUNT=%s | ACCOUNT=%s | MAX_TRADES=%s",
                 MAX_PAIRS, int(PAIR_REFRESH_SECONDS), AMOUNT, ACCOUNT_TYPE, MAX_TOTAL_TRADES)
     logger.info("========================================")
@@ -955,8 +955,8 @@ def main() -> None:
 
     telegram_send(
         "🤖 BOT LISTO\n\n"
-        "📊 N-2 rechazo + N-1 confirmación + N ejecución\n"
-        "⏱ Solo pares con expiración de 1 minuto\n"
+        "📊 Cruce ATR M1 + confirmación M5 + ejecución\n"
+        "⏱ Solo pares con expiración de 5 minutos\n"
         "⚡ Selección de la mejor señal entre hasta 50 pares\n"
         f"⏳ Expiración: {EXPIRATION} minuto(s)\n"
         f"🔢 Activos analizados: {len(PAIRS)} (máximo {MAX_PAIRS})\n"
