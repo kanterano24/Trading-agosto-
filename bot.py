@@ -24,8 +24,8 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 TIMEFRAME = 60
-EXPIRATION = 1
-AMOUNT = float(os.getenv("AMOUNT", "39"))
+EXPIRATION = 5
+AMOUNT = float(os.getenv("AMOUNT", "40"))
 ACCOUNT_TYPE = os.getenv("ACCOUNT_TYPE", "PRACTICE").strip().upper()
 
 MAX_TOTAL_TRADES = 20
