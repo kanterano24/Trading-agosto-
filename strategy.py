@@ -1,20 +1,49 @@
-"""strategy.py - Stochastic expansion + soporte/resistencia compatible con bot.py."""
+"""strategy.py - Señales ATR + confirmación M5.
+
+Lógica:
+- El análisis se realiza en M1.
+- CALL: el precio cruza la línea ATR hacia abajo.
+- PUT: el precio cruza la línea ATR hacia arriba.
+- El cruce debe producirse dentro de una ventana de 5 minutos.
+- Se abre la siguiente vela M5 y se espera a su cierre.
+- CALL solamente si esa M5 cierra roja.
+- PUT solamente si esa M5 cierra verde.
+- Si la confirmación no coincide, no hay operación.
+
+Nota:
+La línea ATR implementada aquí es una línea ATR trailing-stop:
+    ATR line = precio de referencia +/- ATR * multiplicador
+con periodo 14 y multiplicador 1.0.
+Si el indicador de tu gráfico usa otro periodo/multiplicador, cambia
+ATR_PERIOD y ATR_MULTIPLIER para hacer coincidir la línea.
+"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 import math
+from datetime import datetime, timezone
+
 
 MIN_CANDLES = 20
 DEFAULT_LOOKBACK = 60
 DEFAULT_MIN_SCORE = 75
 
-STOCH_K_PERIOD = 13
-STOCH_D_PERIOD = 3
-STOCH_SMOOTHING = 3
+# ==========================================================
+# ATR TRAILING LINE
+# ==========================================================
 
-# Ventana utilizada para determinar la máxima separación reciente.
-STOCH_EXPANSION_LOOKBACK = 5
+ATR_PERIOD = 14
+ATR_MULTIPLIER = 1.0
+
+# Ventana máxima en la que aceptamos el cruce para preparar
+# la siguiente vela M5.
+CROSS_WINDOW_MINUTES = 5
+
+# Estado de señales pendientes, separado por par.
+# Se conserva entre llamadas de analyze_market().
+_PENDING: Dict[str, Dict[str, Any]] = {}
 
 
 @dataclass
@@ -35,19 +64,10 @@ def _number(value: Any, default: float = 0.0) -> float:
 
 
 def _ohlc(candle: Dict[str, Any]) -> Tuple[float, float, float, float]:
-    open_price = _number(
-        candle.get("open", candle.get("open_price"))
-    )
-    close_price = _number(
-        candle.get("close", candle.get("close_price"))
-    )
-    low = _number(
-        candle.get("min", candle.get("low"))
-    )
-    high = _number(
-        candle.get("max", candle.get("high"))
-    )
-
+    open_price = _number(candle.get("open", candle.get("open_price")))
+    close_price = _number(candle.get("close", candle.get("close_price")))
+    low = _number(candle.get("min", candle.get("low")))
+    high = _number(candle.get("max", candle.get("high")))
     return open_price, close_price, low, high
 
 
@@ -63,32 +83,74 @@ def _as_records(value: Any) -> List[Dict[str, Any]]:
             return []
 
     if isinstance(value, dict):
-        return [value]
+        return [dict(value)]
 
     try:
-        return [
-            dict(item)
-            for item in value
-            if isinstance(item, dict)
-        ]
+        return [dict(item) for item in value if isinstance(item, dict)]
     except TypeError:
         return []
 
 
-def _atr(
+def _timestamp(candle: Dict[str, Any]) -> Any:
+    return candle.get("from", candle.get("timestamp", candle.get("time")))
+
+
+def _timestamp_seconds(value: Any) -> Optional[float]:
+    if value is None:
+        return None
+
+    if isinstance(value, (int, float)):
+        number = float(value)
+        if not math.isfinite(number):
+            return None
+        # Epoch milliseconds.
+        if abs(number) > 10_000_000_000:
+            number /= 1000.0
+        return number
+
+    text = str(value).strip()
+    if not text:
+        return None
+
+    try:
+        number = float(text)
+        if math.isfinite(number):
+            if abs(number) > 10_000_000_000:
+                number /= 1000.0
+            return number
+    except ValueError:
+        pass
+
+    try:
+        normalized = text.replace("Z", "+00:00")
+        dt = datetime.fromisoformat(normalized)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.timestamp()
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def _m5_bucket(timestamp_value: Any) -> Optional[int]:
+    seconds = _timestamp_seconds(timestamp_value)
+    if seconds is None:
+        return None
+    return int(seconds // 300)
+
+
+def _atr_values(
     candles: List[Dict[str, Any]],
-    period: int = 14,
-) -> float:
+    period: int = ATR_PERIOD,
+) -> List[float]:
+    """ATR Wilder-style/simple rolling mean of True Range."""
     if len(candles) < 2:
-        return 0.0
+        return []
 
     true_ranges: List[float] = []
 
     for index in range(1, len(candles)):
+        _, previous_close, _, _ = _ohlc(candles[index - 1])
         _, _, low, high = _ohlc(candles[index])
-        _, previous_close, _, _ = _ohlc(
-            candles[index - 1]
-        )
 
         true_ranges.append(
             max(
@@ -98,31 +160,163 @@ def _atr(
             )
         )
 
-    values = true_ranges[-period:]
+    result: List[float] = []
 
-    return (
-        sum(values) / len(values)
-        if values
-        else 0.0
+    for i in range(len(true_ranges)):
+        values = true_ranges[max(0, i - period + 1): i + 1]
+        result.append(sum(values) / len(values) if values else 0.0)
+
+    return result
+
+
+def _atr(candles: List[Dict[str, Any]], period: int = ATR_PERIOD) -> float:
+    values = _atr_values(candles, period)
+    return values[-1] if values else 0.0
+
+
+def _atr_trailing_line(
+    candles: List[Dict[str, Any]],
+    period: int = ATR_PERIOD,
+    multiplier: float = ATR_MULTIPLIER,
+) -> List[float]:
+    """
+    Calcula una línea ATR trailing-stop.
+
+    La línea se mueve debajo del precio cuando la tendencia es alcista
+    y encima del precio cuando la tendencia es bajista.
+
+    Esta es la línea contra la que se detecta el cruce del precio.
+    """
+    if len(candles) < 2:
+        return []
+
+    atr_values = _atr_values(candles, period)
+    lines: List[float] = []
+
+    previous_line = 0.0
+    direction = 1  # 1 = línea inferior, -1 = línea superior
+
+    for i, candle in enumerate(candles):
+        open_price, close_price, low, high = _ohlc(candle)
+
+        atr_value = (
+            atr_values[i - 1]
+            if i - 1 < len(atr_values)
+            else 0.0
+        )
+
+        if atr_value <= 0:
+            if i == 0:
+                lines.append(close_price)
+            else:
+                lines.append(previous_line)
+            continue
+
+        # Línea ATR basada en el cierre.
+        long_stop = close_price - multiplier * atr_value
+        short_stop = close_price + multiplier * atr_value
+
+        if i == 1 or previous_line == 0:
+            direction = 1
+            line = long_stop
+        elif direction == 1:
+            # Mientras siga por encima de la línea inferior,
+            # la línea solo puede subir.
+            line = max(previous_line, long_stop)
+
+            # Cruce hacia abajo de la línea: cambia a línea superior.
+            if close_price < previous_line:
+                direction = -1
+                line = short_stop
+        else:
+            # Mientras siga por debajo de la línea superior,
+            # la línea solo puede bajar.
+            line = min(previous_line, short_stop)
+
+            # Cruce hacia arriba de la línea: cambia a línea inferior.
+            if close_price > previous_line:
+                direction = 1
+                line = long_stop
+
+        previous_line = line
+        lines.append(line)
+
+    return lines
+
+
+def _detect_atr_cross(
+    candles: List[Dict[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    """
+    Detecta el cruce usando las dos últimas M1 cerradas.
+
+    CALL:
+        precio cruza la línea ATR hacia abajo.
+
+    PUT:
+        precio cruza la línea ATR hacia arriba.
+    """
+    if len(candles) < ATR_PERIOD + 3:
+        return None
+
+    lines = _atr_trailing_line(candles)
+
+    if len(lines) < 2:
+        return None
+
+    previous = candles[-2]
+    current = candles[-1]
+
+    previous_close = _ohlc(previous)[1]
+    current_close = _ohlc(current)[1]
+
+    previous_line = lines[-2]
+    current_line = lines[-1]
+
+    if previous_line <= 0 or current_line <= 0:
+        return None
+
+    # Cruce hacia abajo:
+    # el cierre anterior estaba por encima/en la línea
+    # y el cierre actual termina por debajo.
+    cross_down = (
+        previous_close >= previous_line
+        and current_close < current_line
     )
+
+    # Cruce hacia arriba:
+    # el cierre anterior estaba por debajo/en la línea
+    # y el cierre actual termina por encima.
+    cross_up = (
+        previous_close <= previous_line
+        and current_close > current_line
+    )
+
+    if not cross_down and not cross_up:
+        return None
+
+    direction = "call" if cross_down else "put"
+
+    return {
+        "direction": direction,
+        "timestamp": _timestamp(current),
+        "timestamp_seconds": _timestamp_seconds(_timestamp(current)),
+        "m5_bucket": _m5_bucket(_timestamp(current)),
+        "price": current_close,
+        "atr": _atr(candles),
+        "atr_line": current_line,
+        "previous_atr_line": previous_line,
+    }
 
 
 def _zones(
     candles: List[Dict[str, Any]],
     lookback: int = DEFAULT_LOOKBACK,
 ) -> Tuple[float, float]:
-
     sample = candles[-max(1, lookback):]
 
-    lows = [
-        _ohlc(candle)[2]
-        for candle in sample
-    ]
-
-    highs = [
-        _ohlc(candle)[3]
-        for candle in sample
-    ]
+    lows = [_ohlc(candle)[2] for candle in sample]
+    highs = [_ohlc(candle)[3] for candle in sample]
 
     return (
         (min(lows), max(highs))
@@ -131,255 +325,67 @@ def _zones(
     )
 
 
-def _stochastic_series(
-    candles: List[Dict[str, Any]],
-    k_period: int = STOCH_K_PERIOD,
-    d_period: int = STOCH_D_PERIOD,
-    slowing: int = STOCH_SMOOTHING,
-) -> Tuple[List[float], List[float]]:
+def _completed_m5(
+    records: List[Dict[str, Any]],
+) -> Optional[Dict[str, Any]]:
     """
-    Calcula las series completas de Stochastic K y D.
+    Devuelve la última vela M5 COMPLETAMENTE cerrada a partir de M1.
 
-    Solamente utiliza velas cerradas.
+    Se agrupan las M1 por bloques de 5 minutos.
     """
+    if len(records) < 5:
+        return None
 
-    if len(candles) < max(
-        k_period + d_period + slowing,
-        5,
-    ):
-        return [], []
+    buckets: Dict[int, List[Dict[str, Any]]] = {}
 
-    highs = [
-        _ohlc(c)[3]
-        for c in candles
-    ]
+    for candle in records:
+        bucket = _m5_bucket(_timestamp(candle))
+        if bucket is None:
+            continue
+        buckets.setdefault(bucket, []).append(candle)
 
-    lows = [
-        _ohlc(c)[2]
-        for c in candles
-    ]
+    if not buckets:
+        return None
 
-    closes = [
-        _ohlc(c)[1]
-        for c in candles
-    ]
+    complete: List[Tuple[int, List[Dict[str, Any]]]] = []
 
-    raw_k: List[float] = []
-
-    for i in range(
-        k_period - 1,
-        len(candles),
-    ):
-        window_high = max(
-            highs[i - k_period + 1:i + 1]
+    for bucket, group in buckets.items():
+        group = sorted(
+            group,
+            key=lambda x: (
+                _timestamp_seconds(_timestamp(x))
+                if _timestamp_seconds(_timestamp(x)) is not None
+                else 0
+            ),
         )
 
-        window_low = min(
-            lows[i - k_period + 1:i + 1]
-        )
+        if len(group) >= 5:
+            complete.append((bucket, group[-5:]))
 
-        span = window_high - window_low
+    if not complete:
+        return None
 
-        if span <= 0:
-            raw_k.append(50.0)
-        else:
-            raw_k.append(
-                100.0
-                * (closes[i] - window_low)
-                / span
-            )
+    bucket, group = sorted(complete, key=lambda x: x[0])[-1]
 
-    if not raw_k:
-        return [], []
-
-    smoothed_k: List[float] = []
-
-    for i in range(len(raw_k)):
-        start = max(
-            0,
-            i - slowing + 1,
-        )
-
-        window = raw_k[start:i + 1]
-
-        smoothed_k.append(
-            sum(window) / len(window)
-        )
-
-    d_values: List[float] = []
-
-    for i in range(len(smoothed_k)):
-        start = max(
-            0,
-            i - d_period + 1,
-        )
-
-        window = smoothed_k[start:i + 1]
-
-        d_values.append(
-            sum(window) / len(window)
-        )
-
-    return (
-        [
-            max(0.0, min(100.0, value))
-            for value in smoothed_k
-        ],
-        [
-            max(0.0, min(100.0, value))
-            for value in d_values
-        ],
-    )
-
-
-def _stochastic(
-    candles: List[Dict[str, Any]],
-    k_period: int = STOCH_K_PERIOD,
-    d_period: int = STOCH_D_PERIOD,
-    slowing: int = STOCH_SMOOTHING,
-) -> Tuple[float, float]:
-
-    k_values, d_values = _stochastic_series(
-        candles,
-        k_period,
-        d_period,
-        slowing,
-    )
-
-    if not k_values or not d_values:
-        return 50.0, 50.0
-
-    return (
-        k_values[-1],
-        d_values[-1],
-    )
-
-
-def _stochastic_expansion(
-    candles: List[Dict[str, Any]],
-) -> Dict[str, Any]:
-    """
-    Detecta expansión del Stochastic.
-
-    CALL:
-        K > D
-        K está subiendo
-        separación K-D está aumentando
-        separación actual es la máxima de la ventana
-
-    PUT:
-        K < D
-        K está bajando
-        separación D-K está aumentando
-        separación actual es la máxima de la ventana
-    """
-
-    k_values, d_values = _stochastic_series(
-        candles
-    )
-
-    minimum = STOCH_EXPANSION_LOOKBACK + 2
-
-    if len(k_values) < minimum:
-        return {
-            "valid": False,
-            "direction": None,
-            "k": 50.0,
-            "d": 50.0,
-            "separation": 0.0,
-            "previous_separation": 0.0,
-            "maximum_separation": 0.0,
-            "k_change": 0.0,
-            "d_change": 0.0,
-            "expanding": False,
-            "maximum": False,
-        }
-
-    current_k = k_values[-1]
-    current_d = d_values[-1]
-
-    previous_k = k_values[-2]
-    previous_d = d_values[-2]
-
-    current_separation = abs(
-        current_k - current_d
-    )
-
-    previous_separation = abs(
-        previous_k - previous_d
-    )
-
-    start = max(
-        0,
-        len(k_values)
-        - STOCH_EXPANSION_LOOKBACK,
-    )
-
-    recent_separations = [
-        abs(k_values[i] - d_values[i])
-        for i in range(
-            start,
-            len(k_values),
-        )
-    ]
-
-    maximum_separation = max(
-        recent_separations
-    )
-
-    k_change = current_k - previous_k
-    d_change = current_d - previous_d
-
-    expanding = (
-        current_separation
-        > previous_separation
-    )
-
-    maximum = (
-        current_separation
-        >= maximum_separation - 0.000001
-    )
-
-    bullish = (
-        current_k > current_d
-        and k_change > 0
-        and expanding
-        and maximum
-    )
-
-    bearish = (
-        current_k < current_d
-        and k_change < 0
-        and expanding
-        and maximum
-    )
-
-    if bullish:
-        direction = "call"
-    elif bearish:
-        direction = "put"
-    else:
-        direction = None
+    first_open = _ohlc(group[0])[0]
+    last_close = _ohlc(group[-1])[1]
+    low = min(_ohlc(c)[2] for c in group)
+    high = max(_ohlc(c)[3] for c in group)
 
     return {
-        "valid": direction is not None,
-        "direction": direction,
-        "k": current_k,
-        "d": current_d,
-        "separation": current_separation,
-        "previous_separation": previous_separation,
-        "maximum_separation": maximum_separation,
-        "k_change": k_change,
-        "d_change": d_change,
-        "expanding": expanding,
-        "maximum": maximum,
+        "bucket": bucket,
+        "open": first_open,
+        "close": last_close,
+        "low": low,
+        "high": high,
+        "red": last_close < first_open,
+        "green": last_close > first_open,
+        "candles": group,
+        "timestamp": _timestamp(group[-1]),
     }
 
 
-def _empty_result(
-    reason: str = "no_valid_rejection",
-) -> Dict[str, Any]:
-
+def _empty_result(reason: str = "no_valid_atr_signal") -> Dict[str, Any]:
     return {
         "signal": None,
         "score": 0,
@@ -393,15 +399,50 @@ def _empty_result(
             "force": False,
             "structure": "range",
             "atr": 0.0,
+            "atr_line": 0.0,
             "support": None,
             "resistance": None,
             "tolerance": 0.0,
             "entry_quality": 0,
-            "pullback": {
-                "valid": False,
-            },
+            "atr_cross": None,
+            "pending_confirmation": False,
+            "confirmation_m5": None,
         },
     }
+
+
+def _pair_key(pair: Optional[str]) -> str:
+    return str(pair or "__default__").upper()
+
+
+def _store_cross(
+    pair: str,
+    cross: Dict[str, Any],
+) -> None:
+    bucket = cross.get("m5_bucket")
+
+    _PENDING[pair] = {
+        **cross,
+        "created_bucket": bucket,
+        "created_seconds": cross.get("timestamp_seconds"),
+    }
+
+
+def _pending_is_valid(
+    pending: Dict[str, Any],
+    current_bucket: Optional[int],
+) -> bool:
+    if current_bucket is None:
+        return False
+
+    created_bucket = pending.get("created_bucket")
+
+    if created_bucket is None:
+        return False
+
+    # El cruce debe pertenecer al bloque de 5 minutos inmediatamente
+    # anterior al bloque M5 que vamos a confirmar.
+    return current_bucket == created_bucket + 1
 
 
 def analyze_rejection(
@@ -412,195 +453,29 @@ def analyze_rejection(
     stochastic_k: float = 50.0,
     stochastic_d: float = 50.0,
 ) -> Signal:
+    """
+    Compatibilidad con el nombre antiguo.
 
+    La señal ya no utiliza Stochastic ni soporte/resistencia.
+    """
     records = _as_records(candles)
 
-    if len(records) < max(
-        MIN_CANDLES,
-        lookback // 2,
-    ):
-        return Signal(
-            "none",
-            0,
-            "insufficient_candles",
-        )
+    if len(records) < ATR_PERIOD + 3:
+        return Signal("none", 0, "insufficient_candles")
 
-    previous = records[:-1]
-    candle = records[-1]
+    cross = _detect_atr_cross(records)
 
-    (
-        open_price,
-        close_price,
-        low,
-        high,
-    ) = _ohlc(candle)
-
-    body = abs(
-        close_price - open_price
-    )
-
-    candle_range = max(
-        high - low,
-        1e-12,
-    )
-
-    upper_wick = max(
-        high - max(
-            open_price,
-            close_price,
-        ),
-        0.0,
-    )
-
-    lower_wick = max(
-        min(
-            open_price,
-            close_price,
-        ) - low,
-        0.0,
-    )
-
-    atr = _atr(previous)
-
-    if atr <= 0:
-        return Signal(
-            "none",
-            0,
-            "invalid_atr",
-        )
-
-    support, resistance = _zones(
-        previous,
-        lookback,
-    )
-
-    tolerance = (
-        atr
-        * max(
-            zone_atr_factor,
-            0.01,
-        )
-    )
-
-    near_support = (
-        low <= support + tolerance
-        and close_price > support
-    )
-
-    near_resistance = (
-        high >= resistance - tolerance
-        and close_price < resistance
-    )
-
-    stoch = _stochastic_expansion(
-        records
-    )
-
-    # ==========================================================
-    # CALL
-    # ==========================================================
-
-    bullish = (
-        stoch["valid"]
-        and stoch["direction"] == "call"
-        and near_support
-        and lower_wick >= max(
-            body * 1.25,
-            atr * 0.20,
-        )
-        and close_price > open_price
-        and (
-            (close_price - low)
-            / candle_range
-        ) >= 0.60
-    )
-
-    # ==========================================================
-    # PUT
-    # ==========================================================
-
-    bearish = (
-        stoch["valid"]
-        and stoch["direction"] == "put"
-        and near_resistance
-        and upper_wick >= max(
-            body * 1.25,
-            atr * 0.20,
-        )
-        and close_price < open_price
-        and (
-            (high - close_price)
-            / candle_range
-        ) >= 0.60
-    )
-
-    if bullish:
-        score = 90
-
-        # Mayor separación = mayor puntuación.
-        if stoch["separation"] >= 5:
-            score += 3
-
-        if stoch["separation"] >= 10:
-            score += 3
-
-        if stoch["separation"] >= 15:
-            score += 4
-
-        if lower_wick >= body * 2:
-            score += 3
-
-        if (
-            close_price
-            > support + tolerance * 0.25
-        ):
-            score += 2
-
-        if score >= int(min_score):
-            return Signal(
-                "call",
-                min(score, 100),
-                "bullish_stochastic_expansion_support_rejection",
-                support,
-                resistance,
-            )
-
-    if bearish:
-        score = 90
-
-        if stoch["separation"] >= 5:
-            score += 3
-
-        if stoch["separation"] >= 10:
-            score += 3
-
-        if stoch["separation"] >= 15:
-            score += 4
-
-        if upper_wick >= body * 2:
-            score += 3
-
-        if (
-            close_price
-            < resistance - tolerance * 0.25
-        ):
-            score += 2
-
-        if score >= int(min_score):
-            return Signal(
-                "put",
-                min(score, 100),
-                "bearish_stochastic_expansion_resistance_rejection",
-                support,
-                resistance,
-            )
+    if cross is None:
+        return Signal("none", 0, "no_atr_cross")
 
     return Signal(
-        "none",
-        0,
-        "no_valid_stochastic_expansion",
-        support,
-        resistance,
+        cross["direction"],
+        90,
+        (
+            "atr_cross_down_pending_m5_confirmation"
+            if cross["direction"] == "call"
+            else "atr_cross_up_pending_m5_confirmation"
+        ),
     )
 
 
@@ -613,30 +488,27 @@ def analyze_market(
     **_: Any,
 ) -> Dict[str, Any]:
 
-    if previous_m1 is not None:
+    # ----------------------------------------------------------
+    # Construcción de las M1 cerradas disponibles.
+    # ----------------------------------------------------------
 
-        records = _as_records(
-            previous_m1
-        )
+    if previous_m1 is not None:
+        records = _as_records(previous_m1)
 
         if candle_1m is not None:
-            current_closed = (
+            current = (
                 dict(candle_1m)
-                if isinstance(
-                    candle_1m,
-                    dict,
-                )
+                if isinstance(candle_1m, dict)
                 else {}
             )
-
-            records.append(
-                current_closed
-            )
+            if current:
+                records.append(current)
 
     elif df is not None:
-
         all_records = _as_records(df)
 
+        # Mantiene el comportamiento habitual: si la última vela
+        # puede estar abierta, no se utiliza como cerrada.
         records = (
             all_records[:-1]
             if len(all_records) > 1
@@ -644,10 +516,7 @@ def analyze_market(
         )
 
     else:
-
-        all_records = _as_records(
-            candle_1m
-        )
+        all_records = _as_records(candle_1m)
 
         records = (
             all_records[:-1]
@@ -657,220 +526,181 @@ def analyze_market(
 
     result = _empty_result()
 
-    if len(records) < MIN_CANDLES:
-        result["reason"] = (
-            "insufficient_candles"
-        )
+    if len(records) < ATR_PERIOD + 5:
+        result["reason"] = "insufficient_candles"
         return result
 
-    stochastic_k, stochastic_d = _stochastic(
-        records
-    )
+    pair_key = _pair_key(pair)
 
-    stochastic_expansion = (
-        _stochastic_expansion(records)
-    )
+    # ----------------------------------------------------------
+    # 1. Detectar el cruce ATR en M1.
+    # ----------------------------------------------------------
 
-    signal = analyze_rejection(
-        records,
-        min_score=min_score,
-        stochastic_k=stochastic_k,
-        stochastic_d=stochastic_d,
-    )
+    cross = _detect_atr_cross(records)
 
-    records_last = records[-1]
+    if cross is not None:
+        _store_cross(pair_key, cross)
 
-    timestamp = records_last.get(
-        "from",
-        records_last.get("timestamp"),
-    )
+    pending = _PENDING.get(pair_key)
 
-    atr = (
-        _atr(records[:-1])
-        if len(records) > 1
-        else 0.0
-    )
+    # ----------------------------------------------------------
+    # 2. Detectar la M5 cerrada.
+    # ----------------------------------------------------------
 
-    direction = (
-        "bullish"
-        if signal.action == "call"
-        else
-        "bearish"
-        if signal.action == "put"
-        else
-        "range"
-    )
+    m5 = _completed_m5(records)
 
-    force = (
-        signal.action in {"call", "put"}
-        and signal.score >= int(min_score)
-    )
+    if m5 is None:
+        result["reason"] = (
+            "atr_cross_detected_waiting_m5_close"
+            if pending
+            else "waiting_m5_confirmation"
+        )
 
-    analysis = {
-        "force": force,
-        "structure": direction,
-        "atr": atr,
-        "support": signal.support,
-        "resistance": signal.resistance,
-        "tolerance": atr * 0.35,
-        "entry_quality": signal.score,
+        if pending:
+            result["analysis"]["pending_confirmation"] = True
+            result["analysis"]["atr_cross"] = pending
 
-        "stochastic_k": round(
-            stochastic_k,
-            2,
-        ),
+        return result
 
-        "stochastic_d": round(
-            stochastic_d,
-            2,
-        ),
+    current_bucket = m5["bucket"]
 
-        "stochastic_separation": round(
-            stochastic_expansion.get(
-                "separation",
-                0.0,
-            ),
-            2,
-        ),
+    # ----------------------------------------------------------
+    # 3. Confirmar solamente la M5 que abre después del cruce.
+    # ----------------------------------------------------------
 
-        "stochastic_previous_separation": round(
-            stochastic_expansion.get(
-                "previous_separation",
-                0.0,
-            ),
-            2,
-        ),
+    if pending is not None and _pending_is_valid(
+        pending,
+        current_bucket,
+    ):
+        direction = pending["direction"]
 
-        "stochastic_maximum_separation": round(
-            stochastic_expansion.get(
-                "maximum_separation",
-                0.0,
-            ),
-            2,
-        ),
+        call_confirmed = (
+            direction == "call"
+            and m5["red"]
+        )
 
-        "stochastic_k_change": round(
-            stochastic_expansion.get(
-                "k_change",
-                0.0,
-            ),
-            2,
-        ),
+        put_confirmed = (
+            direction == "put"
+            and m5["green"]
+        )
 
-        "stochastic_d_change": round(
-            stochastic_expansion.get(
-                "d_change",
-                0.0,
-            ),
-            2,
-        ),
+        confirmed = call_confirmed or put_confirmed
 
-        "stochastic_expanding": (
-            stochastic_expansion.get(
-                "expanding",
-                False,
+        if confirmed:
+            score = 90
+
+            timestamp = _timestamp(records[-1])
+
+            reason = (
+                "atr_cross_down_m1_confirmed_m5_red"
+                if direction == "call"
+                else "atr_cross_up_m1_confirmed_m5_green"
             )
-        ),
 
-        "stochastic_maximum": (
-            stochastic_expansion.get(
-                "maximum",
-                False,
-            )
-        ),
+            # La señal se consume: un mismo cruce no puede
+            # generar dos operaciones.
+            _PENDING.pop(pair_key, None)
 
-        "stochastic_direction": (
-            stochastic_expansion.get(
-                "direction"
-            )
-        ),
+            analysis = {
+                "force": True,
+                "structure": (
+                    "bullish"
+                    if direction == "call"
+                    else "bearish"
+                ),
+                "atr": pending.get("atr", 0.0),
+                "atr_line": pending.get("atr_line", 0.0),
+                "support": None,
+                "resistance": None,
+                "tolerance": 0.0,
+                "entry_quality": score,
+                "atr_cross": pending,
+                "pending_confirmation": False,
+                "confirmation_m5": {
+                    "bucket": m5["bucket"],
+                    "open": m5["open"],
+                    "close": m5["close"],
+                    "red": m5["red"],
+                    "green": m5["green"],
+                    "timestamp": m5["timestamp"],
+                },
+                "rejection_timestamp": pending.get("timestamp"),
+                "confirmation_timestamp": m5["timestamp"],
+                "rejection_candle": (
+                    records[-1]
+                    if records
+                    else None
+                ),
+                "confirmation_candle": m5["candles"][-1],
+            }
 
-        "last_swing_high": (
-            signal.resistance
-        ),
+            return {
+                "signal": direction,
+                "score": score,
+                "score_100": score,
+                "entry_quality": score,
+                "quality": score,
+                "entry_type": "force",
+                "direction": (
+                    "bullish"
+                    if direction == "call"
+                    else "bearish"
+                ),
+                "reason": reason,
+                "analysis": analysis,
+                "candle_timestamp": timestamp,
+                "pair": pair,
+            }
 
-        "last_swing_low": (
-            signal.support
-        ),
+        # La M5 cerró con el color contrario:
+        # se descarta el cruce, NO se invierte la operación.
+        _PENDING.pop(pair_key, None)
 
-        "rejection_timestamp": timestamp,
+        result["reason"] = (
+            "atr_cross_call_m5_not_red_no_trade"
+            if direction == "call"
+            else "atr_cross_put_m5_not_green_no_trade"
+        )
+        result["analysis"]["pending_confirmation"] = False
+        result["analysis"]["atr_cross"] = pending
+        result["analysis"]["confirmation_m5"] = {
+            "bucket": m5["bucket"],
+            "open": m5["open"],
+            "close": m5["close"],
+            "red": m5["red"],
+            "green": m5["green"],
+        }
+        return result
 
-        "confirmation_timestamp": timestamp,
+    # ----------------------------------------------------------
+    # 4. Si la señal pendiente quedó vieja, se elimina.
+    # ----------------------------------------------------------
 
-        "rejection_candle": records_last,
+    if pending is not None:
+        created_bucket = pending.get("created_bucket")
 
-        "confirmation_candle": records_last,
+        if (
+            created_bucket is not None
+            and current_bucket > created_bucket + 1
+        ):
+            _PENDING.pop(pair_key, None)
 
-        "pullback": {
-            "valid": force,
-            "previous_candle_confirmed": force,
-            "extreme_confirmed": force,
-        },
-    }
+    result["reason"] = (
+        "atr_cross_detected_waiting_next_m5"
+        if cross is not None
+        else "no_valid_atr_signal"
+    )
 
-    return {
-        "signal": (
-            signal.action
-            if force
-            else None
-        ),
+    if pending is not None:
+        result["analysis"]["pending_confirmation"] = True
+        result["analysis"]["atr_cross"] = pending
 
-        "score": (
-            signal.score
-            if force
-            else 0
-        ),
-
-        "score_100": (
-            signal.score
-            if force
-            else 0
-        ),
-
-        "entry_quality": (
-            signal.score
-            if force
-            else 0
-        ),
-
-        "quality": (
-            signal.score
-            if force
-            else 0
-        ),
-
-        "entry_type": (
-            "force"
-            if force
-            else "none"
-        ),
-
-        "direction": direction,
-
-        "reason": (
-            f"{signal.reason} | "
-            f"STOCH K={stochastic_k:.1f} "
-            f"D={stochastic_d:.1f} | "
-            f"SEP={stochastic_expansion.get('separation', 0.0):.2f}"
-        ),
-
-        "analysis": analysis,
-
-        "candle_timestamp": timestamp,
-
-        "pair": pair,
-    }
+    return result
 
 
-def get_signal(
-    df: Any,
-) -> Optional[str]:
-    return analyze_market(
-        df=df
-    ).get("signal")
+def get_signal(df: Any) -> Optional[str]:
+    return analyze_market(df=df).get("signal")
 
 
-def signal(
-    df: Any,
-) -> Optional[str]:
+def signal(df: Any) -> Optional[str]:
     return get_signal(df)
