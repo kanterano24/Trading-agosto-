@@ -25,10 +25,10 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 TIMEFRAME = 60
 EXPIRATION = 1
-AMOUNT = float(os.getenv("AMOUNT", "30"))
+AMOUNT = float(os.getenv("AMOUNT", "39"))
 ACCOUNT_TYPE = os.getenv("ACCOUNT_TYPE", "PRACTICE").strip().upper()
 
-MAX_TOTAL_TRADES = 100
+MAX_TOTAL_TRADES = 20
 TOTAL_TRADES = 0
 CANDLE_COUNT = max(60, int(os.getenv("CANDLE_COUNT", "80")))
 MAX_PAIRS = 50
@@ -40,11 +40,7 @@ PAIR_REFRESH_SECONDS = float(os.getenv("PAIR_REFRESH_SECONDS", "900"))
 SNIPER_POLL = 0.06
 TRADE_COOLDOWN = float(os.getenv("TRADE_COOLDOWN", "60"))
 MIN_HISTORY = 35
-MIN_ROOM_TO_OPPOSITE_ATR = float(os.getenv("MIN_ROOM_TO_OPPOSITE_ATR", "1.00"))
-MIN_STOCH_SEPARATION = float(os.getenv("MIN_STOCH_SEPARATION", "6.0"))
-REQUIRE_STRUCTURE_BREAK = os.getenv("REQUIRE_STRUCTURE_BREAK", "true").strip().lower() in {"1", "true", "yes", "on"}
-REQUIRE_NEW_REJECTION = os.getenv("REQUIRE_NEW_REJECTION", "true").strip().lower() in {"1", "true", "yes", "on"}
-BOT_VERSION = "V3"
+MIN_ROOM_TO_OPPOSITE_ATR = float(os.getenv("MIN_ROOM_TO_OPPOSITE_ATR", "0.90"))
 
 AUTO_START = os.getenv("AUTO_START", "true").strip().lower() in {
     "1", "true", "yes", "on"
@@ -68,7 +64,6 @@ LIVE_STATE: Dict[str, Dict[str, Any]] = {}
 PENDING_ENTRY: Dict[str, Dict[str, Any]] = {}
 LAST_TRADE_TIME: Dict[str, float] = {}
 LAST_TRADE_CANDLE: Dict[str, int] = {}
-LAST_REJECTION_TRADED: Dict[str, int] = {}
 
 STATE_LOCK = threading.RLock()
 STUDY_LOG_LOCK = threading.RLock()
@@ -158,7 +153,7 @@ def telegram_command_loop() -> None:
                         "⚡ MULTIMERCADO | REVERSIÓN\n"
                         f"Cuenta: {ACCOUNT_TYPE}\n"
                         f"Entradas: 0/{MAX_TOTAL_TRADES}\n"
-                        "📌 V3: rechazo N-2 + confirmación cerrada N-1 + entrada N + entrada N\n"
+                        "📌 Rechazo N-2 + confirmación N-1 + entrada N\n"
                         f"⏱ Temporalidad: {TIMEFRAME // 60} minuto(s)\n"
                         f"⏳ Expiración: {EXPIRATION} minuto(s)\n"
                         f"💵 Importe: {AMOUNT:g}"
@@ -176,7 +171,7 @@ def telegram_command_loop() -> None:
                         "📊 ESTADO\n\n"
                         f"Estado: {status}\n"
                         "Mercados: Binary/Turbo y Digital\n"
-                        "Filtro: FUERZA V3\n"
+                        "Filtro: FUERZA\n"
                         "Entrada: rechazo N-2 + confirmación N-1\n"
                         f"Expiración: {EXPIRATION} minuto(s)\n"
                         f"Importe: {AMOUNT:g}\n"
@@ -354,7 +349,6 @@ def refresh_available_pairs(force: bool = False) -> list[str]:
             PENDING_ENTRY.pop(pair, None)
             LIVE_STATE.pop(pair, None)
             LAST_TRADE_CANDLE.pop(pair, None)
-            LAST_REJECTION_TRADED.pop(pair, None)
 
     if current != previous:
         by_market = {"binary": 0, "digital": 0}
@@ -424,8 +418,8 @@ def connect_iq() -> bool:
 
     telegram_send(
         "🟢 IQ OPTION CONECTADO\n\n"
-        "📊 V3: rechazo N-2 + confirmación cerrada N-1 + entrada N\n"
-        "⚡ V3: selección de la mejor señal entre los pares\n"
+        "📊 Rechazo N-2 + confirmación N-1\n"
+        "⚡ Selección de la mejor señal entre los pares\n"
         f"⏳ Expiración: {EXPIRATION} minuto(s)"
     )
 
@@ -595,22 +589,21 @@ def track_trade_result(pair: str, pending: Dict[str, Any], order_id: Any) -> Non
 # ============================================================
 
 def is_force_signal(result: Dict[str, Any], signal: Any) -> bool:
-    """Filtro final V3. Solo acepta señales completas y cerradas."""
     if signal not in ("call", "put"):
         return False
 
     try:
-        score = int(result.get("score", 0) or 0)
+        if int(result.get("score", 0) or 0) < MIN_ACCEPTED_SCORE:
+            return False
     except (TypeError, ValueError):
-        return False
-
-    if score < MIN_ACCEPTED_SCORE:
         return False
 
     entry_type = str(result.get("entry_type") or "").strip().lower()
     analysis = result.get("analysis") or {}
 
     if REQUIRE_FORCE and entry_type != "force":
+        return False
+    if not REQUIRE_FORCE and entry_type not in {"force", "bb_atr_rsi"}:
         return False
     if REQUIRE_FORCE and analysis.get("force") is False:
         return False
@@ -620,45 +613,13 @@ def is_force_signal(result: Dict[str, Any], signal: Any) -> bool:
     if returned_direction not in (None, expected_direction):
         return False
 
-    if str(analysis.get("strategy_version", "")) not in {"V3"}:
-        return False
-
-    # Confirmaciones estructurales obligatorias.
     pullback = analysis.get("pullback")
     if isinstance(pullback, dict):
         if pullback.get("valid") is False:
             return False
-        if pullback.get("previous_candle_confirmed") is not True:
-            return False
-        if pullback.get("extreme_confirmed") is not True:
-            return False
-
-    if REQUIRE_STRUCTURE_BREAK:
-        rejection = analysis.get("rejection_candle") or {}
-        confirmation = analysis.get("confirmation_candle") or {}
-        try:
-            if signal == "call" and float(confirmation.get("close")) <= float(rejection.get("high")):
+        for key in ("previous_candle_confirmed", "extreme_confirmed"):
+            if key in pullback and pullback.get(key) is not True:
                 return False
-            if signal == "put" and float(confirmation.get("close")) >= float(rejection.get("low")):
-                return False
-        except (TypeError, ValueError):
-            return False
-
-    # Separacion Stochastic minima.
-    try:
-        sep = float(analysis.get("stochastic_separation", 0.0) or 0.0)
-    except (TypeError, ValueError):
-        return False
-    if sep < MIN_STOCH_SEPARATION:
-        return False
-
-    # Espacio minimo hasta el nivel contrario.
-    try:
-        room_atr = float(analysis.get("room_atr", 0.0) or 0.0)
-    except (TypeError, ValueError):
-        return False
-    if room_atr < MIN_ROOM_TO_OPPOSITE_ATR:
-        return False
 
     return True
 
@@ -692,16 +653,7 @@ def revalidate_pending_location(pair: str, pending: Dict[str, Any]) -> bool:
     if current is None or current.empty:
         return False
 
-    # get_candles normalmente incluye la vela N en formacion como ultima fila.
-    # Para ejecutar en el inicio de N, usamos su apertura/precio disponible;
-    # si no esta disponible, caemos al ultimo cierre.
-    execution_ts = int(pending.get("execution_ts") or 0)
-    current_rows = current[current["from"].astype(int) == execution_ts]
-    if not current_rows.empty:
-        row = current_rows.iloc[-1]
-        current_price = float(row["open"])
-    else:
-        current_price = float(current.iloc[-1]["close"])
+    current_price = float(current.iloc[-1]["close"])
     room = opposite - current_price if signal == "call" else current_price - opposite
     room_atr = room / atr
     valid = room_atr >= MIN_ROOM_TO_OPPOSITE_ATR
@@ -778,40 +730,26 @@ def analysis_message(pair: str, ts: int, result: Dict[str, Any]) -> str:
 # ANALISIS
 # ============================================================
 
-def analyze_closed_setup(
-    pair: str,
-    confirmation_ts: int,
-) -> Optional[Dict[str, Any]]:
-    """Analiza exclusivamente N-1 ya cerrada.
-
-    N-2 = vela de rechazo.
-    N-1 = confirmacion cerrada.
-    La siguiente vela (N) es donde se ejecuta.
-    """
-    if trade_limit_reached() or IQ is None:
+def analyze_live_candle(pair: str, current_ts: int, execute: bool = True) -> Optional[Dict[str, Any]]:
+    if trade_limit_reached():
         return None
 
     df = get_closed_candles(pair)
-    if df is None or df.empty:
+    if df is None or df.empty or "from" not in df.columns:
         return None
 
-    df = (
-        df.sort_values("from")
-        .drop_duplicates("from", keep="last")
-        .reset_index(drop=True)
-    )
-
-    rows = df[df["from"].astype(int) == int(confirmation_ts)]
-    if rows.empty:
+    df = df.sort_values("from").drop_duplicates("from", keep="last").reset_index(drop=True)
+    current_rows = df[df["from"].astype(int) == int(current_ts)]
+    if current_rows.empty:
         return None
 
-    confirmation_row = rows.iloc[-1]
-    history = df[df["from"].astype(int) < int(confirmation_ts)].copy()
+    current_row = current_rows.iloc[-1]
+    history = df[df["from"].astype(int) < int(current_ts)].copy()
     if len(history) < MIN_HISTORY - 1:
         return None
 
     result = analyze_market(
-        candle_1m=confirmation_row.to_dict(),
+        candle_1m=current_row.to_dict(),
         previous_m1=history,
         pair=pair,
     )
@@ -820,128 +758,45 @@ def analyze_closed_setup(
     if not is_force_signal(result, signal):
         return None
 
-    analysis = result.get("analysis") or {}
-    rejection_ts = analysis.get("rejection_timestamp")
-
-    # No repetir la misma vela de rechazo en el mismo par.
-    if REQUIRE_NEW_REJECTION and rejection_ts is not None:
-        try:
-            if LAST_REJECTION_TRADED.get(pair) == int(rejection_ts):
-                return None
-        except (TypeError, ValueError):
-            return None
-
     candidate = {
         "pair": pair,
-        "confirmation_ts": int(confirmation_ts),
-        "execution_ts": int(confirmation_ts + TIMEFRAME),
+        "timestamp": int(current_ts),
         "result": result,
         "signal": signal,
         "score": int(result.get("score", 0) or 0),
-        "analysis": analysis,
-        "rejection_ts": int(rejection_ts) if rejection_ts is not None else None,
     }
-    return candidate
 
-
-def analyze_live_candle(
-    pair: str,
-    current_ts: int,
-    execute: bool = True,
-) -> Optional[Dict[str, Any]]:
-    """Compatibilidad: current_ts es ahora el inicio de N.
-
-    Se analiza confirmation_ts=current_ts-TIMEFRAME, que ya esta cerrada.
-    """
-    confirmation_ts = int(current_ts) - TIMEFRAME
-    candidate = analyze_closed_setup(pair, confirmation_ts)
-    if candidate is None or not execute:
+    if not execute:
         return candidate
 
-    if LAST_TRADE_CANDLE.get(pair) == int(current_ts):
-        return None
-    if cooldown_active(pair):
+    if LAST_TRADE_CANDLE.get(pair) == int(current_ts) or cooldown_active(pair):
         return None
 
-    # Revalidacion final del espacio antes de ejecutar N.
-    pending = {
-        "pair": pair,
-        "signal": candidate["signal"],
-        "analysis": candidate["analysis"],
-        "execution_ts": int(current_ts),
-        "continuity_ts": int(candidate["confirmation_ts"]),
-        "rejection_ts": candidate.get("rejection_ts"),
-        "score": candidate["score"],
-        "entry_type": candidate["result"].get("entry_type"),
-        "reason": candidate["result"].get("reason", ""),
-        "study_candles": [],
-        "created_at": time.time(),
-        "close": (candidate["analysis"].get("confirmation_candle") or {}).get("close"),
-    }
-
-    if not revalidate_pending_location(pair, pending):
-        logger.info("%s | V3 descartada antes de N por espacio insuficiente", pair)
-        return None
-
-    ok, order_id = buy_binary(pair, candidate["signal"])
+    analysis = result.get("analysis") or {}
+    ok, order_id = buy_binary(pair, signal)
     if not ok:
-        logger.warning("%s | orden rechazada | señal=%s", pair, candidate["signal"])
+        logger.warning("%s | orden rechazada | señal=%s", pair, signal)
         return None
 
     LAST_TRADE_TIME[pair] = time.time()
     LAST_TRADE_CANDLE[pair] = int(current_ts)
-    if candidate.get("rejection_ts") is not None:
-        LAST_REJECTION_TRADED[pair] = int(candidate["rejection_ts"])
-
-    result = candidate["result"]
-    analysis = candidate["analysis"]
-    event = {
-        "event": "entry",
-        "pair": pair,
-        "order_id": order_id,
-        "signal": candidate["signal"],
-        "entry_timestamp": int(current_ts),
-        "analysis_timestamp": int(candidate["confirmation_ts"]),
-        "rejection_timestamp": candidate.get("rejection_ts"),
-        "score": candidate["score"],
-        "entry_type": result.get("entry_type"),
-        "structure": analysis.get("structure"),
-        "reason": result.get("reason", ""),
-        "analysis": analysis,
-        "created_at": pending["created_at"],
-        "recorded_at": int(time.time()),
-    }
-    _study_write(event)
 
     telegram_send(
-        "✅ ENTRADA V3 EJECUTADA\n\n"
+        "✅ ENTRADA EJECUTADA: MEJOR SEÑAL ENTRE LOS 50 PARES\n\n"
         f"Par: {pair}\n"
-        f"Dirección: {str(candidate['signal']).upper()}\n"
+        f"Dirección: {signal.upper()}\n"
+        f"Tipo: {result.get('entry_type')}\n"
         f"Score: {candidate['score']}/100\n"
         f"STOCH K: {analysis.get('stochastic_k')}\n"
         f"STOCH D: {analysis.get('stochastic_d')}\n"
         f"Separación: {analysis.get('stochastic_separation')}\n"
-        f"Espacio: {analysis.get('room_atr')} ATR\n"
-        f"Rechazo N-2: {candidate.get('rejection_ts')}\n"
-        f"Confirmación N-1: {candidate['confirmation_ts']}\n"
-        f"Entrada N: {current_ts}\n"
+        f"Vela N-1: {current_ts}\n"
         f"ID: {order_id}\n\n"
         f"⏳ Expiración: {EXPIRATION} minuto(s)\n\n"
         f"{result.get('reason', '')}"
     )
-
-    logger.info(
-        "%s | V3 EJECUTADA | %s | score=%s | N-2=%s | N-1=%s | N=%s | ID=%s",
-        pair,
-        str(candidate["signal"]).upper(),
-        candidate["score"],
-        candidate.get("rejection_ts"),
-        candidate["confirmation_ts"],
-        current_ts,
-        order_id,
-    )
+    logger.info("%s | MEJOR SEÑAL EJECUTADA | %s | score=%s | ts=%s | ID=%s", pair, signal.upper(), candidate["score"], current_ts, order_id)
     candidate["order_id"] = order_id
-    candidate["execution_ts"] = int(current_ts)
     return candidate
 
 # ============================================================
@@ -1006,15 +861,12 @@ def buy_binary(pair: str, signal: str) -> Tuple[bool, Optional[Any]]:
 # MOTOR
 # ============================================================
 
-def process_pair(
-    pair: str,
-    current_ts: Optional[int] = None,
-) -> Optional[Dict[str, Any]]:
+def process_pair(pair: str, current_ts: Optional[int] = None) -> Optional[Dict[str, Any]]:
     if IQ is None:
         return None
     if current_ts is None:
         current_ts = floor_candle_timestamp(get_iq_server_timestamp())
-    return analyze_closed_setup(pair, int(current_ts) - TIMEFRAME)
+    return analyze_live_candle(pair, int(current_ts), execute=False)
 
 
 def analyze_all_pairs() -> None:
@@ -1022,10 +874,7 @@ def analyze_all_pairs() -> None:
         return
 
     refresh_available_pairs()
-
-    # current_ts = inicio de la vela N. Por tanto N-1 ya esta cerrada.
     current_ts = int(floor_candle_timestamp(get_iq_server_timestamp()))
-    confirmation_ts = current_ts - TIMEFRAME
     candidates: list[Dict[str, Any]] = []
 
     for pair in list(PAIRS)[:MAX_PAIRS]:
@@ -1041,38 +890,27 @@ def analyze_all_pairs() -> None:
     if not candidates:
         return
 
-    # Primero score; en empate, mayor separacion y mayor espacio.
-    def rank(item: Dict[str, Any]) -> tuple[float, float, float]:
-        analysis = item.get("analysis") or {}
-        return (
-            float(item.get("score", 0) or 0),
-            float(analysis.get("stochastic_separation", 0) or 0),
-            float(analysis.get("room_atr", 0) or 0),
-        )
+    candidates.sort(
+        key=lambda item: int(item.get("score", 0)),
+        reverse=True,
+    )
 
-    candidates.sort(key=rank, reverse=True)
     best = candidates[0]
     best_pair = str(best["pair"])
 
     logger.info(
-        "MEJOR CANDIDATO V3 | par=%s | score=%s | stoch_sep=%.2f | room=%.2f ATR | señal=%s | candidatos=%s",
+        "MEJOR CANDIDATO | par=%s | score=%s | señal=%s | candidatos=%s",
         best_pair,
         best.get("score", 0),
-        float((best.get("analysis") or {}).get("stochastic_separation", 0) or 0),
-        float((best.get("analysis") or {}).get("room_atr", 0) or 0),
         str(best.get("signal", "")).upper(),
         len(candidates),
     )
-
-    # Ejecutar solo al comienzo de N. Si la vela N ya avanzo, no trasladamos
-    # la señal a otra vela.
-    if floor_candle_timestamp(get_iq_server_timestamp()) != current_ts:
-        return
 
     if LAST_TRADE_CANDLE.get(best_pair) == current_ts or cooldown_active(best_pair):
         return
 
     analyze_live_candle(best_pair, current_ts, execute=True)
+
 
 # ============================================================
 # MAIN
@@ -1082,7 +920,7 @@ def main() -> None:
     global BOT_RUNNING, TOTAL_TRADES
 
     logger.info("========================================")
-    logger.info("BOT MULTIMERCADO | V3 | N-2 RECHAZO + N-1 CERRADO + N")
+    logger.info("BOT MULTIMERCADO | N-2 RECHAZO + N-1 CONFIRMACION + N")
     logger.info("TIMEFRAME=%s | EXPIRATION=%s (SOLO 1 MINUTO)", TIMEFRAME, EXPIRATION)
     logger.info("MAX PAIRS=%s | REFRESH=%ss | AMOUNT=%s | ACCOUNT=%s | MAX_TRADES=%s",
                 MAX_PAIRS, int(PAIR_REFRESH_SECONDS), AMOUNT, ACCOUNT_TYPE, MAX_TOTAL_TRADES)
@@ -1117,9 +955,9 @@ def main() -> None:
 
     telegram_send(
         "🤖 BOT LISTO\n\n"
-        "📊 V3: N-2 rechazo + N-1 cerrado + N ejecución\n"
+        "📊 N-2 rechazo + N-1 confirmación + N ejecución\n"
         "⏱ Solo pares con expiración de 1 minuto\n"
-        "⚡ V3: selección de la mejor señal entre hasta 50 pares\n"
+        "⚡ Selección de la mejor señal entre hasta 50 pares\n"
         f"⏳ Expiración: {EXPIRATION} minuto(s)\n"
         f"🔢 Activos analizados: {len(PAIRS)} (máximo {MAX_PAIRS})\n"
         f"🔄 Actualización de pares: cada {int(PAIR_REFRESH_SECONDS // 60)} minutos\n"
