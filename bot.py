@@ -53,9 +53,9 @@ from strategy import analyze_market
 # FLUJO:
 #
 # 1. Descubre todos los pares OTC Binary disponibles.
-# 2. Cada par se analiza en M1.
+# 2. Cada par se analiza en M5.
 # 3. Se espera el cierre completo de N.
-# 4. strategy.py analiza N + historial anterior.
+# 4. strategy.py analiza N + historial M5 anterior.
 # 5. Si existe señal confirmada:
 #
 #       N   = análisis
@@ -79,7 +79,7 @@ IQ_PASSWORD = os.getenv("IQ_PASSWORD")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-TIMEFRAME = 60
+TIMEFRAME = 300
 EXPIRATION = 5
 
 AMOUNT = float(
@@ -299,7 +299,7 @@ def telegram_command_loop() -> None:
                         "🧠 ESTRUCTURA + RECHAZO\n\n"
                         f"OTC analizados: "
                         f"hasta {MAX_OTC_PAIRS}\n"
-                        "⏱ Análisis: M1\n"
+                        "⏱ Análisis: M5\n"
                         "🎯 Entrada: N+1\n"
                         "⏳ Expiración: "
                         "5 minutos\n"
@@ -332,7 +332,7 @@ def telegram_command_loop() -> None:
                         "Mercado: BINARY OTC\n"
                         "Estrategia: "
                         "ESTRUCTURA + RECHAZO\n"
-                        "Temporalidad: 1 minuto\n"
+                        "Temporalidad: 5 minutos\n"
                         "Entrada: N+1\n"
                         "Expiración: 5 minutos\n"
                         f"Importe: {AMOUNT:g}\n"
@@ -675,7 +675,7 @@ def connect_iq() -> bool:
         "🟢 IQ OPTION CONECTADO\n\n"
         "⚡ MODO SNIPER\n"
         "🧠 ESTRUCTURA + RECHAZO\n"
-        "⏱ M1 cerrada → N+1\n"
+        "⏱ M5 cerrada → N+1\n"
         "⏳ Expiración: 5 minutos"
     )
 
@@ -738,7 +738,7 @@ def ensure_connection() -> bool:
 
 
 # ============================================================
-# STREAM M1
+# STREAM M5
 # ============================================================
 
 def start_realtime_streams() -> None:
@@ -994,8 +994,8 @@ def analyze_closed_candle(
     # ========================================================
 
     result = analyze_market(
-        candle_1m=closed_row.to_dict(),
-        previous_m1=df.iloc[:-1].copy(),
+        candle_5m=closed_row.to_dict(),
+        previous_m5=df.iloc[:-1].copy(),
         pair=pair,
     )
 
@@ -1362,7 +1362,7 @@ def execute_sniper(
         f"Reloj envío IQ: "
         f"{sent_at:.3f}\n"
         f"ID: {order_id}\n\n"
-        "⚡ Entrada inmediata N+1\n"
+        "⚡ Entrada inmediata N+1 (M5)\n"
         "⏳ Expiración: 5 minutos"
     )
 
@@ -1507,7 +1507,7 @@ def main() -> None:
     )
 
     logger.info(
-        "TIMEFRAME M1"
+        "TIMEFRAME M5"
     )
 
     logger.info(
