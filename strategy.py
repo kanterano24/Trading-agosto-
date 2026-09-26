@@ -2,7 +2,7 @@
 strategy.py
 
 ESTRATEGIA ESTRUCTURAL DE RECHAZO + FASE DE IMPULSO
-PARA BINARY OTC M1.
+PARA BINARY OTC M5.
 
 OBJETIVO PRINCIPAL
 ------------------
@@ -61,8 +61,8 @@ PUT:
 API compatible con bot.py:
 
     analyze_market(
-        candle_1m=...,
-        previous_m1=...,
+        candle_5m=...,
+        previous_m5=...,
         pair=...
     )
 
@@ -195,6 +195,12 @@ PUT_RSI_MAX = 62.0
 MIN_STRUCTURE_SCORE = 3
 
 MIN_ENTRY_SCORE = 70
+
+# Filtro de tendencia M5: la operación solo se permite cuando
+# estructura + EMA + pendiente confirman la misma dirección.
+MIN_TREND_CONFIRMATION = 4
+TREND_SLOPE_LOOKBACK = 3
+TREND_CLOSES_LOOKBACK = 5
 
 
 EPS = 1e-12
@@ -385,8 +391,8 @@ def _normalize(
 # ============================================================
 
 def _build_analysis_dataframe(
-    candle_1m: Any = None,
-    previous_m1: Optional[pd.DataFrame] = None,
+    candle_5m: Any = None,
+    previous_m5: Optional[pd.DataFrame] = None,
     df: Optional[pd.DataFrame] = None,
 ) -> pd.DataFrame:
 
@@ -405,32 +411,32 @@ def _build_analysis_dataframe(
     # --------------------------------------------------------
     # API NUEVA DEL BOT:
     #
-    # candle_1m = N
-    # previous_m1 = velas anteriores a N
+    # candle_5m = N
+    # previous_m5 = velas anteriores a N
     # --------------------------------------------------------
 
     history = _normalize(
-        previous_m1
+        previous_m5
         if isinstance(
-            previous_m1,
+            previous_m5,
             pd.DataFrame,
         )
         else pd.DataFrame()
     )
 
     if isinstance(
-        candle_1m,
+        candle_5m,
         pd.Series,
     ):
 
-        current = candle_1m.to_dict()
+        current = candle_5m.to_dict()
 
     elif isinstance(
-        candle_1m,
+        candle_5m,
         dict,
     ):
 
-        current = dict(candle_1m)
+        current = dict(candle_5m)
 
     else:
 
@@ -2024,15 +2030,100 @@ def _body_is_valid(
 
 
 # ============================================================
+# CONFIRMACIÓN DE TENDENCIA M5
+# ============================================================
+
+def _trend_confirmation(
+    data: pd.DataFrame,
+    current: pd.Series,
+    structure: str,
+) -> Dict[str, Any]:
+    """Confirma que la entrada vaya estrictamente a favor de la tendencia."""
+
+    result = {
+        "valid": False,
+        "score": 0,
+        "reasons": [],
+    }
+
+    if structure not in ("bullish", "bearish") or len(data) < 10:
+        return result
+
+    bullish = structure == "bullish"
+    e9 = _safe_float(current.get("ema9"))
+    e21 = _safe_float(current.get("ema21"))
+    e50 = _safe_float(current.get("ema50"))
+    close = _safe_float(current.get("close"))
+
+    checks = []
+
+    # 1) Alineación de medias.
+    ema_ok = (e9 > e21 > e50) if bullish else (e9 < e21 < e50)
+    checks.append(ema_ok)
+    if ema_ok:
+        result["reasons"].append("EMA alineadas")
+
+    # 2) Precio del lado correcto de EMA21.
+    price_ok = close > e21 if bullish else close < e21
+    checks.append(price_ok)
+    if price_ok:
+        result["reasons"].append("precio sobre/bajo EMA21")
+
+    # 3) Pendiente de EMA21.
+    if len(data) > TREND_SLOPE_LOOKBACK:
+        e21_now = _safe_float(data["ema21"].iloc[-1])
+        e21_prev = _safe_float(data["ema21"].iloc[-1 - TREND_SLOPE_LOOKBACK])
+        slope_ok = e21_now > e21_prev if bullish else e21_now < e21_prev
+    else:
+        slope_ok = False
+    checks.append(slope_ok)
+    if slope_ok:
+        result["reasons"].append("pendiente EMA21")
+
+    # 4) Pendiente de EMA50.
+    if len(data) > TREND_SLOPE_LOOKBACK:
+        e50_now = _safe_float(data["ema50"].iloc[-1])
+        e50_prev = _safe_float(data["ema50"].iloc[-1 - TREND_SLOPE_LOOKBACK])
+        slope50_ok = e50_now > e50_prev if bullish else e50_now < e50_prev
+    else:
+        slope50_ok = False
+    checks.append(slope50_ok)
+    if slope50_ok:
+        result["reasons"].append("pendiente EMA50")
+
+    # 5) Mayoría de cierres recientes del lado de EMA21.
+    look = data.tail(TREND_CLOSES_LOOKBACK)
+    if not look.empty:
+        if bullish:
+            above = (look["close"] > look["ema21"]).sum()
+            close_side_ok = above >= max(3, len(look) - 1)
+        else:
+            below = (look["close"] < look["ema21"]).sum()
+            close_side_ok = below >= max(3, len(look) - 1)
+    else:
+        close_side_ok = False
+    checks.append(close_side_ok)
+    if close_side_ok:
+        result["reasons"].append("cierres recientes confirman tendencia")
+
+    result["score"] = int(sum(bool(x) for x in checks))
+    result["valid"] = result["score"] >= MIN_TREND_CONFIRMATION
+    return result
+
+
+# ============================================================
 # API PRINCIPAL
 # ============================================================
 
 def analyze_market(
     df: Optional[pd.DataFrame] = None,
-    candle_1m: Any = None,
-    candles_5s: Optional[pd.DataFrame] = None,
-    previous_m1: Optional[pd.DataFrame] = None,
+    candle_5m: Any = None,
+    previous_m5: Optional[pd.DataFrame] = None,
     pair: Optional[str] = None,
+    # Alias legacy para no romper integraciones anteriores.
+    candle_1m: Any = None,
+    previous_m1: Optional[pd.DataFrame] = None,
+    candles_5s: Optional[pd.DataFrame] = None,
 ) -> Dict[str, Any]:
 
     result = _empty_result()
@@ -2042,8 +2133,8 @@ def analyze_market(
     # ========================================================
 
     clean = _build_analysis_dataframe(
-        candle_1m=candle_1m,
-        previous_m1=previous_m1,
+        candle_5m=(candle_5m if candle_5m is not None else candle_1m),
+        previous_m5=(previous_m5 if previous_m5 is not None else previous_m1),
         df=df,
     )
 
@@ -2293,6 +2384,28 @@ def analyze_market(
             "No hay niveles estructurales"
         )
 
+        return result
+
+    # ========================================================
+    # TENDENCIA OBLIGATORIA M5
+    # ========================================================
+
+    trend = _trend_confirmation(
+        data,
+        current,
+        structure,
+    )
+
+    result["analysis"]["trend_confirmation"] = trend["score"]
+    result["analysis"]["trend_reasons"] = trend["reasons"]
+
+    if not trend["valid"]:
+
+        result["reason"] = (
+            "Entrada bloqueada: tendencia M5 no confirmada "
+            f"({trend['score']}/5)"
+        )
+        result["analysis"]["blocked_reason"] = "tendencia insuficientemente confirmada"
         return result
 
     # ========================================================
@@ -2586,6 +2699,12 @@ def analyze_market(
             10.0,
             s_score
             * 2.0,
+        )
+
+        quality += min(
+            8.0,
+            trend["score"]
+            * 1.6,
         )
 
         quality += min(
@@ -2927,6 +3046,12 @@ def analyze_market(
         )
 
         quality += min(
+            8.0,
+            trend["score"]
+            * 1.6,
+        )
+
+        quality += min(
             10.0,
             recovery_strength
             * 10.0,
@@ -3097,8 +3222,8 @@ if __name__ == "__main__":
 
     print(
         "analyze_market("
-        "candle_1m=..., "
-        "previous_m1=..., "
+        "candle_5m=..., "
+        "previous_m5=..., "
         "pair=..."
         ")"
     )
