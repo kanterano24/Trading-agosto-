@@ -1176,6 +1176,16 @@ def schedule_single_entry(candidate: Dict[str, Any]) -> bool:
     return True
 
 
+def cooldown_active(pair: str) -> bool:
+    """Impide abrir otra operación antes de que transcurran 60 segundos.
+
+    Se usa con la clave global para garantizar como máximo una operación
+    por minuto, independientemente del par que haya generado la señal.
+    """
+    last_trade = float(LAST_TRADE_TIME.get(pair, 0.0))
+    return (time.time() - last_trade) < TRADE_COOLDOWN
+
+
 def buy_binary(
     pair: str,
     signal: str,
