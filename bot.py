@@ -1061,6 +1061,38 @@ def analyze_closed_candle(
         <= block_end_ts
     ].copy()
 
+    # Extraemos exactamente las 5 M1 que forman el bloque N.
+    # Estas cinco velas son la información microestructural que
+    # confirma la dirección antes de operar el siguiente bloque.
+    block_m1 = df_m1[
+        (df_m1["from"].astype(int) >= expected_closed_ts)
+        & (df_m1["from"].astype(int) <= block_end_ts)
+    ].copy()
+
+    block_m1 = (
+        block_m1
+        .drop_duplicates("from", keep="last")
+        .sort_values("from")
+        .reset_index(drop=True)
+    )
+
+    expected_m1_ts = [
+        int(expected_closed_ts) + (i * M1_TIMEFRAME)
+        for i in range(5)
+    ]
+
+    if (
+        len(block_m1) != 5
+        or block_m1["from"].astype(int).tolist() != expected_m1_ts
+    ):
+        logger.debug(
+            "%s | bloque M5 descartado: faltan M1 | esperado=%s | real=%s",
+            pair,
+            expected_m1_ts,
+            block_m1["from"].astype(int).tolist(),
+        )
+        return False
+
     m5 = aggregate_m1_to_m5(df_m1)
 
     if m5.empty:
@@ -1110,6 +1142,7 @@ def analyze_closed_candle(
     result = analyze_market(
         candle_5m=closed_row.to_dict(),
         previous_m5=df.iloc[:-1].copy(),
+        m1_block=block_m1,
         pair=pair,
     )
 
@@ -1174,7 +1207,8 @@ def analyze_closed_candle(
         f"5 velas M1: {expected_closed_ts} → {block_end_ts}\n"
         f"Dirección: {side}\n"
         f"Score: {score}/100\n"
-        f"Calidad: {result.get('entry_quality', 0)}/100\n\n"
+        f"Calidad: {result.get('entry_quality', 0)}/100\n"
+        f"Confirmación 5 M1: {analysis.get('m1_block_confirmation', {}).get('score', 0)}/5\n\n"
         f"Estructura: {analysis.get('structure')}\n"
         f"Fase impulso: {analysis.get('impulse_phase')}\n"
         f"Zona: {analysis.get('zone')}\n\n"
