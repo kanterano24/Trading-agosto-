@@ -1111,6 +1111,7 @@ def analyze_closed_candle(
             "high": values["high"],
             "low": values["low"],
             "close": values["close"],
+            "atr": float(result.get("atr", analysis.get("atr", 0.0)) or 0.0),
             "reason": result.get("reason", ""),
             "analysis": analysis,
             "created_at": time.time(),
@@ -1214,15 +1215,78 @@ def get_current_m1_open(
     return None
 
 
+def get_recent_m1_atr(
+    pair: str,
+    current_ts: int,
+    period: int = 14,
+) -> float:
+    """Calcula ATR M1 reciente directamente desde IQ como respaldo."""
+    if IQ is None:
+        return 0.0
+
+    try:
+        candles = IQ.get_candles(
+            pair,
+            M1_TIMEFRAME,
+            period + 2,
+            int(current_ts),
+        )
+        if not candles:
+            return 0.0
+
+        rows = []
+        for c in candles:
+            try:
+                ts = int(float(c.get("from", -1)))
+                if ts >= int(current_ts):
+                    continue
+                rows.append({
+                    "high": float(c.get("max", c.get("high"))),
+                    "low": float(c.get("min", c.get("low"))),
+                    "close": float(c.get("close")),
+                })
+            except (TypeError, ValueError):
+                continue
+
+        if len(rows) < period:
+            return 0.0
+
+        df = pd.DataFrame(rows).tail(period + 1)
+        prev = df["close"].shift(1)
+        tr = pd.concat([
+            df["high"] - df["low"],
+            (df["high"] - prev).abs(),
+            (df["low"] - prev).abs(),
+        ], axis=1).max(axis=1)
+        value = float(tr.tail(period).mean())
+        return value if math.isfinite(value) and value > 0 else 0.0
+    except Exception as exc:
+        logger.debug("%s | ATR M1 respaldo: %s", pair, exc)
+        return 0.0
+
+
 def validate_entry_location(
     candidate: Dict[str, Any],
     current_ts: int,
 ) -> Tuple[bool, str]:
     """Evita ejecutar si N+1 abre demasiado lejos del punto validado en N."""
     analysis = candidate.get("analysis", {}) or {}
-    atr = float(analysis.get("atr", 0.0))
+
+    # El ATR debe venir de la misma vela N que genero la senal.
+    # Usamos tambien el valor guardado directamente en candidate como
+    # respaldo para evitar descartar una entrada valida por un campo
+    # ausente en una version anterior de strategy.py.
+    try:
+        atr = float(candidate.get("atr", analysis.get("atr", 0.0)))
+    except (TypeError, ValueError):
+        atr = 0.0
+
+    if not math.isfinite(atr) or atr <= 0:
+        # Ultimo respaldo: calcula ATR M1 reciente desde IQ.
+        atr = get_recent_m1_atr(candidate["pair"], current_ts)
+
     if atr <= 0:
-        return False, "ATR de entrada invalido"
+        return False, "no se pudo calcular ATR M1 de entrada"
 
     current_open = get_current_m1_open(candidate["pair"], current_ts)
     if current_open is None:
