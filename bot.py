@@ -80,8 +80,8 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 M1_TIMEFRAME = 60
-TIMEFRAME = 300
-EXPIRATION = 5
+TIMEFRAME = 60
+EXPIRATION = 1
 
 AMOUNT = float(
     os.getenv(
@@ -297,13 +297,13 @@ def telegram_command_loop() -> None:
                     telegram_send(
                         "🟢 BOT ACTIVADO\n\n"
                         "⚡ SNIPER OTC\n"
-                        "🧠 ESTRUCTURA + RECHAZO\n\n"
+                        "🧠 MOMENTUM M1\n\n"
                         f"OTC analizados: "
                         f"hasta {MAX_OTC_PAIRS}\n"
                         "⏱ Análisis: M1\n"
                         "🎯 Entrada: N+1\n"
                         "⏳ Expiración: "
-                        "5 minutos\n"
+                        "1 minuto\n"
                         f"💵 Importe: "
                         f"{AMOUNT:g}"
                     )
@@ -331,11 +331,10 @@ def telegram_command_loop() -> None:
                         f"Estado: {status}\n"
                         "Modo: SNIPER\n"
                         "Mercado: BINARY OTC\n"
-                        "Estrategia: "
-                        "ESTRUCTURA + RECHAZO\n"
+                        "Estrategia: MOMENTUM M1\n"
                         "Temporalidad: 1 minuto\n"
                         "Entrada: N+1\n"
-                        "Expiración: 5 minutos\n"
+                        "Expiración: 1 minuto\n"
                         f"Importe: {AMOUNT:g}\n"
                         f"Pares OTC: "
                         f"{len(PAIRS)}"
@@ -675,8 +674,8 @@ def connect_iq() -> bool:
     telegram_send(
         "🟢 IQ OPTION CONECTADO\n\n"
         "⚡ MODO SNIPER\n"
-        "🧠 ESTRUCTURA + RECHAZO\n"
-        "⏱ M1 cerrada → N+1\n"
+        "🧠 MOMENTUM\n"
+        "⏱ M5 momentum N → N+1\n"
         "⏳ Expiración: 5 minutos"
     )
 
@@ -1041,110 +1040,36 @@ def analyze_closed_candle(
     pair: str,
     expected_closed_ts: int,
 ) -> bool:
+    """Analiza exclusivamente la vela M1 N ya cerrada.
 
-    # expected_closed_ts es ahora el inicio del bloque M5 que acaba de cerrar.
-    # Ese bloque debe contener exactamente las 5 M1 anteriores.
-    df_m1 = get_closed_candles(pair)
-
-    if df_m1 is None or df_m1.empty:
+    La decisión usa N y el historial anterior. La operación, si existe,
+    se programa para N+1, exactamente al comienzo del siguiente minuto.
+    """
+    df = get_closed_candles(pair)
+    if df is None or df.empty:
         return False
 
-    # Solo usamos M1 que ya pertenecen al bloque cerrado N o anteriores.
-    block_end_ts = (
-        expected_closed_ts
-        + TIMEFRAME
-        - M1_TIMEFRAME
-    )
-
-    df_m1 = df_m1[
-        df_m1["from"].astype(int)
-        <= block_end_ts
-    ].copy()
-
-    # Extraemos exactamente las 5 M1 que forman el bloque N.
-    # Estas cinco velas son la información microestructural que
-    # confirma la dirección antes de operar el siguiente bloque.
-    block_m1 = df_m1[
-        (df_m1["from"].astype(int) >= expected_closed_ts)
-        & (df_m1["from"].astype(int) <= block_end_ts)
-    ].copy()
-
-    block_m1 = (
-        block_m1
-        .drop_duplicates("from", keep="last")
-        .sort_values("from")
-        .reset_index(drop=True)
-    )
-
-    expected_m1_ts = [
-        int(expected_closed_ts) + (i * M1_TIMEFRAME)
-        for i in range(5)
-    ]
-
-    if (
-        len(block_m1) != 5
-        or block_m1["from"].astype(int).tolist() != expected_m1_ts
-    ):
-        logger.debug(
-            "%s | bloque M5 descartado: faltan M1 | esperado=%s | real=%s",
-            pair,
-            expected_m1_ts,
-            block_m1["from"].astype(int).tolist(),
-        )
-        return False
-
-    m5 = aggregate_m1_to_m5(df_m1)
-
-    if m5.empty:
-        return False
-
-    closed_row = get_row_by_ts(
-        m5,
-        expected_closed_ts,
-    )
-
-    if closed_row is None:
-        return False
-
-    # Necesitamos historial suficiente en bloques M5 para la estrategia.
-    df = m5[
-        m5["from"].astype(int)
-        <= expected_closed_ts
-    ].copy()
-
-    df = (
-        df
-        .sort_values("from")
-        .reset_index(drop=True)
-    )
-
+    df = df[df["from"].astype(int) <= int(expected_closed_ts)].copy()
+    df = df.sort_values("from").drop_duplicates("from", keep="last").reset_index(drop=True)
     if len(df) < 35:
-        logger.debug(
-            "%s | bloques M5 insuficientes: %s/35",
-            pair,
-            len(df),
-        )
+        logger.debug("%s | historial M1 insuficiente: %s/35", pair, len(df))
+        return False
+
+    closed = df[df["from"].astype(int) == int(expected_closed_ts)]
+    if closed.empty:
+        return False
+
+    current = closed.iloc[-1]
+    previous = df[df["from"].astype(int) < int(expected_closed_ts)].copy()
+    if len(previous) < 34:
         return False
 
     current_state = LIVE_STATE.get(pair)
-
-    if (
-        current_state is not None
-        and int(current_state.get("analyzed_ts", -1))
-        == expected_closed_ts
-    ):
+    if current_state is not None and int(current_state.get("analyzed_ts", -1)) == int(expected_closed_ts):
         return True
 
-    # ========================================================
-    # ANÁLISIS: N = bloque M5 formado por 5 velas M1
-    # ========================================================
-
-    result = analyze_market(
-        candle_5m=closed_row.to_dict(),
-        previous_m5=df.iloc[:-1].copy(),
-        m1_block=block_m1,
-        pair=pair,
-    )
+    analysis_df = pd.concat([previous, pd.DataFrame([current])], ignore_index=True)
+    result = analyze_market(df=analysis_df, pair=pair, candle_1m=current.to_dict(), previous_m1=previous)
 
     with STATE_LOCK:
         LIVE_STATE[pair] = {
@@ -1158,23 +1083,15 @@ def analyze_closed_candle(
 
     signal = result.get("signal")
     score = int(result.get("score", 0))
-
     logger.info(
-        "%s | BLOQUE M5 N CERRADO | 5xM1=%s..%s | signal=%s | score=%s | %s",
-        pair,
-        expected_closed_ts,
-        block_end_ts,
-        signal,
-        score,
-        result.get("reason", ""),
+        "%s | M1 N CERRADA | signal=%s | score=%s | %s",
+        pair, expected_closed_ts, signal, score, result.get("reason", "")
     )
 
     if signal not in ("call", "put"):
         return True
 
-    values = candle_values(closed_row)
-
-    # La señal de N solo se ejecuta al comenzar el siguiente bloque M5.
+    values = candle_values(current)
     execution_ts = int(expected_closed_ts + TIMEFRAME)
 
     with STATE_LOCK:
@@ -1192,284 +1109,20 @@ def analyze_closed_candle(
             "created_at": time.time(),
         }
 
-    side = (
-        "CALL 🟢"
-        if signal == "call"
-        else "PUT 🔴"
-    )
-
-    analysis = result.get("analysis", {})
-
+    side = "CALL 🟢" if signal == "call" else "PUT 🔴"
     telegram_send(
-        "🎯 SEÑAL M5 CONFIRMADA\n\n"
+        "🎯 SEÑAL MOMENTUM M1\n\n"
         f"Par: {pair}\n"
-        f"Bloque analizado N: {expected_closed_ts}\n"
-        f"5 velas M1: {expected_closed_ts} → {block_end_ts}\n"
+        f"Vela M1 N: {expected_closed_ts}\n"
         f"Dirección: {side}\n"
-        f"Score: {score}/100\n"
-        f"Calidad: {result.get('entry_quality', 0)}/100\n"
-        f"Confirmación 5 M1: {analysis.get('m1_block_confirmation', {}).get('score', 0)}/5\n\n"
-        f"Estructura: {analysis.get('structure')}\n"
-        f"Fase impulso: {analysis.get('impulse_phase')}\n"
-        f"Zona: {analysis.get('zone')}\n\n"
-        f"Apertura M5: {values['open']}\n"
-        f"Máximo M5: {values['high']}\n"
-        f"Mínimo M5: {values['low']}\n"
-        f"Cierre M5: {values['close']}\n\n"
-        f"Siguiente bloque N+1: {execution_ts}\n"
-        "🚫 El bloque N no se opera.\n"
-        "⚡ Entrada al comenzar N+1.\n"
-        "⏳ Expiración: 5 minutos\n\n"
+        f"Score: {score}/100\n\n"
+        f"Cierre N: {values['close']}\n"
+        f"Entrada N+1: {execution_ts}\n"
+        "⚡ Entrada al comenzar N+1\n"
+        "⏳ Expiración: 1 minuto\n\n"
         f"{result.get('reason', '')}"
     )
-
     return True
-
-
-# ============================================================
-# COOLDOWN
-# ============================================================
-
-def cooldown_active(
-    pair: str,
-) -> bool:
-
-    return (
-        time.time()
-        - LAST_TRADE_TIME.get(
-            pair,
-            0.0,
-        )
-        < TRADE_COOLDOWN
-    )
-
-
-# ============================================================
-# COMPRA
-# ============================================================
-
-def buy_binary(
-    pair: str,
-    signal: str,
-) -> Tuple[bool, Optional[Any]]:
-
-    if (
-        IQ is None
-        or signal not in (
-            "call",
-            "put",
-        )
-    ):
-        return False, None
-
-    try:
-
-        result = IQ.buy(
-            AMOUNT,
-            pair,
-            signal,
-            EXPIRATION,
-        )
-
-        if isinstance(
-            result,
-            tuple,
-        ):
-
-            return (
-                bool(result[0]),
-                (
-                    result[1]
-                    if len(result) > 1
-                    else None
-                ),
-            )
-
-        if result not in (
-            None,
-            False,
-            "error",
-            -1,
-        ):
-            return True, result
-
-        return False, result
-
-    except Exception as exc:
-
-        logger.error(
-            "%s | buy error: %s",
-            pair,
-            exc,
-        )
-
-        return False, None
-
-
-# ============================================================
-# SNIPER
-# ============================================================
-
-def execute_sniper(
-    pair: str,
-    pending: Dict[str, Any],
-) -> bool:
-
-    execution_ts = int(
-        pending["execution_ts"]
-    )
-
-    signal = str(
-        pending["signal"]
-    )
-
-    now = (
-        get_iq_server_timestamp()
-    )
-
-    current_ts = (
-        floor_candle_timestamp(
-            now
-        )
-    )
-
-    if current_ts < execution_ts:
-        return False
-
-    if current_ts > execution_ts:
-
-        with STATE_LOCK:
-
-            PENDING_ENTRY.pop(
-                pair,
-                None,
-            )
-
-        telegram_send(
-            "⚠️ SNIPER DESCARTADO\n\n"
-            f"Par: {pair}\n"
-            f"N+1 objetivo: "
-            f"{execution_ts}\n"
-            f"Minuto actual: "
-            f"{current_ts}\n\n"
-            "La señal no se "
-            "trasladó a otra vela."
-        )
-
-        return False
-
-    if (
-        LAST_TRADE_CANDLE.get(
-            pair
-        )
-        == execution_ts
-    ):
-        return False
-
-    if cooldown_active(pair):
-        return False
-
-    now2 = (
-        get_iq_server_timestamp()
-    )
-
-    if (
-        floor_candle_timestamp(
-            now2
-        )
-        != execution_ts
-    ):
-        return False
-
-    telegram_send(
-        "⚡ SNIPER EJECUTANDO\n\n"
-        f"Par: {pair}\n"
-        f"Dirección: "
-        f"{signal.upper()}\n\n"
-        f"N cierre: "
-        f"{pending['close']}\n"
-        f"N+1 timestamp: "
-        f"{execution_ts}\n"
-        f"Reloj IQ: "
-        f"{now2:.3f}\n\n"
-        "⏳ Expiración: 5 minutos"
-    )
-
-    sent_at = (
-        get_iq_server_timestamp()
-    )
-
-    ok, order_id = buy_binary(
-        pair,
-        signal,
-    )
-
-    if not ok:
-
-        with STATE_LOCK:
-
-            PENDING_ENTRY.pop(
-                pair,
-                None,
-            )
-
-        telegram_send(
-            "❌ ORDEN BINARY "
-            "RECHAZADA\n\n"
-            f"Par: {pair}\n"
-            f"Dirección: "
-            f"{signal.upper()}\n"
-            f"N+1: {execution_ts}\n"
-            f"Reloj IQ: "
-            f"{sent_at:.3f}\n\n"
-            "La señal no se "
-            "trasladará a otra vela."
-        )
-
-        return False
-
-    LAST_TRADE_TIME[pair] = (
-        time.time()
-    )
-
-    LAST_TRADE_CANDLE[pair] = (
-        execution_ts
-    )
-
-    with STATE_LOCK:
-
-        PENDING_ENTRY.pop(
-            pair,
-            None,
-        )
-
-    telegram_send(
-        "✅ SNIPER EJECUTADO\n\n"
-        f"Par: {pair}\n"
-        f"Dirección: "
-        f"{signal.upper()}\n"
-        f"N cierre: "
-        f"{pending['close']}\n"
-        f"N+1: {execution_ts}\n"
-        f"Reloj envío IQ: "
-        f"{sent_at:.3f}\n"
-        f"ID: {order_id}\n\n"
-        "⚡ Entrada inmediata N+1\n"
-        "⏳ Expiración: 5 minutos"
-    )
-
-    logger.info(
-        "%s | SNIPER EJECUTADO | "
-        "%s | N=%s | N+1=%s | ID=%s",
-        pair,
-        signal.upper(),
-        pending["continuity_ts"],
-        execution_ts,
-        order_id,
-    )
-
-    return True
-
 
 # ============================================================
 # MOTOR POR PAR
@@ -1590,16 +1243,16 @@ def main() -> None:
     )
 
     logger.info(
-        "ESTRUCTURA + RECHAZO"
+        "MOMENTUM"
     )
 
     logger.info(
         "MODO SNIPER - "
-        "EXPIRACION 5 MINUTOS"
+        "EXPIRACION 1 MINUTO"
     )
 
     logger.info(
-        "ANALISIS: 5 M1 -> 1 BLOQUE M5 | EXPIRACION 5 MIN"
+        "ANALISIS: MOMENTUM EN M1 | EXPIRACION 1 MINUTO"
     )
 
     logger.info(
@@ -1665,7 +1318,7 @@ def main() -> None:
 
     telegram_send(
         "🤖 BOT LISTO\n\n"
-        "🧠 ESTRUCTURA + RECHAZO\n"
+        "🧠 MOMENTUM\n"
         "🔎 Analiza todos los "
         "OTC BINARY disponibles.\n\n"
         "📌 La señal se decide "
