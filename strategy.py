@@ -22,20 +22,19 @@ import pandas as pd
 
 MIN_BARS = 60
 EMA_FAST, EMA_MID, EMA_SLOW = 9, 21, 50
-ATR_PERIOD = 14
 BREAKOUT_LOOKBACK = 6
 PRE_BREAKOUT_CANDLES = 3
 
 MIN_BODY_RATIO = 0.60
-MIN_BODY_ATR = 0.45
-MIN_RANGE_ATR = 0.80
+MIN_BODY_VS_PREV = 1.15
+MIN_RANGE_VS_PREV = 1.10
 MIN_CLOSE_POSITION = 0.78
 
-MAX_BREAKOUT_EXTENSION_ATR = 0.80
-MAX_EMA_DISTANCE_ATR = 1.25
-MAX_COMPRESSION_RANGE_ATR = 1.80
-MAX_COMPRESSION_AVG_RANGE_ATR = 0.75
-MAX_PRE_BREAKOUT_DISTANCE_ATR = 0.35
+MAX_BREAKOUT_EXTENSION_RANGE = 0.80
+MAX_EMA_DISTANCE_RANGE = 1.25
+MAX_COMPRESSION_RANGE_RATIO = 1.80
+MAX_COMPRESSION_AVG_RATIO = 0.75
+MAX_PRE_BREAKOUT_DISTANCE_RANGE = 0.35
 MAX_CONSECUTIVE = 3
 
 MIN_MOMENTUM_SCORE = 82
@@ -55,7 +54,6 @@ def _empty_result(reason: str = "sin señal") -> Dict[str, Any]:
         "entry_type": "momentum_breakout",
         "entry_quality": 0,
         "rsi": 50.0,
-        "atr": 0.0,
         "candle_timestamp": None,
         "analysis": {},
     }
@@ -83,17 +81,6 @@ def _normalize(df: pd.DataFrame) -> pd.DataFrame:
 
 def _ema(series: pd.Series, period: int) -> pd.Series:
     return series.ewm(span=period, adjust=False).mean()
-
-
-def _atr(df: pd.DataFrame, period: int = ATR_PERIOD) -> float:
-    prev = df["close"].shift(1)
-    tr = pd.concat([
-        df["high"] - df["low"],
-        (df["high"] - prev).abs(),
-        (df["low"] - prev).abs(),
-    ], axis=1).max(axis=1)
-    value = tr.rolling(period).mean().iloc[-1]
-    return float(value) if pd.notna(value) and value > 0 else 0.0
 
 
 def _rsi(series: pd.Series, period: int = 14) -> float:
@@ -167,6 +154,13 @@ def analyze_market(
     pair: Optional[str] = None,
     **kwargs: Any,
 ) -> Dict[str, Any]:
+    """Analiza exclusivamente momentum M1, sin indicador ATR.
+
+    La normalizacion de fuerza usa la propia estructura de las velas:
+    - cuerpo/rango de la vela actual,
+    - rango de N frente a la mediana de rangos previos,
+    - distancias expresadas como fraccion del rango de N.
+    """
     data = _build_data(df, candle_1m, previous_m1, candle_5m, previous_m5)
     result = _empty_result()
 
@@ -176,14 +170,17 @@ def analyze_market(
 
     current = data.iloc[-1]
     hist = data.iloc[:-1].copy()
-    atr = _atr(data)
-    if atr <= 0:
-        result["reason"] = "ATR M1 inválido"
-        return result
-
     c = _metrics(current)
     direction = "bullish" if c["close"] > c["open"] else "bearish" if c["close"] < c["open"] else "range"
     rsi = _rsi(data["close"])
+
+    # Referencia de volatilidad simple: mediana del rango de las velas previas.
+    # Usa solo la mediana del rango de velas previas como referencia.
+    prior_ranges = (hist["high"] - hist["low"]).tail(14)
+    median_prev_range = float(prior_ranges.median()) if not prior_ranges.empty else 0.0
+    if median_prev_range <= 0:
+        result["reason"] = "Rango historico invalido"
+        return result
 
     ema9s = _ema(data["close"], EMA_FAST)
     ema21s = _ema(data["close"], EMA_MID)
@@ -202,22 +199,22 @@ def analyze_market(
     pre = hist.tail(PRE_BREAKOUT_CANDLES)
     pre_range = float(pre["high"].max() - pre["low"].min())
     pre_avg_range = float((pre["high"] - pre["low"]).mean())
-    compression_range_atr = pre_range / atr
-    compression_avg_atr = pre_avg_range / atr
+    compression_range_ratio = pre_range / median_prev_range
+    compression_avg_ratio = pre_avg_range / median_prev_range
     compression_ok = (
-        compression_range_atr <= MAX_COMPRESSION_RANGE_ATR
-        and compression_avg_atr <= MAX_COMPRESSION_AVG_RANGE_ATR
+        compression_range_ratio <= MAX_COMPRESSION_RANGE_RATIO
+        and compression_avg_ratio <= MAX_COMPRESSION_AVG_RATIO
     )
 
     previous_close = float(hist.iloc[-1]["close"])
     if direction == "bullish":
-        pre_breakout_distance = max(0.0, breakout_high - previous_close) / atr
+        pre_breakout_distance = max(0.0, breakout_high - previous_close) / max(c["range"], EPS)
     else:
-        pre_breakout_distance = max(0.0, previous_close - breakout_low) / atr
-    pre_breakout_test = pre_breakout_distance <= MAX_PRE_BREAKOUT_DISTANCE_ATR
+        pre_breakout_distance = max(0.0, previous_close - breakout_low) / max(c["range"], EPS)
+    pre_breakout_test = pre_breakout_distance <= MAX_PRE_BREAKOUT_DISTANCE_RANGE
 
-    body_atr = c["body"] / atr
-    range_atr = c["range"] / atr
+    body_vs_prev = c["body"] / median_prev_range
+    range_vs_prev = c["range"] / median_prev_range
     close_strength = c["close_position"] if direction == "bullish" else 1.0 - c["close_position"]
 
     if direction == "bullish":
@@ -229,8 +226,8 @@ def analyze_market(
             and ema50 >= ema50_prev
             and c["close"] > ema21
         )
-        breakout_extension = max(0.0, c["close"] - breakout_high) / atr
-        ema_distance = max(0.0, c["close"] - ema21) / atr
+        breakout_extension = max(0.0, c["close"] - breakout_high) / max(c["range"], EPS)
+        ema_distance = max(0.0, c["close"] - ema21) / max(c["range"], EPS)
     elif direction == "bearish":
         breakout = c["close"] < breakout_low
         trend = (
@@ -240,8 +237,8 @@ def analyze_market(
             and ema50 <= ema50_prev
             and c["close"] < ema21
         )
-        breakout_extension = max(0.0, breakout_low - c["close"]) / atr
-        ema_distance = max(0.0, ema21 - c["close"]) / atr
+        breakout_extension = max(0.0, breakout_low - c["close"]) / max(c["range"], EPS)
+        ema_distance = max(0.0, ema21 - c["close"]) / max(c["range"], EPS)
     else:
         breakout = False
         trend = False
@@ -254,19 +251,18 @@ def analyze_market(
         breakout,
         trend,
         c["body_ratio"] >= MIN_BODY_RATIO,
-        body_atr >= MIN_BODY_ATR,
-        range_atr >= MIN_RANGE_ATR,
+        body_vs_prev >= MIN_BODY_VS_PREV,
+        range_vs_prev >= MIN_RANGE_VS_PREV,
         close_strength >= MIN_CLOSE_POSITION,
         compression_ok,
         pre_breakout_test,
-        breakout_extension <= MAX_BREAKOUT_EXTENSION_ATR,
-        ema_distance <= MAX_EMA_DISTANCE_ATR,
+        breakout_extension <= MAX_BREAKOUT_EXTENSION_RANGE,
+        ema_distance <= MAX_EMA_DISTANCE_RANGE,
         consecutive <= MAX_CONSECUTIVE,
     ]
     names = [
-        "ruptura", "tendencia", "cuerpo", "cuerpo_ATR", "rango_ATR",
-        "cierre", "compresion", "test_previo", "extension",
-        "ubicacion_EMA21", "agotamiento",
+        "ruptura", "tendencia", "cuerpo", "cuerpo_vs_rango_previo", "rango_vs_rango_previo",
+        "cierre", "compresion", "test_previo", "extension", "ubicacion_EMA21", "agotamiento",
     ]
     weights = [18, 10, 8, 8, 7, 8, 10, 10, 8, 6, 7]
     score = int(sum(w for ok, w in zip(checks, weights) if ok))
@@ -275,13 +271,13 @@ def analyze_market(
     if breakout: reasons.append("ruptura M1 confirmada")
     if trend: reasons.append("tendencia EMA 9/21/50 confirmada")
     if c["body_ratio"] >= MIN_BODY_RATIO: reasons.append("cuerpo de desplazamiento fuerte")
-    if body_atr >= MIN_BODY_ATR: reasons.append("cuerpo suficiente frente al ATR")
-    if range_atr >= MIN_RANGE_ATR: reasons.append("rango suficiente frente al ATR")
+    if body_vs_prev >= MIN_BODY_VS_PREV: reasons.append("cuerpo mayor que el rango previo de referencia")
+    if range_vs_prev >= MIN_RANGE_VS_PREV: reasons.append("rango de desplazamiento mayor que el habitual")
     if close_strength >= MIN_CLOSE_POSITION: reasons.append("cierre fuerte en el extremo")
     if compression_ok: reasons.append("compresion previa")
     if pre_breakout_test: reasons.append("precio previo cerca de la ruptura")
-    if breakout_extension <= MAX_BREAKOUT_EXTENSION_ATR: reasons.append("entrada no demasiado extendida")
-    if ema_distance <= MAX_EMA_DISTANCE_ATR: reasons.append("distancia a EMA21 controlada")
+    if breakout_extension <= MAX_BREAKOUT_EXTENSION_RANGE: reasons.append("entrada no demasiado extendida")
+    if ema_distance <= MAX_EMA_DISTANCE_RANGE: reasons.append("distancia a EMA21 controlada")
     if consecutive <= MAX_CONSECUTIVE: reasons.append("sin agotamiento por velas consecutivas")
 
     ts = int(current["from"]) if "from" in data.columns and pd.notna(current["from"]) else None
@@ -289,23 +285,23 @@ def analyze_market(
         "direction": direction,
         "trend": direction if trend else "range",
         "rsi": rsi,
-        "atr": atr,
         "candle_timestamp": ts,
         "analysis": {
             "timeframe": "M1",
             "momentum": True,
-            "atr": atr,
             "breakout_high": breakout_high,
             "breakout_low": breakout_low,
-            "breakout_extension_atr": breakout_extension,
-            "ema_distance_atr": ema_distance,
+            "breakout_extension_range": breakout_extension,
+            "ema_distance_range": ema_distance,
             "body_ratio": c["body_ratio"],
-            "body_atr": body_atr,
-            "range_atr": range_atr,
+            "body_vs_prev_range": body_vs_prev,
+            "range_vs_prev_range": range_vs_prev,
             "close_strength": close_strength,
-            "compression_range_atr": compression_range_atr,
-            "compression_avg_range_atr": compression_avg_atr,
-            "pre_breakout_distance_atr": pre_breakout_distance,
+            "median_prev_range": median_prev_range,
+            "compression_range_ratio": compression_range_ratio,
+            "compression_avg_range_ratio": compression_avg_ratio,
+            "pre_breakout_distance_range": pre_breakout_distance,
+            "candle_range": c["range"],
             "consecutive": consecutive,
             "ema9": ema9,
             "ema21": ema21,
@@ -339,7 +335,6 @@ def analyze_market(
         "reason": f"{signal.upper()} | MOMENTUM M1 CONFIRMADO | " + "; ".join(reasons),
     })
     return result
-
 
 def get_signal(df: pd.DataFrame):
     return analyze_market(df=df).get("signal")
