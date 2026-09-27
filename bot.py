@@ -86,7 +86,7 @@ EXPIRATION = 1
 AMOUNT = float(
     os.getenv(
         "AMOUNT",
-        "120",
+        "3000",
     )
 )
 
@@ -1111,7 +1111,6 @@ def analyze_closed_candle(
             "high": values["high"],
             "low": values["low"],
             "close": values["close"],
-            "atr": float(result.get("atr", analysis.get("atr", 0.0)) or 0.0),
             "reason": result.get("reason", ""),
             "analysis": analysis,
             "created_at": time.time(),
@@ -1145,11 +1144,11 @@ def _candidate_strength(candidate: Dict[str, Any]) -> tuple:
     analysis = candidate.get("analysis", {}) or {}
     return (
         int(candidate.get("score", 0)),
-        -float(analysis.get("breakout_extension_atr", 999.0)),
-        -float(analysis.get("pre_breakout_distance_atr", 999.0)),
-        -float(analysis.get("ema_distance_atr", 999.0)),
-        float(analysis.get("body_atr", 0.0)),
-        float(analysis.get("range_atr", 0.0)),
+        -float(analysis.get("breakout_extension_range", 999.0)),
+        -float(analysis.get("pre_breakout_distance_range", 999.0)),
+        -float(analysis.get("ema_distance_range", 999.0)),
+        float(analysis.get("body_vs_prev_range", 0.0)),
+        float(analysis.get("range_vs_prev_range", 0.0)),
         float(analysis.get("body_ratio", 0.0)),
     )
 
@@ -1215,102 +1214,46 @@ def get_current_m1_open(
     return None
 
 
-def get_recent_m1_atr(
-    pair: str,
-    current_ts: int,
-    period: int = 14,
-) -> float:
-    """Calcula ATR M1 reciente directamente desde IQ como respaldo."""
-    if IQ is None:
-        return 0.0
-
-    try:
-        candles = IQ.get_candles(
-            pair,
-            M1_TIMEFRAME,
-            period + 2,
-            int(current_ts),
-        )
-        if not candles:
-            return 0.0
-
-        rows = []
-        for c in candles:
-            try:
-                ts = int(float(c.get("from", -1)))
-                if ts >= int(current_ts):
-                    continue
-                rows.append({
-                    "high": float(c.get("max", c.get("high"))),
-                    "low": float(c.get("min", c.get("low"))),
-                    "close": float(c.get("close")),
-                })
-            except (TypeError, ValueError):
-                continue
-
-        if len(rows) < period:
-            return 0.0
-
-        df = pd.DataFrame(rows).tail(period + 1)
-        prev = df["close"].shift(1)
-        tr = pd.concat([
-            df["high"] - df["low"],
-            (df["high"] - prev).abs(),
-            (df["low"] - prev).abs(),
-        ], axis=1).max(axis=1)
-        value = float(tr.tail(period).mean())
-        return value if math.isfinite(value) and value > 0 else 0.0
-    except Exception as exc:
-        logger.debug("%s | ATR M1 respaldo: %s", pair, exc)
-        return 0.0
-
-
 def validate_entry_location(
     candidate: Dict[str, Any],
     current_ts: int,
 ) -> Tuple[bool, str]:
-    """Evita ejecutar si N+1 abre demasiado lejos del punto validado en N."""
+    """Valida la ubicacion de N+1 usando solo el rango de la vela N.
+
+    La referencia es el rango real de la
+    propia vela de desplazamiento N.
+    """
     analysis = candidate.get("analysis", {}) or {}
-
-    # El ATR debe venir de la misma vela N que genero la senal.
-    # Usamos tambien el valor guardado directamente en candidate como
-    # respaldo para evitar descartar una entrada valida por un campo
-    # ausente en una version anterior de strategy.py.
-    try:
-        atr = float(candidate.get("atr", analysis.get("atr", 0.0)))
-    except (TypeError, ValueError):
-        atr = 0.0
-
-    if not math.isfinite(atr) or atr <= 0:
-        # Ultimo respaldo: calcula ATR M1 reciente desde IQ.
-        atr = get_recent_m1_atr(candidate["pair"], current_ts)
-
-    if atr <= 0:
-        return False, "no se pudo calcular ATR M1 de entrada"
-
     current_open = get_current_m1_open(candidate["pair"], current_ts)
     if current_open is None:
         return False, "no se pudo validar la apertura de N+1"
 
-    n_close = float(candidate.get("close", 0.0))
-    gap_atr = abs(current_open - n_close) / atr
-    if gap_atr > 0.35:
-        return False, f"N+1 demasiado alejada de N ({gap_atr:.2f} ATR)"
+    n_close = float(candidate.get("close", 0.0) or 0.0)
+    n_range = float(analysis.get("candle_range", 0.0) or 0.0)
+    if not math.isfinite(n_range) or n_range <= 0:
+        n_range = abs(float(candidate.get("high", 0.0)) - float(candidate.get("low", 0.0)))
+    if not math.isfinite(n_range) or n_range <= 0:
+        return False, "rango de la vela N invalido"
+
+    gap = abs(current_open - n_close)
+    max_gap = 0.35 * n_range
+    if gap > max_gap:
+        return False, f"N+1 demasiado alejada de N (gap={gap:.8f})"
 
     signal = str(candidate.get("signal"))
     if signal == "call":
         level = float(analysis.get("breakout_high", n_close))
-        if current_open < level - 0.20 * atr:
+        if current_open < level - 0.20 * n_range:
             return False, "CALL: N+1 perdio demasiado la ruptura"
     else:
         level = float(analysis.get("breakout_low", n_close))
-        if current_open > level + 0.20 * atr:
+        if current_open > level + 0.20 * n_range:
             return False, "PUT: N+1 perdio demasiado la ruptura"
 
     candidate["entry_open_n1"] = current_open
-    candidate["entry_gap_atr"] = gap_atr
-    return True, f"entrada validada | gap={gap_atr:.2f} ATR"
-
+    candidate["entry_gap"] = gap
+    candidate["entry_gap_ratio"] = gap / n_range
+    return True, f"entrada validada | gap_ratio={gap / n_range:.2f}"
 
 def buy_binary(
     pair: str,
