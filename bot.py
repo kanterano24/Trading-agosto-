@@ -1129,7 +1129,7 @@ def analyze_closed_candle(
         }
 
     logger.info(
-        "%s | M1 N CERRADA | signal=%s | score=%s | %s",
+        "%s | M1 N CERRADA | N=%s | signal=%s | score=%s | %s",
         pair,
         expected_closed_ts,
         signal,
