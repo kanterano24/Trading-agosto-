@@ -2,7 +2,7 @@
 strategy.py
 
 ESTRATEGIA ESTRUCTURAL DE RECHAZO + FASE DE IMPULSO
-PARA BINARY OTC M5.
+PARA BINARY OTC M5 CONSTRUIDO DESDE BLOQUES DE 5 VELAS M1.
 
 OBJETIVO PRINCIPAL
 ------------------
@@ -69,6 +69,12 @@ API compatible con bot.py:
 También acepta:
 
     analyze_market(df)
+
+Cada vela M5 que recibe esta estrategia debe representar exactamente
+un bloque cerrado de 5 velas M1.
+
+El bloque N se analiza completo y la decisión queda destinada al
+siguiente bloque N+1 de 5 minutos.
 
 No ejecuta operaciones.
 No decide expiración.
@@ -201,6 +207,10 @@ MIN_ENTRY_SCORE = 70
 MIN_TREND_CONFIRMATION = 4
 TREND_SLOPE_LOOKBACK = 3
 TREND_CLOSES_LOOKBACK = 5
+
+# Confirmación interna: las 5 M1 que forman cada bloque M5 deben
+# apoyar la misma dirección que la tendencia antes de permitir N+1.
+MIN_M1_BLOCK_CONFIRMATION = 3
 
 
 EPS = 1e-12
@@ -2111,6 +2121,137 @@ def _trend_confirmation(
     return result
 
 
+
+# ============================================================
+# CONFIRMACIÓN DEL BLOQUE DE 5 VELAS M1
+# ============================================================
+
+def _m1_block_confirmation(
+    m1_block: Optional[pd.DataFrame],
+    direction: str,
+) -> Dict[str, Any]:
+    """
+    Evalúa exclusivamente las 5 M1 que acaban de cerrar.
+
+    No mira ninguna vela del siguiente bloque.
+    La finalidad es confirmar que el movimiento interno del bloque
+    acompaña la tendencia M5 antes de programar N+1.
+    """
+
+    result = {
+        "valid": False,
+        "score": 0,
+        "bullish_count": 0,
+        "bearish_count": 0,
+        "neutral_count": 0,
+        "net_direction": "neutral",
+        "last_direction": "neutral",
+        "net_move_atr": 0.0,
+        "reasons": [],
+    }
+
+    if (
+        m1_block is None
+        or not isinstance(m1_block, pd.DataFrame)
+    ):
+        result["reasons"].append("sin bloque M1")
+        return result
+
+    block = _normalize(m1_block)
+
+    if len(block) != 5:
+        result["reasons"].append(
+            f"bloque M1 incompleto {len(block)}/5"
+        )
+        return result
+
+    directions = []
+    for _, row in block.iterrows():
+        directions.append(candle_direction(row))
+
+    bullish = directions.count("bull")
+    bearish = directions.count("bear")
+    neutral = directions.count("neutral")
+
+    result["bullish_count"] = bullish
+    result["bearish_count"] = bearish
+    result["neutral_count"] = neutral
+    result["last_direction"] = directions[-1]
+
+    first_open = _safe_float(block.iloc[0]["open"])
+    last_close = _safe_float(block.iloc[-1]["close"])
+    block_high = _safe_float(block["high"].max())
+    block_low = _safe_float(block["low"].min())
+    block_range = max(block_high - block_low, EPS)
+    net_move = last_close - first_open
+
+    # ATR aproximado usando el rango del bloque. La normalización es
+    # deliberadamente conservadora: solo sirve como confirmación interna.
+    net_move_atr = net_move / block_range
+    result["net_move_atr"] = float(net_move_atr)
+
+    if net_move > EPS:
+        result["net_direction"] = "bullish"
+    elif net_move < -EPS:
+        result["net_direction"] = "bearish"
+
+    if direction == "bullish":
+        aligned = bullish
+        opposite = bearish
+        net_ok = net_move > 0
+        last_ok = directions[-1] in ("bull", "neutral")
+        if aligned >= MIN_M1_BLOCK_CONFIRMATION:
+            result["reasons"].append(
+                f"{aligned}/5 M1 alcistas"
+            )
+        if net_ok:
+            result["reasons"].append("cierre del bloque sobre su apertura")
+        if last_ok:
+            result["reasons"].append("última M1 no contradice la tendencia")
+    elif direction == "bearish":
+        aligned = bearish
+        opposite = bullish
+        net_ok = net_move < 0
+        last_ok = directions[-1] in ("bear", "neutral")
+        if aligned >= MIN_M1_BLOCK_CONFIRMATION:
+            result["reasons"].append(
+                f"{aligned}/5 M1 bajistas"
+            )
+        if net_ok:
+            result["reasons"].append("cierre del bloque bajo su apertura")
+        if last_ok:
+            result["reasons"].append("última M1 no contradice la tendencia")
+    else:
+        return result
+
+    # La última M1 es la confirmación final del bloque. Esto evita
+    # entrar N+1 cuando las primeras M1 fueron favorables pero el bloque
+    # terminó girando en contra.
+    strong_opposite = opposite >= 4
+    result["score"] = int(
+        min(
+            5,
+            aligned
+            + (1 if net_ok else 0)
+            + (1 if last_ok else 0),
+        )
+    )
+
+    result["valid"] = (
+        aligned >= MIN_M1_BLOCK_CONFIRMATION
+        and net_ok
+        and last_ok
+        and not strong_opposite
+    )
+
+    if strong_opposite:
+        result["reasons"].append("bloque M1 contradice fuertemente la tendencia")
+
+    if not result["valid"]:
+        result["reasons"].append("confirmación M1 insuficiente")
+
+    return result
+
 # ============================================================
 # API PRINCIPAL
 # ============================================================
@@ -2124,6 +2265,7 @@ def analyze_market(
     candle_1m: Any = None,
     previous_m1: Optional[pd.DataFrame] = None,
     candles_5s: Optional[pd.DataFrame] = None,
+    m1_block: Optional[pd.DataFrame] = None,
 ) -> Dict[str, Any]:
 
     result = _empty_result()
@@ -2406,6 +2548,25 @@ def analyze_market(
             f"({trend['score']}/5)"
         )
         result["analysis"]["blocked_reason"] = "tendencia insuficientemente confirmada"
+        return result
+
+    # ========================================================
+    # CONFIRMACIÓN DE LAS 5 M1 DEL BLOQUE N
+    # ========================================================
+
+    m1_confirmation = _m1_block_confirmation(
+        m1_block,
+        structure,
+    )
+
+    result["analysis"]["m1_block_confirmation"] = m1_confirmation
+
+    if not m1_confirmation["valid"]:
+        result["reason"] = (
+            "Entrada bloqueada: las 5 M1 no confirman "
+            f"la tendencia M5 ({m1_confirmation['score']}/5)"
+        )
+        result["analysis"]["blocked_reason"] = "confirmacion_m1_insuficiente"
         return result
 
     # ========================================================
@@ -2704,6 +2865,12 @@ def analyze_market(
         quality += min(
             8.0,
             trend["score"]
+            * 1.6,
+        )
+
+        quality += min(
+            8.0,
+            m1_confirmation["score"]
             * 1.6,
         )
 
@@ -3048,6 +3215,12 @@ def analyze_market(
         quality += min(
             8.0,
             trend["score"]
+            * 1.6,
+        )
+
+        quality += min(
+            8.0,
+            m1_confirmation["score"]
             * 1.6,
         )
 
