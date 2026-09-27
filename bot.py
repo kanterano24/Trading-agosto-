@@ -47,7 +47,7 @@ from strategy import analyze_market
 
 
 # ============================================================
-# BOT OTC - ESTRUCTURA / RECHAZO / SNIPER
+# BOT OTC - MOMENTUM M1 / SNIPER
 # ============================================================
 #
 # FLUJO:
@@ -62,7 +62,7 @@ from strategy import analyze_market
 #       N+1 = ejecución
 #
 # 6. N+1 NO participa en la decisión.
-# 7. Expiración = 5 minutos.
+# 7. Expiración = 1 minuto.
 #
 # La estrategia NO ejecuta operaciones.
 # Este archivo es responsable de la ejecución.
@@ -675,8 +675,8 @@ def connect_iq() -> bool:
         "🟢 IQ OPTION CONECTADO\n\n"
         "⚡ MODO SNIPER\n"
         "🧠 MOMENTUM\n"
-        "⏱ M5 momentum N → N+1\n"
-        "⏳ Expiración: 5 minutos"
+        "⏱ Momentum M1: N → N+1\n"
+        "⏳ Expiración: 1 minuto"
     )
 
     return True
@@ -1039,192 +1039,292 @@ def analysis_message(
 def analyze_closed_candle(
     pair: str,
     expected_closed_ts: int,
-) -> bool:
-    """Analiza exclusivamente la vela M1 N ya cerrada.
+) -> Optional[Dict[str, Any]]:
+    """Analiza una única vela M1 cerrada y NO programa la entrada.
 
-    La decisión usa N y el historial anterior. La operación, si existe,
-    se programa para N+1, exactamente al comienzo del siguiente minuto.
+    Devuelve el candidato encontrado para que analyze_all_pairs pueda
+    comparar todos los pares y elegir como máximo UNA señal para N+1.
     """
     df = get_closed_candles(pair)
     if df is None or df.empty:
-        return False
+        return None
 
     df = df[df["from"].astype(int) <= int(expected_closed_ts)].copy()
-    df = df.sort_values("from").drop_duplicates("from", keep="last").reset_index(drop=True)
+    df = (
+        df.sort_values("from")
+        .drop_duplicates("from", keep="last")
+        .reset_index(drop=True)
+    )
+
     if len(df) < 35:
-        logger.debug("%s | historial M1 insuficiente: %s/35", pair, len(df))
-        return False
+        logger.debug(
+            "%s | historial M1 insuficiente: %s/35",
+            pair,
+            len(df),
+        )
+        return None
 
     closed = df[df["from"].astype(int) == int(expected_closed_ts)]
     if closed.empty:
-        return False
+        return None
 
     current = closed.iloc[-1]
     previous = df[df["from"].astype(int) < int(expected_closed_ts)].copy()
     if len(previous) < 34:
-        return False
+        return None
 
     current_state = LIVE_STATE.get(pair)
-    if current_state is not None and int(current_state.get("analyzed_ts", -1)) == int(expected_closed_ts):
-        return True
+    if (
+        current_state is not None
+        and int(current_state.get("analyzed_ts", -1)) == int(expected_closed_ts)
+    ):
+        # Ya fue analizada esta vela N. No volver a programar
+        # la misma señal para el minuto siguiente.
+        return None
 
-    analysis_df = pd.concat([previous, pd.DataFrame([current])], ignore_index=True)
-    result = analyze_market(df=analysis_df, pair=pair, candle_1m=current.to_dict(), previous_m1=previous)
-
-    with STATE_LOCK:
-        LIVE_STATE[pair] = {
-            "analyzed_ts": int(expected_closed_ts),
-            "signal": result.get("signal"),
-            "score": int(result.get("score", 0)),
-            "reason": result.get("reason", ""),
-            "analysis": result.get("analysis", {}),
-            "created_at": time.time(),
-        }
-
-    signal = result.get("signal")
-    score = int(result.get("score", 0))
-    logger.info(
-        "%s | M1 N CERRADA | signal=%s | score=%s | %s",
-        pair, expected_closed_ts, signal, score, result.get("reason", "")
+    analysis_df = pd.concat(
+        [previous, pd.DataFrame([current])],
+        ignore_index=True,
     )
 
-    if signal not in ("call", "put"):
-        return True
+    result = analyze_market(
+        df=analysis_df,
+        pair=pair,
+        candle_1m=current.to_dict(),
+        previous_m1=previous,
+    )
 
-    values = candle_values(current)
-    execution_ts = int(expected_closed_ts + TIMEFRAME)
+    score = int(result.get("score", 0))
+    signal = result.get("signal")
+    analysis = result.get("analysis", {}) or {}
 
-    with STATE_LOCK:
-        PENDING_ENTRY[pair] = {
+    candidate = None
+    if signal in ("call", "put"):
+        values = candle_values(current)
+        candidate = {
+            "pair": pair,
             "signal": signal,
             "score": score,
             "continuity_ts": int(expected_closed_ts),
-            "execution_ts": execution_ts,
+            "execution_ts": int(expected_closed_ts + TIMEFRAME),
             "open": values["open"],
             "high": values["high"],
             "low": values["low"],
             "close": values["close"],
             "reason": result.get("reason", ""),
-            "analysis": result.get("analysis", {}),
+            "analysis": analysis,
             "created_at": time.time(),
         }
 
-    side = "CALL 🟢" if signal == "call" else "PUT 🔴"
+    with STATE_LOCK:
+        LIVE_STATE[pair] = {
+            "analyzed_ts": int(expected_closed_ts),
+            "signal": signal,
+            "score": score,
+            "reason": result.get("reason", ""),
+            "analysis": analysis,
+            "candidate": candidate,
+            "created_at": time.time(),
+        }
+
+    logger.info(
+        "%s | M1 N CERRADA | signal=%s | score=%s | %s",
+        pair,
+        expected_closed_ts,
+        signal,
+        score,
+        result.get("reason", ""),
+    )
+
+    return candidate
+
+
+def _candidate_strength(candidate: Dict[str, Any]) -> tuple:
+    """Desempate para elegir una sola señal por minuto."""
+    analysis = candidate.get("analysis", {}) or {}
+    return (
+        int(candidate.get("score", 0)),
+        float(analysis.get("body_atr", 0.0)),
+        float(analysis.get("range_atr", 0.0)),
+        float(analysis.get("body_ratio", 0.0)),
+    )
+
+
+def schedule_single_entry(candidate: Dict[str, Any]) -> bool:
+    """Programa como máximo una entrada para el siguiente minuto."""
+    execution_ts = int(candidate["execution_ts"])
+
+    with STATE_LOCK:
+        if PENDING_ENTRY:
+            return False
+
+        PENDING_ENTRY["__global__"] = candidate.copy()
+
+    side = "CALL 🟢" if candidate["signal"] == "call" else "PUT 🔴"
     telegram_send(
         "🎯 SEÑAL MOMENTUM M1\n\n"
-        f"Par: {pair}\n"
-        f"Vela M1 N: {expected_closed_ts}\n"
+        f"Par: {candidate['pair']}\n"
+        f"Vela M1 N: {candidate['continuity_ts']}\n"
         f"Dirección: {side}\n"
-        f"Score: {score}/100\n\n"
-        f"Cierre N: {values['close']}\n"
+        f"Score: {candidate['score']}/100\n\n"
+        f"Cierre N: {candidate['close']}\n"
         f"Entrada N+1: {execution_ts}\n"
         "⚡ Entrada al comenzar N+1\n"
         "⏳ Expiración: 1 minuto\n\n"
-        f"{result.get('reason', '')}"
+        f"{candidate['reason']}"
     )
     return True
 
-# ============================================================
-# MOTOR POR PAR
-# ============================================================
 
-def process_pair(
+def buy_binary(
     pair: str,
-) -> None:
+    signal: str,
+) -> Tuple[bool, Optional[Any]]:
+    if IQ is None or signal not in ("call", "put"):
+        return False, None
 
+    try:
+        result = IQ.buy(
+            AMOUNT,
+            pair,
+            signal,
+            EXPIRATION,
+        )
+
+        if isinstance(result, tuple):
+            return bool(result[0]), result[1] if len(result) > 1 else None
+
+        if result not in (None, False, "error", -1):
+            return True, result
+
+        return False, result
+
+    except Exception as exc:
+        logger.error("%s | buy error: %s", pair, exc)
+        return False, None
+
+
+def execute_sniper(
+    candidate: Dict[str, Any],
+    current_ts: int,
+) -> bool:
+    """Ejecuta únicamente la entrada global correspondiente a este minuto."""
+    pair = str(candidate["pair"])
+    signal = str(candidate["signal"])
+    execution_ts = int(candidate["execution_ts"])
+
+    if current_ts != execution_ts:
+        return False
+
+    if LAST_TRADE_CANDLE.get("__global__") == execution_ts:
+        return False
+
+    if cooldown_active("__global__"):
+        return False
+
+    telegram_send(
+        "⚡ EJECUTANDO MOMENTUM M1\n\n"
+        f"Par: {pair}\n"
+        f"Dirección: {signal.upper()}\n"
+        f"N: {candidate['continuity_ts']}\n"
+        f"N+1: {execution_ts}\n"
+        "⏳ Expiración: 1 minuto"
+    )
+
+    ok, order_id = buy_binary(pair, signal)
+
+    if not ok:
+        telegram_send(
+            "❌ ORDEN BINARY RECHAZADA\n\n"
+            f"Par: {pair}\n"
+            f"Dirección: {signal.upper()}\n"
+            f"N+1: {execution_ts}\n"
+            "La señal no se trasladará a otra vela."
+        )
+        return False
+
+    now = time.time()
+    LAST_TRADE_TIME["__global__"] = now
+    LAST_TRADE_CANDLE["__global__"] = execution_ts
+
+    telegram_send(
+        "✅ MOMENTUM M1 EJECUTADO\n\n"
+        f"Par: {pair}\n"
+        f"Dirección: {signal.upper()}\n"
+        f"N: {candidate['continuity_ts']}\n"
+        f"N+1: {execution_ts}\n"
+        f"ID: {order_id}\n\n"
+        "⚡ Entrada al comenzar N+1\n"
+        "⏳ Expiración: 1 minuto"
+    )
+
+    logger.info(
+        "%s | MOMENTUM M1 EJECUTADO | %s | N=%s | N+1=%s | ID=%s",
+        pair,
+        signal.upper(),
+        candidate["continuity_ts"],
+        execution_ts,
+        order_id,
+    )
+    return True
+
+
+def process_pair(pair: str) -> None:
+    """Compatibilidad: analiza un par, pero no ejecuta por separado."""
     if IQ is None:
         return
 
-    server_now = (
-        get_iq_server_timestamp()
-    )
+    current_ts = floor_candle_timestamp(get_iq_server_timestamp())
+    closed_ts = current_ts - TIMEFRAME
+    analyze_closed_candle(pair, closed_ts)
 
-    current_ts = (
-        floor_candle_timestamp(
-            server_now
-        )
-    )
-
-    closed_ts = (
-        current_ts
-        - TIMEFRAME
-    )
-
-    state = LIVE_STATE.get(
-        pair
-    )
-
-    analyzed_ts = -1
-
-    if state is not None:
-
-        try:
-
-            analyzed_ts = int(
-                state.get(
-                    "analyzed_ts",
-                    -1,
-                )
-            )
-
-        except Exception:
-
-            analyzed_ts = -1
-
-    if analyzed_ts != closed_ts:
-
-        analyze_closed_candle(
-            pair,
-            closed_ts,
-        )
-
-    pending = PENDING_ENTRY.get(
-        pair
-    )
-
-    if pending is None:
-        return
-
-    if int(
-        pending["execution_ts"]
-    ) != current_ts:
-        return
-
-    execute_sniper(
-        pair,
-        pending,
-    )
-
-
-# ============================================================
-# ANALIZAR TODOS LOS OTC
-# ============================================================
 
 def analyze_all_pairs() -> None:
-
+    """Analiza todos los OTC y permite solo UNA entrada por minuto."""
     if not BOT_RUNNING:
         return
 
     refresh_binary_otc_pairs()
+    current_ts = floor_candle_timestamp(get_iq_server_timestamp())
+
+    # 1) Primero ejecuta la señal que fue preparada para este minuto.
+    pending = PENDING_ENTRY.get("__global__")
+    if pending is not None:
+        if int(pending.get("execution_ts", -1)) == current_ts:
+            execute_sniper(pending, current_ts)
+            with STATE_LOCK:
+                PENDING_ENTRY.pop("__global__", None)
+        elif int(pending.get("execution_ts", -1)) < current_ts:
+            with STATE_LOCK:
+                PENDING_ENTRY.pop("__global__", None)
+
+    # 2) Si ya hubo una operación en este minuto, no se prepara otra.
+    if LAST_TRADE_CANDLE.get("__global__") == current_ts:
+        return
+
+    # 3) Si hay una entrada pendiente para el futuro, no se reemplaza.
+    if PENDING_ENTRY:
+        return
+
+    closed_ts = current_ts - TIMEFRAME
+    candidates = []
 
     for pair in list(PAIRS):
-
         if not BOT_RUNNING:
             return
-
         try:
-
-            process_pair(
-                pair
-            )
-
+            candidate = analyze_closed_candle(pair, closed_ts)
+            if candidate is not None:
+                candidates.append(candidate)
         except Exception:
+            logger.exception("Error analizando %s", pair)
 
-            logger.exception(
-                "Error procesando %s",
-                pair,
-            )
+    if not candidates:
+        return
 
+    # Una sola señal: mayor score; si empatan, mayor fuerza de momentum.
+    best = max(candidates, key=_candidate_strength)
+    schedule_single_entry(best)
 
 # ============================================================
 # MAIN
@@ -1327,7 +1427,7 @@ def main() -> None:
         "⚡ N+1 se ejecuta en "
         "modo SNIPER.\n"
         "⏳ Expiración: "
-        "5 minutos.\n\n"
+        "1 minuto.\n\n"
         "Usa /start para activar."
     )
 
