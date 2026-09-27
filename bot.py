@@ -1144,6 +1144,9 @@ def _candidate_strength(candidate: Dict[str, Any]) -> tuple:
     analysis = candidate.get("analysis", {}) or {}
     return (
         int(candidate.get("score", 0)),
+        -float(analysis.get("breakout_extension_atr", 999.0)),
+        -float(analysis.get("pre_breakout_distance_atr", 999.0)),
+        -float(analysis.get("ema_distance_atr", 999.0)),
         float(analysis.get("body_atr", 0.0)),
         float(analysis.get("range_atr", 0.0)),
         float(analysis.get("body_ratio", 0.0)),
@@ -1184,6 +1187,65 @@ def cooldown_active(pair: str) -> bool:
     """
     last_trade = float(LAST_TRADE_TIME.get(pair, 0.0))
     return (time.time() - last_trade) < TRADE_COOLDOWN
+
+
+def get_current_m1_open(
+    pair: str,
+    current_ts: int,
+) -> Optional[float]:
+    """Obtiene la apertura real de N+1 para validar el lugar de entrada."""
+    if IQ is None:
+        return None
+    try:
+        candles = IQ.get_candles(
+            pair,
+            M1_TIMEFRAME,
+            2,
+            get_iq_server_timestamp(),
+        )
+        if not candles:
+            return None
+        for candle in candles:
+            if int(float(candle.get("from", -1))) == int(current_ts):
+                value = float(candle.get("open"))
+                return value if math.isfinite(value) else None
+    except Exception as exc:
+        logger.debug("%s | precio N+1: %s", pair, exc)
+    return None
+
+
+def validate_entry_location(
+    candidate: Dict[str, Any],
+    current_ts: int,
+) -> Tuple[bool, str]:
+    """Evita ejecutar si N+1 abre demasiado lejos del punto validado en N."""
+    analysis = candidate.get("analysis", {}) or {}
+    atr = float(analysis.get("atr", 0.0))
+    if atr <= 0:
+        return False, "ATR de entrada invalido"
+
+    current_open = get_current_m1_open(candidate["pair"], current_ts)
+    if current_open is None:
+        return False, "no se pudo validar la apertura de N+1"
+
+    n_close = float(candidate.get("close", 0.0))
+    gap_atr = abs(current_open - n_close) / atr
+    if gap_atr > 0.35:
+        return False, f"N+1 demasiado alejada de N ({gap_atr:.2f} ATR)"
+
+    signal = str(candidate.get("signal"))
+    if signal == "call":
+        level = float(analysis.get("breakout_high", n_close))
+        if current_open < level - 0.20 * atr:
+            return False, "CALL: N+1 perdio demasiado la ruptura"
+    else:
+        level = float(analysis.get("breakout_low", n_close))
+        if current_open > level + 0.20 * atr:
+            return False, "PUT: N+1 perdio demasiado la ruptura"
+
+    candidate["entry_open_n1"] = current_open
+    candidate["entry_gap_atr"] = gap_atr
+    return True, f"entrada validada | gap={gap_atr:.2f} ATR"
 
 
 def buy_binary(
@@ -1230,6 +1292,18 @@ def execute_sniper(
         return False
 
     if cooldown_active("__global__"):
+        return False
+
+    valid_entry, entry_reason = validate_entry_location(candidate, current_ts)
+    if not valid_entry:
+        logger.info("%s | ENTRADA DESCARTADA | %s", pair, entry_reason)
+        telegram_send(
+            "⛔ ENTRADA MOMENTUM DESCARTADA\n\n"
+            f"Par: {pair}\n"
+            f"Dirección: {signal.upper()}\n"
+            f"N+1: {execution_ts}\n"
+            f"Motivo: {entry_reason}"
+        )
         return False
 
     telegram_send(
