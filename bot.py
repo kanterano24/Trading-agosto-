@@ -62,7 +62,7 @@ from strategy import analyze_market
 #       N+1 = ejecución
 #
 # 6. N+1 NO participa en la decisión.
-# 7. Expiración = 1 minuto.
+# 7. Expiración = 2 minutos.
 #
 # La estrategia NO ejecuta operaciones.
 # Este archivo es responsable de la ejecución.
@@ -86,7 +86,7 @@ EXPIRATION = 2
 AMOUNT = float(
     os.getenv(
         "AMOUNT",
-        "650",
+        "500",
     )
 )
 
@@ -97,15 +97,18 @@ CANDLE_COUNT = int(
     )
 )
 
-MAX_OTC_PAIRS = int(
-    os.getenv(
-        "MAX_OTC_PAIRS",
-        "9",
-    )
-)
+# Analizar exactamente 9 pares OTC.
+MAX_OTC_PAIRS = 6
 
 PAIR_REFRESH_SECONDS = 60.0
-SNIPER_POLL = 00.30
+SNIPER_POLL = 0.20
+
+# Entrada mejorada: no compra automáticamente al abrir N+1.
+# Espera un retesteo de la zona S/R y una confirmación de rechazo dentro de N+1.
+ENTRY_POLL = 0.20
+ENTRY_RETEST_TOL_ATR = 0.20
+ENTRY_INVALIDATION_ATR = 0.25
+ENTRY_MAX_WAIT_SECONDS = 55.0
 TRADE_COOLDOWN = 60.0
 
 
@@ -334,7 +337,7 @@ def telegram_command_loop() -> None:
                         "Estrategia: MOMENTUM M1\n"
                         "Temporalidad: 1 minuto\n"
                         "Entrada: N+1\n"
-                        "Expiración: 1 minuto\n"
+                        "Expiración: 2 minutos\n"
                         f"Importe: {AMOUNT:g}\n"
                         f"Pares OTC: "
                         f"{len(PAIRS)}"
@@ -676,7 +679,7 @@ def connect_iq() -> bool:
         "⚡ MODO SNIPER\n"
         "🧠 MOMENTUM\n"
         "⏱ Momentum M1: N → N+1\n"
-        "⏳ Expiración: 1 minuto"
+        "⏳ Expiración: 2 minutos"
     )
 
     return True
@@ -1154,14 +1157,16 @@ def _candidate_strength(candidate: Dict[str, Any]) -> tuple:
 
 
 def schedule_single_entry(candidate: Dict[str, Any]) -> bool:
-    """Programa como máximo una entrada para el siguiente minuto."""
+    """Programa una ventana de entrada para N+1; no compra al abrir la vela."""
     execution_ts = int(candidate["execution_ts"])
 
     with STATE_LOCK:
         if PENDING_ENTRY:
             return False
 
-        PENDING_ENTRY["__global__"] = candidate.copy()
+        pending = candidate.copy()
+        pending["entry_watch_started"] = time.time()
+        PENDING_ENTRY["__global__"] = pending
 
     side = "CALL 🟢" if candidate["signal"] == "call" else "PUT 🔴"
     telegram_send(
@@ -1171,9 +1176,10 @@ def schedule_single_entry(candidate: Dict[str, Any]) -> bool:
         f"Dirección: {side}\n"
         f"Score: {candidate['score']}/100\n\n"
         f"Cierre N: {candidate['close']}\n"
-        f"Entrada N+1: {execution_ts}\n"
-        "⚡ Entrada al comenzar N+1\n"
-        "⏳ Expiración: 1 minuto\n\n"
+        f"Ventana de entrada N+1: {execution_ts}\n"
+        "🎯 NO entra al abrir N+1\n"
+        "↩️ Espera RETEST de S/R + rechazo\n"
+        "⏳ Expiración: 2 minutos\n\n"
         f"{candidate['reason']}"
     )
     return True
@@ -1217,31 +1223,177 @@ def buy_binary(
         return False, None
 
 
+def _get_live_candle(pair: str) -> Optional[pd.Series]:
+    """Obtiene la vela M1 que se está formando para el retesteo."""
+    if IQ is None:
+        return None
+
+    try:
+        now = int(get_iq_server_timestamp())
+        candles = IQ.get_candles(
+            pair,
+            M1_TIMEFRAME,
+            1,
+            now,
+        )
+
+        if not candles:
+            return None
+
+        row = candles[-1]
+        values = {
+            "from": int(row.get("from", 0)),
+            "open": float(row.get("open")),
+            "high": float(row.get("max", row.get("high"))),
+            "low": float(row.get("min", row.get("low"))),
+            "close": float(row.get("close")),
+        }
+
+        if values["high"] < values["low"]:
+            return None
+
+        return pd.Series(values)
+
+    except Exception as exc:
+        logger.debug("%s | live candle: %s", pair, exc)
+        return None
+
+
+def _entry_retest_trigger(
+    candidate: Dict[str, Any],
+    candle: pd.Series,
+) -> Tuple[bool, str]:
+    """
+    Entrada de precisión en N+1.
+
+    CALL:
+      - el precio vuelve a soporte desde arriba;
+      - toca la zona;
+      - rechaza hacia arriba y cierra sobre el nivel.
+
+    PUT:
+      - el precio vuelve a resistencia desde abajo;
+      - toca la zona;
+      - rechaza hacia abajo y cierra bajo el nivel.
+
+    Se evita perseguir el precio cuando N+1 continúa desplazándose sin retesteo.
+    """
+    analysis = candidate.get("analysis", {}) or {}
+    atr = float(analysis.get("atr", 0.0))
+    if atr <= 0:
+        return False, "ATR inválido"
+
+    signal = str(candidate["signal"])
+    zone_key = "support_zone" if signal == "call" else "resistance_zone"
+    zone = analysis.get(zone_key)
+
+    if zone is None:
+        return False, "sin zona S/R"
+
+    zone = float(zone)
+    tol = ENTRY_RETEST_TOL_ATR * atr
+
+    o = float(candle["open"])
+    h = float(candle["high"])
+    l = float(candle["low"])
+    c = float(candle["close"])
+
+    if signal == "call":
+        touched = l <= zone + tol
+        rejected_up = c > zone and c >= o
+
+        if touched and rejected_up:
+            return True, "retest de soporte + confirmación alcista"
+
+        if c < zone - ENTRY_INVALIDATION_ATR * atr:
+            return False, "soporte invalidado"
+
+    else:
+        touched = h >= zone - tol
+        rejected_down = c < zone and c <= o
+
+        if touched and rejected_down:
+            return True, "retest de resistencia + confirmación bajista"
+
+        if c > zone + ENTRY_INVALIDATION_ATR * atr:
+            return False, "resistencia invalidada"
+
+    return False, "esperando retesteo"
+
+
 def execute_sniper(
     candidate: Dict[str, Any],
     current_ts: int,
-) -> bool:
-    """Ejecuta únicamente la entrada global correspondiente a este minuto."""
+) -> Tuple[bool, bool]:
+    """
+    Retorna:
+      (ejecutada, finalizar_espera)
+
+    La operación ya no se dispara automáticamente al comenzar N+1.
+    Primero exige retesteo + rechazo de la zona S/R dentro de N+1.
+    """
     pair = str(candidate["pair"])
     signal = str(candidate["signal"])
     execution_ts = int(candidate["execution_ts"])
 
     if current_ts != execution_ts:
-        return False
+        return False, True
 
     if LAST_TRADE_CANDLE.get("__global__") == execution_ts:
-        return False
+        return False, True
 
     if cooldown_active("__global__"):
-        return False
+        return False, True
+
+    created_at = float(candidate.get("entry_watch_started", time.time()))
+
+    if time.time() - created_at > ENTRY_MAX_WAIT_SECONDS:
+        telegram_send(
+            "⏭️ ENTRADA CANCELADA\n\n"
+            f"Par: {pair}\n"
+            f"Dirección: {signal.upper()}\n"
+            "Motivo: no hubo retesteo + confirmación dentro de N+1."
+        )
+        return False, True
+
+    candle = _get_live_candle(pair)
+
+    if candle is None:
+        return False, False
+
+    # Si por latencia recibimos otra vela, ya no debemos operar la señal.
+    if int(candle["from"]) != execution_ts:
+        return False, True
+
+    trigger, trigger_reason = _entry_retest_trigger(
+        candidate,
+        candle,
+    )
+
+    if not trigger:
+        if trigger_reason in (
+            "soporte invalidado",
+            "resistencia invalidada",
+        ):
+            telegram_send(
+                "🚫 ENTRADA INVALIDADA\n\n"
+                f"Par: {pair}\n"
+                f"Dirección: {signal.upper()}\n"
+                f"Motivo: {trigger_reason}."
+            )
+            return False, True
+
+        return False, False
 
     telegram_send(
-        "⚡ EJECUTANDO MOMENTUM M1\n\n"
+        "🎯 RETEST + RECHAZO CONFIRMADO\n\n"
         f"Par: {pair}\n"
         f"Dirección: {signal.upper()}\n"
         f"N: {candidate['continuity_ts']}\n"
         f"N+1: {execution_ts}\n"
-        "⏳ Expiración: 1 minuto"
+        f"Entrada: {trigger_reason}\n"
+        "⚡ EJECUTANDO AHORA\n"
+        "⏳ Expiración: 2 minutos"
     )
 
     ok, order_id = buy_binary(pair, signal)
@@ -1251,10 +1403,9 @@ def execute_sniper(
             "❌ ORDEN BINARY RECHAZADA\n\n"
             f"Par: {pair}\n"
             f"Dirección: {signal.upper()}\n"
-            f"N+1: {execution_ts}\n"
-            "La señal no se trasladará a otra vela."
+            f"N+1: {execution_ts}"
         )
-        return False
+        return False, True
 
     now = time.time()
     LAST_TRADE_TIME["__global__"] = now
@@ -1267,20 +1418,21 @@ def execute_sniper(
         f"N: {candidate['continuity_ts']}\n"
         f"N+1: {execution_ts}\n"
         f"ID: {order_id}\n\n"
-        "⚡ Entrada al comenzar N+1\n"
-        "⏳ Expiración: 1 minuto"
+        f"🎯 Entrada por RETEST: {trigger_reason}\n"
+        "⏳ Expiración: 2 minutos"
     )
 
     logger.info(
-        "%s | MOMENTUM M1 EJECUTADO | %s | N=%s | N+1=%s | ID=%s",
+        "%s | MOMENTUM M1 RETEST EJECUTADO | %s | N=%s | N+1=%s | ID=%s | %s",
         pair,
         signal.upper(),
         candidate["continuity_ts"],
         execution_ts,
         order_id,
+        trigger_reason,
     )
-    return True
 
+    return True, True
 
 def process_pair(pair: str) -> None:
     """Compatibilidad: analiza un par, pero no ejecuta por separado."""
@@ -1300,14 +1452,26 @@ def analyze_all_pairs() -> None:
     refresh_binary_otc_pairs()
     current_ts = floor_candle_timestamp(get_iq_server_timestamp())
 
-    # 1) Primero ejecuta la señal que fue preparada para este minuto.
+    # 1) Si existe una señal pendiente para N+1, se monitoriza el retesteo
+    #    durante la vela. No se compra automáticamente al abrirla.
     pending = PENDING_ENTRY.get("__global__")
     if pending is not None:
-        if int(pending.get("execution_ts", -1)) == current_ts:
-            execute_sniper(pending, current_ts)
-            with STATE_LOCK:
-                PENDING_ENTRY.pop("__global__", None)
-        elif int(pending.get("execution_ts", -1)) < current_ts:
+        pending_ts = int(pending.get("execution_ts", -1))
+
+        if pending_ts == current_ts:
+            executed, finish_wait = execute_sniper(
+                pending,
+                current_ts,
+            )
+
+            if finish_wait:
+                with STATE_LOCK:
+                    PENDING_ENTRY.pop("__global__", None)
+
+            # Mientras exista una ventana de entrada, no se analiza otra señal.
+            return
+
+        if pending_ts < current_ts:
             with STATE_LOCK:
                 PENDING_ENTRY.pop("__global__", None)
 
@@ -1361,11 +1525,11 @@ def main() -> None:
 
     logger.info(
         "MODO SNIPER - "
-        "EXPIRACION 1 MINUTO"
+        "EXPIRACION 2 MINUTOS"
     )
 
     logger.info(
-        "ANALISIS: MOMENTUM EN M1 | EXPIRACION 1 MINUTO"
+        "ANALISIS: MOMENTUM EN M1 | EXPIRACION 2 MINUTOS"
     )
 
     logger.info(
