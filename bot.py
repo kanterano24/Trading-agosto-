@@ -81,12 +81,12 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 M1_TIMEFRAME = 60
 TIMEFRAME = 60
-EXPIRATION = 1
+EXPIRATION = 2
 
 AMOUNT = float(
     os.getenv(
         "AMOUNT",
-        "550",
+        "650",
     )
 )
 
@@ -100,12 +100,12 @@ CANDLE_COUNT = int(
 MAX_OTC_PAIRS = int(
     os.getenv(
         "MAX_OTC_PAIRS",
-        "50",
+        "9",
     )
 )
 
 PAIR_REFRESH_SECONDS = 60.0
-SNIPER_POLL = 0.02
+SNIPER_POLL = 00.30
 TRADE_COOLDOWN = 60.0
 
 
