@@ -86,7 +86,7 @@ EXPIRATION = 1
 AMOUNT = float(
     os.getenv(
         "AMOUNT",
-        "500",
+        "550",
     )
 )
 
@@ -1142,8 +1142,11 @@ def analyze_closed_candle(
 def _candidate_strength(candidate: Dict[str, Any]) -> tuple:
     """Desempate para elegir una sola señal por minuto."""
     analysis = candidate.get("analysis", {}) or {}
+    rejection = analysis.get("rejection", {}) or {}
     return (
         int(candidate.get("score", 0)),
+        int(rejection.get("quality", 0)),
+        float(rejection.get("details", {}).get("wick_ratio", 0.0)),
         float(analysis.get("body_atr", 0.0)),
         float(analysis.get("range_atr", 0.0)),
         float(analysis.get("body_ratio", 0.0)),
@@ -1162,7 +1165,7 @@ def schedule_single_entry(candidate: Dict[str, Any]) -> bool:
 
     side = "CALL 🟢" if candidate["signal"] == "call" else "PUT 🔴"
     telegram_send(
-        "🎯 SEÑAL MOMENTUM M1\n\n"
+        "🎯 SEÑAL MOMENTUM M1 + RECHAZO S/R\n\n"
         f"Par: {candidate['pair']}\n"
         f"Vela M1 N: {candidate['continuity_ts']}\n"
         f"Dirección: {side}\n"
