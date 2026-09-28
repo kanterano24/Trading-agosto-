@@ -1,9 +1,9 @@
 """strategy.py
 
-Estrategia de ACCION DEL PRECIO para velas M5, sin indicadores.
+Estrategia de ACCION DEL PRECIO para velas M1, sin indicadores.
 
 La estrategia:
-- Analiza exclusivamente velas M5 cerradas.
+- Analiza exclusivamente velas M1 cerradas.
 - Clasifica cada vela: indecision, continuidad, reversion, fuerza,
   descanso, momentum, doji, estrella fugaz, estrella de la tarde,
   pullback y rechazo.
@@ -49,7 +49,7 @@ def _empty(reason: str = "sin señal") -> Dict[str, Any]:
         "continuity": False,
         "blocked": True,
         "zone": "none",
-        "entry_type": "PRICE_ACTION_M5_NEXT_M1_1M",
+        "entry_type": "PRICE_ACTION_M1_NEXT_M1_1M",
         "entry_quality": 0,
         "candle_timestamp": None,
         "analysis": {},
@@ -294,24 +294,24 @@ def _pattern_names(p: Dict[str, Any]) -> list[str]:
 
 def analyze_market(
     df: Optional[pd.DataFrame] = None,
-    candle_5m: Any = None,
-    previous_m5: Optional[pd.DataFrame] = None,
+    candle_1m: Any = None,
+    previous_m1: Optional[pd.DataFrame] = None,
     pair: Optional[str] = None,
     **kwargs: Any,
 ) -> Dict[str, Any]:
     if df is not None:
         base = df.copy()
-    elif previous_m5 is not None:
-        base = previous_m5.copy()
-        if candle_5m is not None:
-            base = pd.concat([base, pd.DataFrame([candle_5m])], ignore_index=True)
+    elif previous_m1 is not None:
+        base = previous_m1.copy()
+        if candle_1m is not None:
+            base = pd.concat([base, pd.DataFrame([candle_1m])], ignore_index=True)
     else:
         base = pd.DataFrame()
 
     data = _normalize(base)
     result = _empty()
     if len(data) < MIN_BARS:
-        result["reason"] = f"Historial M5 insuficiente {len(data)}/{MIN_BARS}"
+        result["reason"] = f"Historial M1 insuficiente {len(data)}/{MIN_BARS}"
         return result
 
     idx = len(data) - 1
@@ -396,11 +396,11 @@ def analyze_market(
         "continuity": True,
         "blocked": False,
         "zone": rej["zone"],
-        "entry_type": "PRICE_ACTION_M5_NEXT_M1_1M",
+        "entry_type": "PRICE_ACTION_M1_NEXT_M1_1M",
         "entry_quality": score,
         "candle_timestamp": int(cur["from"]) if "from" in data.columns and pd.notna(cur["from"]) else None,
         "analysis": {
-            "timeframe": "M5",
+            "timeframe": "M1",
             "indicators_used": False,
             "structure": structure,
             "last_high": st.get("last_high"),
@@ -441,7 +441,7 @@ def _blocked_result(data, st, p, rej, patterns, counter, reason):
         "zone": rej["zone"],
         "candle_timestamp": int(cur["from"]) if "from" in data.columns and pd.notna(cur["from"]) else None,
         "analysis": {
-            "timeframe": "M5",
+            "timeframe": "M1",
             "indicators_used": False,
             "structure": st["structure"],
             "support": st.get("last_low"),
