@@ -55,6 +55,16 @@ REJECTION_MIN_BODY_ATR = 0.25
 REJECTION_MIN_RANGE_ATR = 0.55
 REJECTION_MIN_CLOSE_POSITION = 0.65
 
+# PASO 4: estructura + retroceso + momentum
+STRUCTURE_LOOKBACK = 30
+STRUCTURE_MIN_SWINGS = 2
+PULLBACK_LOOKBACK = 3
+PULLBACK_MIN_COUNTER_CANDLES = 1
+MOMENTUM_BREAK_PREVIOUS = True
+
+# La operación que genera esta estrategia está pensada para 2 minutos.
+TARGET_EXPIRATION_MINUTES = 2
+
 EPS = 1e-12
 
 
@@ -331,6 +341,137 @@ def _find_rejection_setup(
     }
 
 
+
+def _structure_and_pullback(
+    data: pd.DataFrame,
+    current: pd.Series,
+    direction: str,
+) -> Dict[str, Any]:
+    """Evalúa estructura HH/HL o LH/LL y exige retroceso antes del momentum."""
+
+    hist = data.iloc[:-1]
+    if len(hist) < 8:
+        return {
+            "structure": "range",
+            "structure_ok": False,
+            "pullback_ok": False,
+            "counter_candles": 0,
+            "last_swing_high": None,
+            "previous_swing_high": None,
+            "last_swing_low": None,
+            "previous_swing_low": None,
+        }
+
+    start = max(0, len(hist) - STRUCTURE_LOOKBACK)
+    x = hist.iloc[start:].reset_index(drop=True)
+
+    # Pivotes de 2 velas a cada lado. Solo se usan pivotes ya cerrados.
+    highs = []
+    lows = []
+    left = 2
+    right = 2
+
+    if len(x) >= left + right + 1:
+        for i in range(left, len(x) - right):
+            hi = float(x.iloc[i].high)
+            lo = float(x.iloc[i].low)
+
+            left_highs = x.iloc[i-left:i].high
+            right_highs = x.iloc[i+1:i+1+right].high
+            left_lows = x.iloc[i-left:i].low
+            right_lows = x.iloc[i+1:i+1+right].low
+
+            if hi >= float(left_highs.max()) and hi >= float(right_highs.max()):
+                highs.append(hi)
+            if lo <= float(left_lows.min()) and lo <= float(right_lows.min()):
+                lows.append(lo)
+
+    last_high = highs[-1] if len(highs) >= 1 else None
+    prev_high = highs[-2] if len(highs) >= 2 else None
+    last_low = lows[-1] if len(lows) >= 1 else None
+    prev_low = lows[-2] if len(lows) >= 2 else None
+
+    bullish_structure = (
+        prev_high is not None
+        and last_high is not None
+        and prev_low is not None
+        and last_low is not None
+        and last_high > prev_high
+        and last_low > prev_low
+    )
+
+    bearish_structure = (
+        prev_high is not None
+        and last_high is not None
+        and prev_low is not None
+        and last_low is not None
+        and last_high < prev_high
+        and last_low < prev_low
+    )
+
+    if bullish_structure:
+        structure = "bullish"
+    elif bearish_structure:
+        structure = "bearish"
+    else:
+        structure = "range"
+
+    # El precio debe venir de un retroceso contra la estructura
+    # inmediatamente antes de la vela de momentum.
+    recent = data.iloc[max(0, len(data) - 1 - PULLBACK_LOOKBACK):-1]
+    counter_candles = 0
+
+    for _, c in recent.iterrows():
+        if direction == "bullish" and float(c.close) < float(c.open):
+            counter_candles += 1
+        elif direction == "bearish" and float(c.close) > float(c.open):
+            counter_candles += 1
+
+    if direction == "bullish":
+        pullback_ok = (
+            structure == "bullish"
+            and counter_candles >= PULLBACK_MIN_COUNTER_CANDLES
+        )
+    elif direction == "bearish":
+        pullback_ok = (
+            structure == "bearish"
+            and counter_candles >= PULLBACK_MIN_COUNTER_CANDLES
+        )
+    else:
+        pullback_ok = False
+
+    # Confirmación adicional: la vela de momentum debe recuperar
+    # el máximo/mínimo de la vela inmediatamente anterior.
+    previous = data.iloc[-2]
+    if direction == "bullish":
+        momentum_break_ok = (
+            float(current.close) > float(current.open)
+            and float(current.close) > float(previous.high)
+        )
+    elif direction == "bearish":
+        momentum_break_ok = (
+            float(current.close) < float(current.open)
+            and float(current.close) < float(previous.low)
+        )
+    else:
+        momentum_break_ok = False
+
+    if MOMENTUM_BREAK_PREVIOUS:
+        pullback_ok = pullback_ok and momentum_break_ok
+
+    return {
+        "structure": structure,
+        "structure_ok": structure == direction,
+        "pullback_ok": bool(pullback_ok),
+        "counter_candles": int(counter_candles),
+        "momentum_break_previous_ok": bool(momentum_break_ok),
+        "last_swing_high": last_high,
+        "previous_swing_high": prev_high,
+        "last_swing_low": last_low,
+        "previous_swing_low": prev_low,
+    }
+
+
 def analyze_market(
     df: Optional[pd.DataFrame] = None,
     candle_1m: Any = None,
@@ -405,6 +546,31 @@ def analyze_market(
         and ema9 < ema9p
         and ema21 < ema21p
         and current.close < ema21
+    )
+
+    # ========================================================
+    # PASO 4 - ESTRUCTURA + RETROCESO + MOMENTUM
+    # ========================================================
+    structure_info = _structure_and_pullback(
+        data=data,
+        current=current,
+        direction=direction,
+    )
+
+    structure_ok = bool(structure_info["structure_ok"])
+    pullback_ok = bool(structure_info["pullback_ok"])
+
+    # Dirección obligatoria:
+    # estructura alcista + tendencia alcista -> CALL
+    # estructura bajista + tendencia bajista -> PUT
+    structure_trend_ok = (
+        direction == "bullish"
+        and structure_info["structure"] == "bullish"
+        and trend_bull
+    ) or (
+        direction == "bearish"
+        and structure_info["structure"] == "bearish"
+        and trend_bear
     )
 
     dirs = [
@@ -546,6 +712,16 @@ def analyze_market(
 
     momentum_ok = bool(checks) and all(checks)
 
+    # Filtro obligatorio del nuevo modelo:
+    # N debe ser una vela de momentum que sale de un retroceso,
+    # y la dirección debe coincidir con la estructura y la tendencia.
+    momentum_ok = (
+        momentum_ok
+        and structure_ok
+        and pullback_ok
+        and structure_trend_ok
+    )
+
     score = 0
     if direction != "range":
         score += 10 if body_ratio >= MIN_BODY_RATIO else 0
@@ -558,6 +734,9 @@ def analyze_market(
         score += 10 if displacement_ok else 0
         score += 10 if (bullish_break if direction == "bullish" else bearish_break) else 0
         score += 10 if location_ok else 0
+        score += 10 if structure_ok else 0
+        score += 10 if pullback_ok else 0
+        score += 10 if structure_trend_ok else 0
         score += int(min(20, rejection.get("quality", 0)))
 
     score = int(min(100, score))
@@ -574,6 +753,26 @@ def analyze_market(
         reasons.append("poco espacio hasta zona extrema previa")
     score = max(0, score - location_penalty)
 
+    if structure_info["structure"] == "bullish":
+        reasons.append("estructura alcista HH/HL")
+    elif structure_info["structure"] == "bearish":
+        reasons.append("estructura bajista LH/LL")
+    else:
+        reasons.append("estructura sin dirección")
+
+    if pullback_ok:
+        reasons.append("precio en retroceso antes del momentum")
+    else:
+        reasons.append("sin retroceso válido antes del momentum")
+
+    if structure_trend_ok:
+        reasons.append(
+            "estructura y tendencia alineadas "
+            + ("alcistas" if direction == "bullish" else "bajistas")
+        )
+    else:
+        reasons.append("estructura/tendencia no alineadas")
+
     if rejection_ok:
         if direction == "bullish":
             reasons.append("rechazo confirmado de soporte")
@@ -584,7 +783,13 @@ def analyze_market(
     else:
         reasons.append("sin rechazo S/R confirmado")
 
-    if not momentum_ok:
+    if not structure_ok:
+        result["reason"] = "Entrada bloqueada: estructura no coincide con la dirección"
+    elif not pullback_ok:
+        result["reason"] = "Entrada bloqueada: no hay retroceso + momentum confirmado"
+    elif not structure_trend_ok:
+        result["reason"] = "Entrada bloqueada: estructura y tendencia no están alineadas"
+    elif not momentum_ok:
         result["reason"] = "Momentum M1 insuficiente"
     elif not location_ok:
         result["reason"] = "Entrada bloqueada por ubicación"
@@ -636,6 +841,17 @@ def analyze_market(
                 "too_extended": too_extended,
                 "too_close_to_zone": too_close_to_zone,
                 "momentum_ok": momentum_ok,
+                "target_expiration_minutes": TARGET_EXPIRATION_MINUTES,
+                "structure": structure_info["structure"],
+                "structure_ok": structure_ok,
+                "structure_trend_ok": structure_trend_ok,
+                "pullback_ok": pullback_ok,
+                "counter_candles": structure_info["counter_candles"],
+                "momentum_break_previous_ok": structure_info["momentum_break_previous_ok"],
+                "last_swing_high": structure_info["last_swing_high"],
+                "previous_swing_high": structure_info["previous_swing_high"],
+                "last_swing_low": structure_info["last_swing_low"],
+                "previous_swing_low": structure_info["previous_swing_low"],
                 "trend_bull": trend_bull,
                 "trend_bear": trend_bear,
                 "ema9": float(ema9),
@@ -653,7 +869,7 @@ def analyze_market(
                 "continuity": True,
                 "blocked": False,
                 "zone": "support_rejection" if direction == "bullish" else "resistance_rejection",
-                "entry_type": "MOMENTUM_M1_REJECTION_SR",
+                "entry_type": "MOMENTUM_M1_PULLBACK_STRUCTURE_2M",
                 "reason": (
                     ("CALL" if direction == "bullish" else "PUT")
                     + " | MOMENTUM M1 | RECHAZO S/R | "
