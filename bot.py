@@ -86,7 +86,7 @@ EXPIRATION = 2
 AMOUNT = float(
     os.getenv(
         "AMOUNT",
-        "700",
+        "1300",
     )
 )
 
@@ -97,17 +97,22 @@ CANDLE_COUNT = int(
     )
 )
 
-# Analizar exactamente 9 pares OTC.
+# Analizar como máximo 9 pares OTC DISPONIBLES.
+# La lista se reconstruye automáticamente cada 10 minutos.
 MAX_OTC_PAIRS = 50
 
-PAIR_REFRESH_SECONDS = 60.0
+# Solo se aceptan pares que el catálogo Binary devuelve como:
+# - OTC
+# - enabled != False
+# - suspended != True
+
+PAIR_REFRESH_SECONDS = 600.0
 SNIPER_POLL = 0.20
 
 # Entrada mejorada: no compra automáticamente al abrir N+1.
-# Espera un retesteo de la zona S/R y una confirmación de rechazo dentro de N+1.
+# Espera retesteo de la zona S/R y confirmación de rechazo en N+1, sin indicadores.
 ENTRY_POLL = 0.20
-ENTRY_RETEST_TOL_ATR = 0.20
-ENTRY_INVALIDATION_ATR = 0.25
+ENTRY_ZONE_TOLERANCE = 0.0015
 ENTRY_MAX_WAIT_SECONDS = 55.0
 TRADE_COOLDOWN = 60.0
 
@@ -306,7 +311,7 @@ def telegram_command_loop() -> None:
                         "⏱ Análisis: M1\n"
                         "🎯 Entrada: N+1\n"
                         "⏳ Expiración: "
-                        "1 minuto\n"
+                        "2 minutos\n"
                         f"💵 Importe: "
                         f"{AMOUNT:g}"
                     )
@@ -570,8 +575,8 @@ def refresh_binary_otc_pairs(
         )
 
         msg = (
-            "🔄 UNIVERSO OTC "
-            "ACTUALIZADO\n\n"
+            "🔄 UNIVERSO OTC ACTUALIZADO\n\n"
+            "Solo pares disponibles | actualización cada 10 min\n\n"
             f"Pares disponibles: "
             f"{len(selected)}/{MAX_OTC_PAIRS}\n\n"
             f"{selected_text}"
@@ -1160,6 +1165,25 @@ def schedule_single_entry(candidate: Dict[str, Any]) -> bool:
     """Programa una ventana de entrada para N+1; no compra al abrir la vela."""
     execution_ts = int(candidate["execution_ts"])
 
+    analysis = candidate.get("analysis", {}) or {}
+    signal = str(candidate.get("signal", ""))
+    zone = str(analysis.get("zone", ""))
+
+    # Nunca guardar una señal cuya zona no corresponda con su dirección.
+    if signal == "call" and zone not in ("support", "support_rejection"):
+        logger.warning(
+            "%s | CALL bloqueada: zona=%s no es soporte",
+            candidate.get("pair"), zone,
+        )
+        return False
+
+    if signal == "put" and zone not in ("resistance", "resistance_rejection"):
+        logger.warning(
+            "%s | PUT bloqueada: zona=%s no es resistencia",
+            candidate.get("pair"), zone,
+        )
+        return False
+
     with STATE_LOCK:
         if PENDING_ENTRY:
             return False
@@ -1263,59 +1287,80 @@ def _entry_retest_trigger(
     candidate: Dict[str, Any],
     candle: pd.Series,
 ) -> Tuple[bool, str]:
-    """
-    Entrada de precisión en N+1.
+    """Revalida N+1 usando SOLO acción del precio.
 
-    CALL:
-      - el precio vuelve a soporte desde arriba;
-      - toca la zona;
-      - rechaza hacia arriba y cierra sobre el nivel.
-
-    PUT:
-      - el precio vuelve a resistencia desde abajo;
-      - toca la zona;
-      - rechaza hacia abajo y cierra bajo el nivel.
-
-    Se evita perseguir el precio cuando N+1 continúa desplazándose sin retesteo.
+    Regla de seguridad obligatoria:
+      - CALL solamente en soporte.
+      - PUT solamente en resistencia.
+      - Si una PUT llega a soporte, se cancela aunque N haya dado PUT.
+      - Si una CALL llega a resistencia, se cancela aunque N haya dado CALL.
     """
     analysis = candidate.get("analysis", {}) or {}
-    atr = float(analysis.get("atr", 0.0))
-    if atr <= 0:
-        return False, "ATR inválido"
-
     signal = str(candidate["signal"])
-    zone_key = "support_zone" if signal == "call" else "resistance_zone"
-    zone = analysis.get(zone_key)
 
-    if zone is None:
-        return False, "sin zona S/R"
+    support = analysis.get("support")
+    resistance = analysis.get("resistance")
 
-    zone = float(zone)
-    tol = ENTRY_RETEST_TOL_ATR * atr
+    if support is not None:
+        support = float(support)
+    if resistance is not None:
+        resistance = float(resistance)
 
     o = float(candle["open"])
     h = float(candle["high"])
     l = float(candle["low"])
     c = float(candle["close"])
 
+    near_support = (
+        support is not None
+        and l <= support * (1.0 + ENTRY_ZONE_TOLERANCE)
+    )
+    near_resistance = (
+        resistance is not None
+        and h >= resistance * (1.0 - ENTRY_ZONE_TOLERANCE)
+    )
+
+    # SEGURIDAD 1: dirección incompatible con la zona actual.
+    if signal == "put" and near_support and not near_resistance:
+        return False, "PUT bloqueada: precio en soporte"
+
+    if signal == "call" and near_resistance and not near_support:
+        return False, "CALL bloqueada: precio en resistencia"
+
+    # Si las dos zonas quedan demasiado cerca, no hay operación.
+    if near_support and near_resistance:
+        return False, "soporte y resistencia ambiguos"
+
+    # SEGURIDAD 2: la señal debe corresponder a su zona.
+    expected_zone = "support" if signal == "call" else "resistance"
+    candidate_zone = str(analysis.get("zone", ""))
+    if candidate_zone not in (expected_zone, f"{expected_zone}_rejection"):
+        return False, "dirección incompatible con zona de señal"
+
     if signal == "call":
-        touched = l <= zone + tol
-        rejected_up = c > zone and c >= o
+        if support is None:
+            return False, "sin soporte"
+
+        touched = l <= support * (1.0 + ENTRY_ZONE_TOLERANCE)
+        rejected_up = c > support and c >= o
 
         if touched and rejected_up:
             return True, "retest de soporte + confirmación alcista"
 
-        if c < zone - ENTRY_INVALIDATION_ATR * atr:
+        if c < support * (1.0 - ENTRY_ZONE_TOLERANCE):
             return False, "soporte invalidado"
 
     else:
-        touched = h >= zone - tol
-        rejected_down = c < zone and c <= o
+        if resistance is None:
+            return False, "sin resistencia"
+
+        touched = h >= resistance * (1.0 - ENTRY_ZONE_TOLERANCE)
+        rejected_down = c < resistance and c <= o
 
         if touched and rejected_down:
             return True, "retest de resistencia + confirmación bajista"
 
-        if c > zone + ENTRY_INVALIDATION_ATR * atr:
+        if c > resistance * (1.0 + ENTRY_ZONE_TOLERANCE):
             return False, "resistencia invalidada"
 
     return False, "esperando retesteo"
