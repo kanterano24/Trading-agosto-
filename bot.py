@@ -2,7 +2,7 @@
 
 - Descubre pares OTC Binary disponibles.
 - Actualiza el universo cada 10 minutos.
-- En cada cierre de vela M5 analiza TODOS los pares disponibles.
+- En cada cierre de vela M1 analiza TODOS los pares disponibles.
 - Selecciona como maximo UN par con la senal mas fuerte.
 - Ejecuta la entrada justo al abrir la siguiente vela M1.
 - Invierte la señal: CALL -> PUT y PUT -> CALL.
@@ -50,7 +50,6 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 M1_TIMEFRAME = 60
-M5_TIMEFRAME = 300
 EXPIRATION = 1
 AMOUNT = float(os.getenv("AMOUNT", "500"))
 CANDLE_COUNT_M1 = int(os.getenv("CANDLE_COUNT_M1", "250"))
@@ -59,10 +58,10 @@ POLL_SECONDS = 0.05
 TRADE_COOLDOWN = 60.0
 
 # Se descubren todos los OTC disponibles, pero SOLO se puede elegir un par
-# para operar por cada cierre M5.
+# para operar por cada cierre M1.
 PAIRS: list[str] = []
 LAST_PAIR_REFRESH = 0.0
-LAST_ANALYZED_M5 = -1
+LAST_ANALYZED_M1 = -1
 LAST_TRADE_M1 = -1
 LAST_TRADE_TIME = 0.0
 PENDING_CANDIDATE: Optional[Dict[str, Any]] = None
@@ -134,9 +133,9 @@ def telegram_command_loop() -> None:
                     BOT_RUNNING = True
                     telegram_send(
                         "🟢 BOT ACTIVADO\n\n"
-                        "🧠 ACCION DEL PRECIO M5\n"
+                        "🧠 ACCION DEL PRECIO M1\n"
                         "🔎 Analiza todos los OTC disponibles\n"
-                        "🎯 Opera solo 1 par por cierre M5\n"
+                        "🎯 Opera solo 1 par por cierre M1\n"
                         "⚡ Entrada: apertura de la siguiente M1\n"
                         "🔄 Señal invertida: CALL↔PUT\n"
                         "⏳ Expiracion: 1 minuto\n"
@@ -150,7 +149,7 @@ def telegram_command_loop() -> None:
                     telegram_send(
                         "📊 ESTADO\n\n"
                         f"Estado: {status}\n"
-                        "Analisis: M5\n"
+                        "Analisis: M1\n"
                         "Entrada: apertura de la siguiente M1\n"
                         "Señal: invertida CALL↔PUT\n"
                         "Expiracion: 1 minuto\n"
@@ -269,8 +268,8 @@ def floor_m1(ts: float) -> int:
 
 
 def last_closed_m5_timestamp(current_m1_open: int) -> int:
-    # Solo existe un nuevo cierre M5 en 00, 05, 10, 15, etc.
-    return current_m1_open - M5_TIMEFRAME
+    # Solo existe un nuevo cierre M1 en 00, 05, 10, 15, etc.
+    return current_m1_open - M1_TIMEFRAME
 
 
 def connect_iq() -> bool:
@@ -286,7 +285,7 @@ def connect_iq() -> bool:
     logger.info("IQ conectado | server=%.3f", get_iq_server_timestamp())
     telegram_send(
         "🟢 IQ OPTION CONECTADO\n\n"
-        "🧠 Analisis M5 por accion del precio\n"
+        "🧠 Analisis M1 por accion del precio\n"
         "⚡ Entrada: apertura de la siguiente M1\n"
         "🔄 Señal invertida CALL↔PUT\n"
         "⏳ Expiracion: 1 minuto"
@@ -313,13 +312,18 @@ def ensure_connection() -> bool:
     return False
 
 # ============================================================
-# DATOS M1 -> M5
+# DATOS M1
 # ============================================================
 def get_m1_candles(pair: str) -> Optional[pd.DataFrame]:
     if IQ is None:
         return None
     try:
-        candles = IQ.get_candles(pair, M1_TIMEFRAME, CANDLE_COUNT_M1, get_iq_server_timestamp())
+        candles = IQ.get_candles(
+            pair,
+            M1_TIMEFRAME,
+            CANDLE_COUNT_M1,
+            get_iq_server_timestamp(),
+        )
         if not candles:
             return None
         df = pd.DataFrame(candles).rename(columns={"max": "high", "min": "low"})
@@ -330,36 +334,15 @@ def get_m1_candles(pair: str) -> Optional[pd.DataFrame]:
             df[c] = pd.to_numeric(df[c], errors="coerce")
         df = df.dropna(subset=required).copy()
         df["from"] = df["from"].astype(int)
-        return df.drop_duplicates("from", keep="last").sort_values("from").reset_index(drop=True)
+        return (
+            df.drop_duplicates("from", keep="last")
+              .sort_values("from")
+              .reset_index(drop=True)
+        )
     except Exception as exc:
         logger.debug("%s | M1: %s", pair, exc)
         return None
 
-
-def aggregate_m1_to_m5(m1: pd.DataFrame, closed_m5_ts: int) -> pd.DataFrame:
-    if m1 is None or m1.empty:
-        return pd.DataFrame()
-    work = m1.copy()
-    work = work[work["from"].astype(int) <= int(closed_m5_ts + M5_TIMEFRAME - M1_TIMEFRAME)]
-    work["block"] = (work["from"].astype(int) // M5_TIMEFRAME) * M5_TIMEFRAME
-    blocks = []
-    for block_ts, group in work.groupby("block", sort=True):
-        group = group.sort_values("from").copy()
-        expected = [int(block_ts) + i * M1_TIMEFRAME for i in range(5)]
-        actual = group["from"].astype(int).tolist()
-        if actual != expected:
-            continue
-        blocks.append({
-            "from": int(block_ts),
-            "open": float(group.iloc[0]["open"]),
-            "high": float(group["high"].max()),
-            "low": float(group["low"].min()),
-            "close": float(group.iloc[-1]["close"]),
-        })
-    if not blocks:
-        return pd.DataFrame(columns=["from", "open", "high", "low", "close"])
-    out = pd.DataFrame(blocks).sort_values("from").reset_index(drop=True)
-    return out[out["from"] <= int(closed_m5_ts)].reset_index(drop=True)
 
 # ============================================================
 # ANALISIS Y SELECCION DE UN SOLO PAR
@@ -372,61 +355,83 @@ def _candidate_strength(c: Dict[str, Any]) -> tuple:
         1 if a.get("call_momentum") or a.get("put_momentum") else 0,
         1 if a.get("pullback") else 0,
         1 if a.get("reversal") else 0,
+        1 if a.get("continuation") else 0,
+        1 if a.get("strength") else 0,
     )
 
 
-def analyze_pair_at_m5_close(pair: str, closed_m5_ts: int) -> Optional[Dict[str, Any]]:
+def analyze_pair_at_m1_close(pair: str, closed_m1_ts: int) -> Optional[Dict[str, Any]]:
     m1 = get_m1_candles(pair)
     if m1 is None or m1.empty:
         return None
-    m5 = aggregate_m1_to_m5(m1, closed_m5_ts)
-    if m5.empty:
+
+    # Solo velas COMPLETAMENTE cerradas. La vela que acaba de abrir no participa.
+    history = m1[m1["from"].astype(int) <= int(closed_m1_ts)].copy()
+    if history.empty:
         return None
-    row = m5[m5["from"].astype(int) == int(closed_m5_ts)]
+
+    row = history[history["from"].astype(int) == int(closed_m1_ts)]
     if row.empty:
         return None
+
     current = row.iloc[-1]
-    history = m5[m5["from"].astype(int) <= int(closed_m5_ts)].copy()
-    result = analyze_market(df=history, candle_5m=current.to_dict(), pair=pair)
+    result = analyze_market(
+        df=history,
+        candle_1m=current.to_dict(),
+        previous_m1=history.iloc[:-1].copy(),
+        pair=pair,
+    )
+
     signal = result.get("signal")
     if signal not in ("call", "put"):
-        logger.info("%s | M5 %s | SIN OPERACION | %s", pair, closed_m5_ts, result.get("reason", ""))
+        logger.info(
+            "%s | M1 %s | SIN OPERACION | %s",
+            pair,
+            closed_m1_ts,
+            result.get("reason", ""),
+        )
         return None
+
     return {
         "pair": pair,
         "signal": signal,
         "score": int(result.get("score", 0)),
-        "m5_ts": int(closed_m5_ts),
-        "execution_m1_ts": int(closed_m5_ts + M5_TIMEFRAME),
+        "m1_ts": int(closed_m1_ts),
+        "execution_m1_ts": int(closed_m1_ts + M1_TIMEFRAME),
         "reason": result.get("reason", ""),
         "analysis": result.get("analysis", {}) or {},
     }
 
 
-def analyze_all_pairs_at_m5_close(closed_m5_ts: int) -> Optional[Dict[str, Any]]:
+def analyze_all_pairs_at_m1_close(closed_m1_ts: int) -> Optional[Dict[str, Any]]:
     candidates: list[Dict[str, Any]] = []
+
     for pair in list(PAIRS):
         if not BOT_RUNNING:
             return None
         try:
-            c = analyze_pair_at_m5_close(pair, closed_m5_ts)
-            if c is not None:
-                candidates.append(c)
+            candidate = analyze_pair_at_m1_close(pair, closed_m1_ts)
+            if candidate is not None:
+                candidates.append(candidate)
         except Exception:
             logger.exception("Error analizando %s", pair)
+
     if not candidates:
         telegram_send(
-            "⏸️ CIERRE M5 SIN ENTRADA\n\n"
+            "⏸️ CIERRE M1 SIN ENTRADA\n\n"
             "Ningun OTC disponible cumplio las condiciones de accion del precio."
         )
         return None
+
+    # Una sola operación: se elige la señal con mayor calidad de acción del precio.
     best = max(candidates, key=_candidate_strength)
+
     telegram_send(
-        "🎯 SEÑAL M5 CONFIRMADA\n\n"
+        "🎯 SEÑAL M1 CONFIRMADA\n\n"
         f"Par elegido: {best['pair']}\n"
-        f"Dirección: {best['signal'].upper()}\n"
+        f"Dirección original: {best['signal'].upper()}\n"
         f"Score: {best['score']}/100\n"
-        f"M5 cerrada: {best['m5_ts']}\n"
+        f"M1 cerrada: {best['m1_ts']}\n"
         "⚡ Entrada: apertura de la siguiente M1\n"
         "⏳ Expiración: 1 minuto\n\n"
         f"{best['reason']}"
@@ -452,17 +457,17 @@ def buy_binary(pair: str, signal: str) -> Tuple[bool, Optional[Any]]:
 
 
 def execute_candidate(candidate: Dict[str, Any], current_ts: float) -> bool:
-    """Ejecuta la señal invertida justo al abrir la M1 objetivo."""
+    """Ejecuta la señal invertida en la apertura de la M1 objetivo."""
     global LAST_TRADE_M1, LAST_TRADE_TIME
 
     target_ts = int(candidate["execution_m1_ts"])
-    # La entrada se hace en la apertura de la M1 objetivo.
-    # Se permite una ventana de 0.75 s para absorber el intervalo de polling
-    # sin trasladar la operación a una vela posterior.
-    if not (target_ts <= float(current_ts) < target_ts + 0.75):
+
+    # Solo se permite la apertura de la vela objetivo. Nunca se entra tarde.
+    # La ventana es muy corta para absorber el polling sin mover la entrada.
+    if not (target_ts <= float(current_ts) < target_ts + 0.35):
         return False
 
-    target_m1 = int(target_ts)
+    target_m1 = target_ts
     if LAST_TRADE_M1 == target_m1:
         return False
     if time.time() - LAST_TRADE_TIME < TRADE_COOLDOWN:
@@ -471,7 +476,7 @@ def execute_candidate(candidate: Dict[str, Any], current_ts: float) -> bool:
     pair = str(candidate["pair"])
     original_signal = str(candidate["signal"]).lower()
 
-    # INVERTIR LA ENTRADA: CALL -> PUT / PUT -> CALL.
+    # Mantener la inversión solicitada: CALL -> PUT / PUT -> CALL.
     signal = "put" if original_signal == "call" else "call"
 
     ok, order_id = buy_binary(pair, signal)
@@ -487,20 +492,27 @@ def execute_candidate(candidate: Dict[str, Any], current_ts: float) -> bool:
 
     LAST_TRADE_M1 = target_m1
     LAST_TRADE_TIME = time.time()
+
     telegram_send(
-        "⚡ ENTRADA EJECUTADA\n\n"
+        "⚡ ENTRADA EJECUTADA EN APERTURA M1\n\n"
         f"Par: {pair}\n"
         f"Señal original: {original_signal.upper()}\n"
         f"Entrada INVERTIDA: {signal.upper()}\n"
-        f"M5 analizada: {candidate['m5_ts']}\n"
-        f"M1 objetivo: {target_m1}\n"
-        "⚡ Ejecución: apertura de M1\n"
+        f"M1 analizada: {candidate['m1_ts']}\n"
+        f"M1 ejecutada: {target_m1}\n"
+        "⚡ Ejecución: segundo 00 / apertura M1\n"
         f"ID: {order_id}\n"
         "⏳ Expiración: 1 minuto"
     )
+
     logger.info(
-        "%s | ORIGINAL=%s | INVERTIDA=%s | M5=%s | M1=%s | segundo=30 | ID=%s",
-        pair, original_signal.upper(), signal.upper(), candidate["m5_ts"], target_m1, order_id,
+        "%s | ORIGINAL=%s | INVERTIDA=%s | M1_ANALIZADA=%s | M1_EJECUTADA=%s | apertura=00 | ID=%s",
+        pair,
+        original_signal.upper(),
+        signal.upper(),
+        candidate["m1_ts"],
+        target_m1,
+        order_id,
     )
     return True
 
@@ -509,12 +521,13 @@ def execute_candidate(candidate: Dict[str, Any], current_ts: float) -> bool:
 # ============================================================
 def process_cycle() -> None:
     """
-    1) Al cierre de cada M5 analiza TODOS los OTC disponibles.
-    2) Elige SOLO un par.
-    3) Guarda la señal para la siguiente M1.
-    4) Ejecuta la señal INVERTIDA justo al abrir la siguiente M1.
+    1) Detecta el cierre de cada M1 usando el reloj del servidor.
+    2) Analiza TODOS los OTC disponibles con la vela M1 cerrada.
+    3) Elige SOLO un par.
+    4) Guarda la señal para la M1 siguiente.
+    5) Ejecuta la señal INVERTIDA justo en la apertura de esa M1.
     """
-    global LAST_ANALYZED_M5, LAST_CANDIDATE, PENDING_CANDIDATE
+    global LAST_ANALYZED_M1, LAST_CANDIDATE, PENDING_CANDIDATE
 
     if not BOT_RUNNING:
         return
@@ -526,50 +539,44 @@ def process_cycle() -> None:
     server_ts = get_iq_server_timestamp()
     current_m1_open = floor_m1(server_ts)
 
-    # --------------------------------------------------------
-    # EJECUTAR CANDIDATO PENDIENTE EN LA APERTURA DE LA M1
-    # --------------------------------------------------------
+    # 1) EJECUTAR CANDIDATO PENDIENTE EN LA APERTURA DE LA M1.
     if PENDING_CANDIDATE is not None:
         if execute_candidate(PENDING_CANDIDATE, server_ts):
             PENDING_CANDIDATE = None
             LAST_CANDIDATE = None
-        elif server_ts >= int(PENDING_CANDIDATE["execution_m1_ts"]) + 31:
-            # Si por alguna razón se perdió el segundo 30, NO se ejecuta tarde.
+        elif server_ts >= int(PENDING_CANDIDATE["execution_m1_ts"]) + 1:
+            # Si no pudo ejecutarse prácticamente en la apertura, se cancela.
             logger.warning(
-                "Entrada perdida: %s M1=%s",
+                "Entrada perdida: %s M1=%s server=%.3f",
                 PENDING_CANDIDATE.get("pair"),
                 PENDING_CANDIDATE.get("execution_m1_ts"),
+                server_ts,
             )
             telegram_send(
                 "⚠️ ENTRADA PERDIDA\n\n"
                 f"Par: {PENDING_CANDIDATE.get('pair')}\n"
-                "No se ejecutara fuera de la apertura de la M1 objetivo."
+                "No se ejecutara tarde."
             )
             PENDING_CANDIDATE = None
             LAST_CANDIDATE = None
 
-    # --------------------------------------------------------
-    # ANALIZAR SOLO CUANDO CIERRA UNA M5
-    # --------------------------------------------------------
-    if current_m1_open % M5_TIMEFRAME != 0:
+    # 2) Solo analizar cuando acaba de cerrar una M1.
+    # Si estamos dentro de una M1, no se vuelve a analizar.
+    closed_m1_ts = current_m1_open - M1_TIMEFRAME
+    if closed_m1_ts == LAST_ANALYZED_M1:
         return
 
-    closed_m5_ts = last_closed_m5_timestamp(current_m1_open)
-    if closed_m5_ts == LAST_ANALYZED_M5:
-        return
-
-    # No se prepara otra señal si todavía existe una pendiente.
+    # No preparar una segunda entrada mientras haya una pendiente.
     if PENDING_CANDIDATE is not None:
         return
 
-    LAST_ANALYZED_M5 = closed_m5_ts
-    candidate = analyze_all_pairs_at_m5_close(closed_m5_ts)
+    LAST_ANALYZED_M1 = closed_m1_ts
+    candidate = analyze_all_pairs_at_m1_close(closed_m1_ts)
     LAST_CANDIDATE = candidate
 
     if candidate is not None:
-        # La siguiente M1 abre en current_m1_open.
-        # La entrada se hará en la apertura de la siguiente M1.
         candidate = dict(candidate)
+        # La vela recién abierta es exactamente la siguiente M1.
         candidate["execution_m1_ts"] = int(current_m1_open)
         candidate["execution_second"] = 0
         PENDING_CANDIDATE = candidate
@@ -579,9 +586,9 @@ def process_cycle() -> None:
             f"Par: {candidate['pair']}\n"
             f"Señal original: {candidate['signal'].upper()}\n"
             f"Entrada INVERTIDA: {'PUT' if candidate['signal'] == 'call' else 'CALL'}\n"
-            f"M5 cerrada: {candidate['m5_ts']}\n"
+            f"M1 cerrada: {candidate['m1_ts']}\n"
             f"M1 objetivo: {candidate['execution_m1_ts']}\n"
-            "⚡ Ejecución: apertura de M1\n"
+            "⚡ Ejecución: apertura / segundo 00\n"
             "⏳ Expiración: 1 minuto"
         )
 
@@ -590,8 +597,8 @@ def main() -> None:
     global BOT_RUNNING
     logger.info("========================================")
     logger.info("BOT BINARY OTC - ACCION DEL PRECIO")
-    logger.info("Analisis M5 | Entrada apertura M1 | Expiracion 1 minuto")
-    logger.info("Opera SOLO UN par por cada cierre M5")
+    logger.info("Analisis M1 | Entrada apertura de la siguiente M1 | Expiracion 1 minuto")
+    logger.info("Opera SOLO UN par por cada cierre M1")
     logger.info("Sin EMA | Sin RSI | Sin ATR | Sin indicadores")
     logger.info("========================================")
 
@@ -617,7 +624,7 @@ def main() -> None:
     BOT_RUNNING = False
     telegram_send(
         "🤖 BOT LISTO\n\n"
-        "📊 Analiza TODOS los OTC disponibles en M5.\n"
+        "📊 Analiza TODOS los OTC disponibles en M1.\n"
         "🎯 Selecciona SOLO 1 par.\n"
         "⚡ Opera al abrir la siguiente M1.\n"
         "⏳ Expiración: 1 minuto.\n"
