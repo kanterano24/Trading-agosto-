@@ -86,7 +86,7 @@ EXPIRATION = 2
 AMOUNT = float(
     os.getenv(
         "AMOUNT",
-        "500",
+        "700",
     )
 )
 
@@ -98,7 +98,7 @@ CANDLE_COUNT = int(
 )
 
 # Analizar exactamente 9 pares OTC.
-MAX_OTC_PAIRS = 6
+MAX_OTC_PAIRS = 50
 
 PAIR_REFRESH_SECONDS = 60.0
 SNIPER_POLL = 0.20
