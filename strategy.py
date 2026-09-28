@@ -1,469 +1,577 @@
-"""strategy.py
+"""bot.py - OTC Binary, un solo par por señal.
 
-Estrategia de ACCION DEL PRECIO para velas M1, sin indicadores.
-
-La estrategia:
-- Analiza exclusivamente velas M1 cerradas.
-- Clasifica cada vela: indecision, continuidad, reversion, fuerza,
-  descanso, momentum, doji, estrella fugaz, estrella de la tarde,
-  pullback y rechazo.
-- Usa estructura de precio, maximos/minimos, zonas S/R y secuencia de velas.
-- No usa EMA, RSI, ATR ni ningun indicador tecnico.
-- Devuelve UNA sola direccion: call, put o None.
-- El bot ejecuta la senal al abrir la siguiente vela M1.
-- Expiracion objetivo: 1 minuto.
-
-Importante: clasificar un patron de vela no garantiza el resultado de una
-operacion. El bot debe bloquear senales cuando la accion del precio sea
-ambigua o contradiga la estructura.
+- Descubre pares OTC Binary disponibles.
+- Actualiza el universo cada 10 minutos.
+- En cada cierre de vela M5 analiza TODOS los pares disponibles.
+- Selecciona como maximo UN par con la senal mas fuerte.
+- Ejecuta inmediatamente al abrir la siguiente vela M1.
+- Expiracion Binary: 1 minuto.
+- La estrategia esta en strategy.py y NO usa indicadores.
 """
 from __future__ import annotations
 
+import logging
+import os
+import threading
+import time
 from typing import Any, Dict, Optional, Tuple
+
 import pandas as pd
+import requests
+from iqoptionapi.stable_api import IQ_Option
+import iqoptionapi.constants as OP_code
 
-MIN_BARS = 30
-SWING_LEFT = 2
-SWING_RIGHT = 2
-SWING_LOOKBACK = 30
-SR_LOOKBACK = 20
-ZONE_TOLERANCE = 0.0015
+from strategy import analyze_market
 
-DOJI_BODY_MAX = 0.10
-INDECISION_BODY_MAX = 0.25
-SMALL_BODY_MAX = 0.35
-STRONG_BODY_MIN = 0.60
-EXTREME_CLOSE_MIN = 0.70
-WICK_BODY_MIN = 1.20
+# ============================================================
+# COMPATIBILIDAD IQOPTIONAPI - SOLO BINARY OTC
+# ============================================================
 
-TARGET_EXPIRATION_MINUTES = 1
+def _binary_only_digital_underlying(self):
+    return {"underlying": []}
 
 
-def _empty(reason: str = "sin señal") -> Dict[str, Any]:
-    return {
-        "signal": None,
-        "direction": "range",
-        "trend": "range",
-        "reason": reason,
-        "score": 0,
-        "continuity": False,
-        "blocked": True,
-        "zone": "none",
-        "entry_type": "PRICE_ACTION_M1_NEXT_M1_1M",
-        "entry_quality": 0,
-        "candle_timestamp": None,
-        "analysis": {},
-    }
+def _disabled_digital_open(self, *args, **kwargs):
+    return None
 
 
-def _normalize(df: Optional[pd.DataFrame]) -> pd.DataFrame:
-    if df is None or not isinstance(df, pd.DataFrame) or df.empty:
-        return pd.DataFrame()
-    data = df.copy()
-    rename = {}
-    if "max" in data.columns and "high" not in data.columns:
-        rename["max"] = "high"
-    if "min" in data.columns and "low" not in data.columns:
-        rename["min"] = "low"
-    if rename:
-        data = data.rename(columns=rename)
-    required = ["open", "high", "low", "close"]
-    if any(c not in data.columns for c in required):
-        return pd.DataFrame()
-    for c in required:
-        data[c] = pd.to_numeric(data[c], errors="coerce")
-    if "from" in data.columns:
-        data["from"] = pd.to_numeric(data["from"], errors="coerce")
-        data = data.sort_values("from")
-    data = data.dropna(subset=required).reset_index(drop=True)
-    return data
+setattr(IQ_Option, "get_digital_underlying_list_data", _binary_only_digital_underlying)
+for _name in ("_IQ_Option__get_digital_open", "__get_digital_open", "_get_digital_open"):
+    if hasattr(IQ_Option, _name):
+        setattr(IQ_Option, _name, _disabled_digital_open)
 
+# ============================================================
+# CONFIGURACION
+# ============================================================
+IQ_EMAIL = os.getenv("IQ_EMAIL")
+IQ_PASSWORD = os.getenv("IQ_PASSWORD")
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-def _metrics(row: pd.Series) -> Dict[str, float]:
-    o, h, l, c = map(float, (row["open"], row["high"], row["low"], row["close"]))
-    rng = max(h - l, 1e-12)
-    body = abs(c - o)
-    upper = h - max(o, c)
-    lower = min(o, c) - l
-    close_pos = (c - l) / rng
-    return {
-        "open": o, "high": h, "low": l, "close": c,
-        "range": rng, "body": body,
-        "body_ratio": body / rng,
-        "upper_wick": upper,
-        "lower_wick": lower,
-        "upper_body": upper / max(body, 1e-12),
-        "lower_body": lower / max(body, 1e-12),
-        "close_pos": close_pos,
-    }
+M1_TIMEFRAME = 60
+M5_TIMEFRAME = 300
+EXPIRATION = 1
+AMOUNT = float(os.getenv("AMOUNT", "500"))
+CANDLE_COUNT_M1 = int(os.getenv("CANDLE_COUNT_M1", "250"))
+PAIR_REFRESH_SECONDS = 600.0
+POLL_SECONDS = 0.05
+TRADE_COOLDOWN = 60.0
 
+# Se descubren todos los OTC disponibles, pero SOLO se puede elegir un par
+# para operar por cada cierre M5.
+PAIRS: list[str] = []
+LAST_PAIR_REFRESH = 0.0
+LAST_ANALYZED_M5 = -1
+LAST_TRADE_M1 = -1
+LAST_TRADE_TIME = 0.0
+BOT_RUNNING = False
+IQ: Optional[IQ_Option] = None
+STATE_LOCK = threading.RLock()
+LAST_CANDIDATE: Optional[Dict[str, Any]] = None
 
-def _direction(row: pd.Series) -> str:
-    if float(row["close"]) > float(row["open"]):
-        return "bullish"
-    if float(row["close"]) < float(row["open"]):
-        return "bearish"
-    return "neutral"
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s",
+)
+logger = logging.getLogger(__name__)
 
-
-def _swings(data: pd.DataFrame) -> Tuple[list[Tuple[int, float]], list[Tuple[int, float]]]:
-    highs: list[Tuple[int, float]] = []
-    lows: list[Tuple[int, float]] = []
-    start = max(SWING_LEFT, len(data) - SWING_LOOKBACK - SWING_RIGHT)
-    end = len(data) - SWING_RIGHT
-    for i in range(start, end):
-        h = float(data.iloc[i]["high"])
-        l = float(data.iloc[i]["low"])
-        left_h = data.iloc[i-SWING_LEFT:i]["high"].max()
-        right_h = data.iloc[i+1:i+1+SWING_RIGHT]["high"].max()
-        left_l = data.iloc[i-SWING_LEFT:i]["low"].min()
-        right_l = data.iloc[i+1:i+1+SWING_RIGHT]["low"].min()
-        if h >= float(left_h) and h >= float(right_h):
-            highs.append((i, h))
-        if l <= float(left_l) and l <= float(right_l):
-            lows.append((i, l))
-    return highs, lows
-
-
-def _structure(data: pd.DataFrame) -> Dict[str, Any]:
-    highs, lows = _swings(data)
-    out: Dict[str, Any] = {
-        "structure": "range",
-        "highs": highs,
-        "lows": lows,
-        "last_high": highs[-1][1] if highs else None,
-        "previous_high": highs[-2][1] if len(highs) >= 2 else None,
-        "last_low": lows[-1][1] if lows else None,
-        "previous_low": lows[-2][1] if len(lows) >= 2 else None,
-    }
-    if len(highs) >= 2 and len(lows) >= 2:
-        hh = highs[-1][1] > highs[-2][1]
-        hl = lows[-1][1] > lows[-2][1]
-        lh = highs[-1][1] < highs[-2][1]
-        ll = lows[-1][1] < lows[-2][1]
-        if hh and hl:
-            out["structure"] = "bullish"
-        elif lh and ll:
-            out["structure"] = "bearish"
-    return out
-
-
-def _classify_candle(data: pd.DataFrame, idx: int) -> Dict[str, Any]:
-    cur = _metrics(data.iloc[idx])
-    prev = _metrics(data.iloc[idx - 1]) if idx > 0 else cur
-    d = _direction(data.iloc[idx])
-    prev_d = _direction(data.iloc[idx - 1]) if idx > 0 else "neutral"
-
-    doji = cur["body_ratio"] <= DOJI_BODY_MAX
-    indecision = cur["body_ratio"] <= INDECISION_BODY_MAX
-    strength = cur["body_ratio"] >= STRONG_BODY_MIN and (
-        cur["close_pos"] >= EXTREME_CLOSE_MIN or cur["close_pos"] <= 1 - EXTREME_CLOSE_MIN
-    )
-    continuation = d in ("bullish", "bearish") and d == prev_d and cur["body_ratio"] >= 0.35
-
-    bullish_engulf = (
-        d == "bullish" and prev_d == "bearish"
-        and cur["open"] <= prev["close"]
-        and cur["close"] >= prev["open"]
-    )
-    bearish_engulf = (
-        d == "bearish" and prev_d == "bullish"
-        and cur["open"] >= prev["close"]
-        and cur["close"] <= prev["open"]
-    )
-    reversal = bullish_engulf or bearish_engulf
-
-    rest = cur["body_ratio"] <= SMALL_BODY_MAX and not doji
-
-    momentum_bull = (
-        d == "bullish" and cur["body_ratio"] >= 0.55
-        and cur["close_pos"] >= 0.70
-        and cur["close"] > prev["high"]
-    )
-    momentum_bear = (
-        d == "bearish" and cur["body_ratio"] >= 0.55
-        and cur["close_pos"] <= 0.30
-        and cur["close"] < prev["low"]
-    )
-
-    shooting_star = (
-        cur["upper_body"] >= WICK_BODY_MIN
-        and cur["upper_wick"] > cur["lower_wick"] * 1.5
-        and cur["close_pos"] <= 0.55
-    )
-    evening_star = False
-    if idx >= 2:
-        a = _metrics(data.iloc[idx - 2])
-        b = _metrics(data.iloc[idx - 1])
-        evening_star = (
-            _direction(data.iloc[idx - 2]) == "bullish"
-            and a["body_ratio"] >= 0.55
-            and b["body_ratio"] <= 0.35
-            and d == "bearish"
-            and cur["close"] < (a["open"] + a["close"]) / 2.0
+# ============================================================
+# TELEGRAM
+# ============================================================
+def _telegram_post(endpoint: str, data: Dict[str, Any], timeout: float = 3.0) -> bool:
+    if not TELEGRAM_TOKEN:
+        return False
+    try:
+        r = requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/{endpoint}",
+            data=data,
+            timeout=timeout,
         )
+        return r.status_code == 200
+    except Exception as exc:
+        logger.debug("Telegram %s: %s", endpoint, exc)
+        return False
 
+
+def telegram_send(message: str) -> None:
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        return
+    threading.Thread(
+        target=_telegram_post,
+        args=("sendMessage", {"chat_id": TELEGRAM_CHAT_ID, "text": message}),
+        kwargs={"timeout": 3.0},
+        daemon=True,
+    ).start()
+
+
+def telegram_command_loop() -> None:
+    global BOT_RUNNING
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        return
+    last_update_id: Optional[int] = None
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates"
+    while True:
+        try:
+            params: Dict[str, Any] = {"timeout": 1}
+            if last_update_id is not None:
+                params["offset"] = last_update_id + 1
+            data = requests.get(url, params=params, timeout=3).json()
+            if not data.get("ok"):
+                time.sleep(0.5)
+                continue
+            for update in data.get("result", []):
+                uid = update.get("update_id")
+                if uid is not None:
+                    last_update_id = int(uid)
+                msg = update.get("message") or {}
+                chat_id = str((msg.get("chat") or {}).get("id", ""))
+                if chat_id != str(TELEGRAM_CHAT_ID):
+                    continue
+                text = str(msg.get("text", "")).strip().lower()
+                if text == "/start":
+                    BOT_RUNNING = True
+                    telegram_send(
+                        "🟢 BOT ACTIVADO\n\n"
+                        "🧠 ACCION DEL PRECIO M5\n"
+                        "🔎 Analiza todos los OTC disponibles\n"
+                        "🎯 Opera solo 1 par por cierre M5\n"
+                        "⚡ Entrada: apertura de la siguiente M1\n"
+                        "⏳ Expiracion: 1 minuto\n"
+                        "🚫 Sin indicadores"
+                    )
+                elif text == "/stop":
+                    BOT_RUNNING = False
+                    telegram_send("🔴 BOT DETENIDO\n\nNo se abriran nuevas operaciones.")
+                elif text == "/status":
+                    status = "🟢 ACTIVO" if BOT_RUNNING else "🔴 DETENIDO"
+                    telegram_send(
+                        "📊 ESTADO\n\n"
+                        f"Estado: {status}\n"
+                        "Analisis: M5\n"
+                        "Entrada: apertura M1 siguiente\n"
+                        "Expiracion: 1 minuto\n"
+                        f"OTC disponibles: {len(PAIRS)}\n"
+                        f"Importe: {AMOUNT:g}\n"
+                        "Indicadores: NO"
+                    )
+        except Exception as exc:
+            logger.debug("Telegram command loop: %s", exc)
+            time.sleep(1)
+
+# ============================================================
+# OTC DISPONIBLES
+# ============================================================
+def _is_otc_pair(value: Any) -> bool:
+    try:
+        name = str(value).strip().upper()
+    except Exception:
+        return False
+    return name.endswith("-OTC") or name.endswith("_OTC") or "OTC" in name
+
+
+def _load_binary_otc_catalog() -> Tuple[list[str], bool]:
+    if IQ is None or not hasattr(IQ, "get_all_init_v2"):
+        return [], False
+    try:
+        data = IQ.get_all_init_v2()
+    except Exception as exc:
+        logger.warning("Catalogo Binary no disponible: %s", exc)
+        return [], False
+    if not isinstance(data, dict):
+        return [], False
+    binary = data.get("binary")
+    if not isinstance(binary, dict):
+        result = data.get("result")
+        if isinstance(result, dict):
+            binary = result.get("binary")
+    if not isinstance(binary, dict):
+        return [], False
+    actives = binary.get("actives", {})
+    if not isinstance(actives, dict):
+        return [], False
+
+    pairs: list[str] = []
+    for active_id, info in actives.items():
+        if not isinstance(info, dict):
+            continue
+        raw_name = info.get("name")
+        if not isinstance(raw_name, str):
+            continue
+        name = raw_name.split(".", 1)[1] if "." in raw_name else raw_name
+        name = name.strip()
+        if not _is_otc_pair(name):
+            continue
+        if info.get("enabled", True) is False:
+            continue
+        if info.get("is_suspended", info.get("suspended", False)) is True:
+            continue
+        try:
+            OP_code.ACTIVES[name] = int(active_id)
+        except (TypeError, ValueError):
+            continue
+        pairs.append(name)
+    return sorted(set(pairs)), True
+
+
+def discover_binary_otc_pairs() -> list[str]:
+    pairs, ok = _load_binary_otc_catalog()
+    return pairs if ok else []
+
+
+def refresh_binary_otc_pairs(force: bool = False) -> list[str]:
+    global PAIRS, LAST_PAIR_REFRESH
+    now = time.time()
+    if not force and now - LAST_PAIR_REFRESH < PAIR_REFRESH_SECONDS:
+        return list(PAIRS)
+
+    discovered = discover_binary_otc_pairs()
+    if not discovered:
+        # Si el catalogo falla, conservar el ultimo universo valido.
+        logger.warning("No se pudo actualizar OTC; se conserva la lista anterior: %s", PAIRS)
+        LAST_PAIR_REFRESH = now
+        return list(PAIRS)
+
+    previous = set(PAIRS)
+    PAIRS = list(discovered)
+    LAST_PAIR_REFRESH = now
+
+    if set(PAIRS) != previous:
+        text = ", ".join(PAIRS) if PAIRS else "NINGUNO"
+        telegram_send(
+            "🔄 OTC DISPONIBLES ACTUALIZADOS\n\n"
+            f"Pares encontrados: {len(PAIRS)}\n"
+            "Proxima actualizacion: 10 minutos\n\n"
+            f"{text}"
+        )
+        logger.info("OTC disponibles: %d | %s", len(PAIRS), text)
+    return list(PAIRS)
+
+# ============================================================
+# RELOJ Y CONEXION
+# ============================================================
+def get_iq_server_timestamp() -> float:
+    if IQ is not None:
+        try:
+            value = float(IQ.get_server_timestamp())
+            if value > 0:
+                return value
+        except Exception:
+            pass
+    return time.time()
+
+
+def floor_m1(ts: float) -> int:
+    return int(ts // M1_TIMEFRAME) * M1_TIMEFRAME
+
+
+def last_closed_m5_timestamp(current_m1_open: int) -> int:
+    # Solo existe un nuevo cierre M5 en 00, 05, 10, 15, etc.
+    return current_m1_open - M5_TIMEFRAME
+
+
+def connect_iq() -> bool:
+    global IQ
+    if not IQ_EMAIL or not IQ_PASSWORD:
+        raise ValueError("Faltan IQ_EMAIL/IQ_PASSWORD")
+    logger.info("Conectando a IQ Option...")
+    IQ = IQ_Option(IQ_EMAIL, IQ_PASSWORD)
+    connected, reason = IQ.connect()
+    if not connected:
+        raise ConnectionError(f"No se pudo conectar a IQ Option: {reason}")
+    refresh_binary_otc_pairs(force=True)
+    logger.info("IQ conectado | server=%.3f", get_iq_server_timestamp())
+    telegram_send(
+        "🟢 IQ OPTION CONECTADO\n\n"
+        "🧠 Analisis M5 por accion del precio\n"
+        "⚡ Entrada inmediata en apertura M1\n"
+        "⏳ Expiracion: 1 minuto"
+    )
+    return True
+
+
+def ensure_connection() -> bool:
+    global IQ
+    if IQ is None:
+        return connect_iq()
+    try:
+        if hasattr(IQ, "check_connect") and IQ.check_connect():
+            return True
+    except Exception:
+        pass
+    try:
+        connected, _ = IQ.connect()
+        if connected:
+            refresh_binary_otc_pairs(force=True)
+            return True
+    except Exception as exc:
+        logger.warning("Reconexión fallida: %s", exc)
+    return False
+
+# ============================================================
+# DATOS M1 -> M5
+# ============================================================
+def get_m1_candles(pair: str) -> Optional[pd.DataFrame]:
+    if IQ is None:
+        return None
+    try:
+        candles = IQ.get_candles(pair, M1_TIMEFRAME, CANDLE_COUNT_M1, get_iq_server_timestamp())
+        if not candles:
+            return None
+        df = pd.DataFrame(candles).rename(columns={"max": "high", "min": "low"})
+        required = ["from", "open", "high", "low", "close"]
+        if any(c not in df.columns for c in required):
+            return None
+        for c in required:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+        df = df.dropna(subset=required).copy()
+        df["from"] = df["from"].astype(int)
+        return df.drop_duplicates("from", keep="last").sort_values("from").reset_index(drop=True)
+    except Exception as exc:
+        logger.debug("%s | M1: %s", pair, exc)
+        return None
+
+
+def aggregate_m1_to_m5(m1: pd.DataFrame, closed_m5_ts: int) -> pd.DataFrame:
+    if m1 is None or m1.empty:
+        return pd.DataFrame()
+    work = m1.copy()
+    work = work[work["from"].astype(int) <= int(closed_m5_ts + M5_TIMEFRAME - M1_TIMEFRAME)]
+    work["block"] = (work["from"].astype(int) // M5_TIMEFRAME) * M5_TIMEFRAME
+    blocks = []
+    for block_ts, group in work.groupby("block", sort=True):
+        group = group.sort_values("from").copy()
+        expected = [int(block_ts) + i * M1_TIMEFRAME for i in range(5)]
+        actual = group["from"].astype(int).tolist()
+        if actual != expected:
+            continue
+        blocks.append({
+            "from": int(block_ts),
+            "open": float(group.iloc[0]["open"]),
+            "high": float(group["high"].max()),
+            "low": float(group["low"].min()),
+            "close": float(group.iloc[-1]["close"]),
+        })
+    if not blocks:
+        return pd.DataFrame(columns=["from", "open", "high", "low", "close"])
+    out = pd.DataFrame(blocks).sort_values("from").reset_index(drop=True)
+    return out[out["from"] <= int(closed_m5_ts)].reset_index(drop=True)
+
+# ============================================================
+# ANALISIS Y SELECCION DE UN SOLO PAR
+# ============================================================
+def _candidate_strength(c: Dict[str, Any]) -> tuple:
+    a = c.get("analysis", {}) or {}
+    return (
+        int(c.get("score", 0)),
+        1 if a.get("call_rejection") or a.get("put_rejection") else 0,
+        1 if a.get("call_momentum") or a.get("put_momentum") else 0,
+        1 if a.get("pullback") else 0,
+        1 if a.get("reversal") else 0,
+    )
+
+
+def analyze_pair_at_m5_close(pair: str, closed_m5_ts: int) -> Optional[Dict[str, Any]]:
+    m1 = get_m1_candles(pair)
+    if m1 is None or m1.empty:
+        return None
+    m5 = aggregate_m1_to_m5(m1, closed_m5_ts)
+    if m5.empty:
+        return None
+    row = m5[m5["from"].astype(int) == int(closed_m5_ts)]
+    if row.empty:
+        return None
+    current = row.iloc[-1]
+    history = m5[m5["from"].astype(int) <= int(closed_m5_ts)].copy()
+    result = analyze_market(df=history, candle_5m=current.to_dict(), pair=pair)
+    signal = result.get("signal")
+    if signal not in ("call", "put"):
+        logger.info("%s | M5 %s | SIN OPERACION | %s", pair, closed_m5_ts, result.get("reason", ""))
+        return None
     return {
-        "direction": d,
-        "doji": doji,
-        "indecision": indecision,
-        "continuation": continuation,
-        "reversal": reversal,
-        "strength": strength,
-        "rest": rest,
-        "momentum_bull": momentum_bull,
-        "momentum_bear": momentum_bear,
-        "shooting_star": shooting_star,
-        "evening_star": evening_star,
-        "body_ratio": cur["body_ratio"],
-        "close_pos": cur["close_pos"],
-        "upper_body": cur["upper_body"],
-        "lower_body": cur["lower_body"],
-    }
-
-
-def _pullback(data: pd.DataFrame, structure: str) -> Tuple[bool, int]:
-    if len(data) < 5 or structure not in ("bullish", "bearish"):
-        return False, 0
-    recent = data.iloc[-5:-1]
-    counter = 0
-    for _, row in recent.iterrows():
-        d = _direction(row)
-        if structure == "bullish" and d == "bearish":
-            counter += 1
-        elif structure == "bearish" and d == "bullish":
-            counter += 1
-    return counter >= 1, counter
-
-
-def _zones(data: pd.DataFrame, st: Dict[str, Any]) -> Tuple[Optional[float], Optional[float]]:
-    support = st.get("last_low")
-    resistance = st.get("last_high")
-    if support is None:
-        support = float(data.iloc[-SR_LOOKBACK:]["low"].min())
-    if resistance is None:
-        resistance = float(data.iloc[-SR_LOOKBACK:]["high"].max())
-    return support, resistance
-
-
-def _rejection(cur: pd.Series, support: Optional[float], resistance: Optional[float]) -> Dict[str, Any]:
-    m = _metrics(cur)
-    near_support = support is not None and m["low"] <= support * (1 + ZONE_TOLERANCE) and m["close"] >= support
-    near_resistance = resistance is not None and m["high"] >= resistance * (1 - ZONE_TOLERANCE) and m["close"] <= resistance
-    bull_reject = near_support and m["lower_body"] >= WICK_BODY_MIN and m["close_pos"] >= 0.60
-    bear_reject = near_resistance and m["upper_body"] >= WICK_BODY_MIN and m["close_pos"] <= 0.40
-    if near_support and not near_resistance:
-        zone = "support"
-    elif near_resistance and not near_support:
-        zone = "resistance"
-    elif near_support and near_resistance:
-        zone = "ambiguous"
-    else:
-        zone = "none"
-    return {
-        "zone": zone,
-        "near_support": near_support,
-        "near_resistance": near_resistance,
-        "bull_rejection": bull_reject,
-        "bear_rejection": bear_reject,
-    }
-
-
-def _pattern_names(p: Dict[str, Any]) -> list[str]:
-    names = []
-    if p["doji"]:
-        names.append("doji")
-    elif p["indecision"]:
-        names.append("indecision")
-    if p["continuation"]:
-        names.append("continuidad")
-    if p["reversal"]:
-        names.append("reversion")
-    if p["strength"]:
-        names.append("fuerza")
-    if p["rest"]:
-        names.append("descanso")
-    if p["momentum_bull"] or p["momentum_bear"]:
-        names.append("momentum")
-    if p["shooting_star"]:
-        names.append("estrella_fugaz")
-    if p["evening_star"]:
-        names.append("estrella_atardecer")
-    return names
-
-
-def analyze_market(
-    df: Optional[pd.DataFrame] = None,
-    candle_1m: Any = None,
-    previous_m1: Optional[pd.DataFrame] = None,
-    pair: Optional[str] = None,
-    **kwargs: Any,
-) -> Dict[str, Any]:
-    if df is not None:
-        base = df.copy()
-    elif previous_m1 is not None:
-        base = previous_m1.copy()
-        if candle_1m is not None:
-            base = pd.concat([base, pd.DataFrame([candle_1m])], ignore_index=True)
-    else:
-        base = pd.DataFrame()
-
-    data = _normalize(base)
-    result = _empty()
-    if len(data) < MIN_BARS:
-        result["reason"] = f"Historial M1 insuficiente {len(data)}/{MIN_BARS}"
-        return result
-
-    idx = len(data) - 1
-    cur = data.iloc[idx]
-    st = _structure(data)
-    structure = st["structure"]
-    p = _classify_candle(data, idx)
-    pullback_ok, counter = _pullback(data, structure)
-    support, resistance = _zones(data, st)
-    rej = _rejection(cur, support, resistance)
-
-    direction = p["direction"]
-    patterns = _pattern_names(p)
-
-    # La senal debe venir de una estructura clara y de accion del precio.
-    bullish_context = structure == "bullish"
-    bearish_context = structure == "bearish"
-
-    # Pullback: se acepta retroceso antes de la vela de confirmacion.
-    bull_pullback = bullish_context and pullback_ok
-    bear_pullback = bearish_context and pullback_ok
-
-    # Dos familias de entrada:
-    # 1) Rechazo en zona + vela de confirmacion.
-    # 2) Momentum/continuacion despues de pullback, sin perseguir una vela extrema.
-    call_rejection = bullish_context and direction == "bullish" and rej["bull_rejection"]
-    put_rejection = bearish_context and direction == "bearish" and rej["bear_rejection"]
-    call_momentum = bullish_context and direction == "bullish" and p["momentum_bull"] and bull_pullback
-    put_momentum = bearish_context and direction == "bearish" and p["momentum_bear"] and bear_pullback
-
-    # Prohibiciones duras de zona.
-    if rej["zone"] == "support" and direction == "bearish":
-        return _blocked_result(data, st, p, rej, patterns, counter, "PUT bloqueada: precio en SOPORTE")
-    if rej["zone"] == "resistance" and direction == "bullish":
-        return _blocked_result(data, st, p, rej, patterns, counter, "CALL bloqueada: precio en RESISTENCIA")
-    if rej["zone"] == "ambiguous":
-        return _blocked_result(data, st, p, rej, patterns, counter, "Entrada bloqueada: S/R ambiguos")
-
-    call_ok = call_rejection or call_momentum
-    put_ok = put_rejection or put_momentum
-
-    # No se opera doji/indecision puro, descanso puro ni patron de agotamiento
-    # sin confirmacion estructural posterior.
-    if p["doji"] or p["indecision"]:
-        call_ok = False
-        put_ok = False
-    if p["shooting_star"] and not call_rejection:
-        call_ok = False
-    if p["evening_star"] and not put_rejection:
-        put_ok = False
-
-    if call_ok == put_ok:
-        reason = "sin señal: accion del precio ambigua"
-        if call_ok and put_ok:
-            reason = "sin señal: CALL y PUT simultaneamente posibles"
-        return _blocked_result(data, st, p, rej, patterns, counter, reason)
-
-    signal = "call" if call_ok else "put"
-    score = 0
-    score += 25 if structure in ("bullish", "bearish") else 0
-    score += 15 if pullback_ok else 0
-    score += 25 if (call_rejection or put_rejection) else 0
-    score += 20 if (call_momentum or put_momentum) else 0
-    score += 10 if p["reversal"] or p["continuation"] else 0
-    score += 5 if p["strength"] else 0
-    score = min(100, score)
-
-    reasons = [
-        f"estructura {structure}",
-        f"patrones: {', '.join(patterns) if patterns else 'vela normal'}",
-        "pullback detectado" if pullback_ok else "sin pullback claro",
-        "rechazo confirmado" if (call_rejection or put_rejection) else "sin rechazo directo",
-        "momentum confirmado" if (call_momentum or put_momentum) else "sin ruptura de momentum",
-    ]
-
-    result.update({
+        "pair": pair,
         "signal": signal,
-        "direction": direction,
-        "trend": structure,
-        "reason": ("CALL" if signal == "call" else "PUT") + " | " + " | ".join(reasons),
-        "score": score,
-        "continuity": True,
-        "blocked": False,
-        "zone": rej["zone"],
-        "entry_type": "PRICE_ACTION_M1_NEXT_M1_1M",
-        "entry_quality": score,
-        "candle_timestamp": int(cur["from"]) if "from" in data.columns and pd.notna(cur["from"]) else None,
-        "analysis": {
-            "timeframe": "M1",
-            "indicators_used": False,
-            "structure": structure,
-            "last_high": st.get("last_high"),
-            "previous_high": st.get("previous_high"),
-            "last_low": st.get("last_low"),
-            "previous_low": st.get("previous_low"),
-            "support": support,
-            "resistance": resistance,
-            "zone": rej["zone"],
-            "near_support": rej["near_support"],
-            "near_resistance": rej["near_resistance"],
-            "support_rejection": rej["bull_rejection"],
-            "resistance_rejection": rej["bear_rejection"],
-            "pullback": pullback_ok,
-            "counter_candles": counter,
-            "patterns": patterns,
-            "candle_classification": p,
-            "reversal": p["reversal"],
-            "continuation": p["continuation"],
-            "strength": p["strength"],
-            "rest": p["rest"],
-            "call_rejection": call_rejection,
-            "put_rejection": put_rejection,
-            "call_momentum": call_momentum,
-            "put_momentum": put_momentum,
-            "target_expiration_minutes": 1,
-        },
-    })
-    return result
+        "score": int(result.get("score", 0)),
+        "m5_ts": int(closed_m5_ts),
+        "execution_m1_ts": int(closed_m5_ts + M5_TIMEFRAME),
+        "reason": result.get("reason", ""),
+        "analysis": result.get("analysis", {}) or {},
+    }
 
 
-def _blocked_result(data, st, p, rej, patterns, counter, reason):
-    cur = data.iloc[-1]
-    r = _empty(reason)
-    r.update({
-        "direction": p["direction"],
-        "trend": st["structure"],
-        "zone": rej["zone"],
-        "candle_timestamp": int(cur["from"]) if "from" in data.columns and pd.notna(cur["from"]) else None,
-        "analysis": {
-            "timeframe": "M1",
-            "indicators_used": False,
-            "structure": st["structure"],
-            "support": st.get("last_low"),
-            "resistance": st.get("last_high"),
-            "zone": rej["zone"],
-            "patterns": patterns,
-            "candle_classification": p,
-            "reversal": p["reversal"],
-            "continuation": p["continuation"],
-            "strength": p["strength"],
-            "rest": p["rest"],
-            "pullback": bool(counter),
-            "counter_candles": counter,
-            "target_expiration_minutes": 1,
-        },
-    })
-    return r
+def analyze_all_pairs_at_m5_close(closed_m5_ts: int) -> Optional[Dict[str, Any]]:
+    candidates: list[Dict[str, Any]] = []
+    for pair in list(PAIRS):
+        if not BOT_RUNNING:
+            return None
+        try:
+            c = analyze_pair_at_m5_close(pair, closed_m5_ts)
+            if c is not None:
+                candidates.append(c)
+        except Exception:
+            logger.exception("Error analizando %s", pair)
+    if not candidates:
+        telegram_send(
+            "⏸️ CIERRE M5 SIN ENTRADA\n\n"
+            "Ningun OTC disponible cumplio las condiciones de accion del precio."
+        )
+        return None
+    best = max(candidates, key=_candidate_strength)
+    telegram_send(
+        "🎯 SEÑAL M5 CONFIRMADA\n\n"
+        f"Par elegido: {best['pair']}\n"
+        f"Dirección: {best['signal'].upper()}\n"
+        f"Score: {best['score']}/100\n"
+        f"M5 cerrada: {best['m5_ts']}\n"
+        "⚡ Entrada: apertura de la siguiente M1\n"
+        "⏳ Expiración: 1 minuto\n\n"
+        f"{best['reason']}"
+    )
+    return best
+
+# ============================================================
+# EJECUCION
+# ============================================================
+def buy_binary(pair: str, signal: str) -> Tuple[bool, Optional[Any]]:
+    if IQ is None or signal not in ("call", "put"):
+        return False, None
+    try:
+        result = IQ.buy(AMOUNT, pair, signal, EXPIRATION)
+        if isinstance(result, tuple):
+            return bool(result[0]), result[1] if len(result) > 1 else None
+        if result not in (None, False, "error", -1):
+            return True, result
+        return False, result
+    except Exception as exc:
+        logger.error("%s | buy error: %s", pair, exc)
+        return False, None
 
 
-def get_signal(df):
-    return analyze_market(df=df).get("signal")
+def execute_candidate(candidate: Dict[str, Any], current_m1_open: int) -> bool:
+    global LAST_TRADE_M1, LAST_TRADE_TIME
+    if int(candidate["execution_m1_ts"]) != int(current_m1_open):
+        return False
+    if LAST_TRADE_M1 == current_m1_open:
+        return False
+    if time.time() - LAST_TRADE_TIME < TRADE_COOLDOWN:
+        return False
+
+    pair = str(candidate["pair"])
+    signal = str(candidate["signal"])
+
+    ok, order_id = buy_binary(pair, signal)
+    if not ok:
+        telegram_send(
+            "❌ ORDEN RECHAZADA\n\n"
+            f"Par: {pair}\nDirección: {signal.upper()}\n"
+            "La señal no se trasladara a otra vela."
+        )
+        return False
+
+    LAST_TRADE_M1 = current_m1_open
+    LAST_TRADE_TIME = time.time()
+    telegram_send(
+        "⚡ ENTRADA EJECUTADA\n\n"
+        f"Par: {pair}\n"
+        f"Dirección: {signal.upper()}\n"
+        f"Apertura M1: {current_m1_open}\n"
+        f"M5 analizada: {candidate['m5_ts']}\n"
+        f"ID: {order_id}\n"
+        "⏳ Expiración: 1 minuto"
+    )
+    logger.info(
+        "%s | %s | M5=%s | M1=%s | ID=%s",
+        pair, signal.upper(), candidate["m5_ts"], current_m1_open, order_id,
+    )
+    return True
+
+# ============================================================
+# CICLO PRINCIPAL
+# ============================================================
+def process_cycle() -> None:
+    global LAST_ANALYZED_M5, LAST_CANDIDATE
+    if not BOT_RUNNING:
+        return
+    refresh_binary_otc_pairs()
+    if not PAIRS:
+        return
+
+    current_m1_open = floor_m1(get_iq_server_timestamp())
+
+    # Solo se procesa una vez cada cierre M5.
+    if current_m1_open % M5_TIMEFRAME != 0:
+        return
+
+    closed_m5_ts = last_closed_m5_timestamp(current_m1_open)
+    if closed_m5_ts == LAST_ANALYZED_M5:
+        return
+
+    LAST_ANALYZED_M5 = closed_m5_ts
+    LAST_CANDIDATE = analyze_all_pairs_at_m5_close(closed_m5_ts)
+
+    # La ejecucion ocurre inmediatamente en la apertura de la M1 siguiente.
+    if LAST_CANDIDATE is not None:
+        execute_candidate(LAST_CANDIDATE, current_m1_open)
+        LAST_CANDIDATE = None
 
 
-def signal(df):
-    return get_signal(df)
+def main() -> None:
+    global BOT_RUNNING
+    logger.info("========================================")
+    logger.info("BOT BINARY OTC - ACCION DEL PRECIO")
+    logger.info("Analisis M5 | Entrada apertura M1 | Expiracion 1 minuto")
+    logger.info("Opera SOLO UN par por cada cierre M5")
+    logger.info("Sin EMA | Sin RSI | Sin ATR | Sin indicadores")
+    logger.info("========================================")
+
+    required = {
+        "IQ_EMAIL": IQ_EMAIL,
+        "IQ_PASSWORD": IQ_PASSWORD,
+        "TELEGRAM_TOKEN": TELEGRAM_TOKEN,
+        "TELEGRAM_CHAT_ID": TELEGRAM_CHAT_ID,
+    }
+    missing = [k for k, v in required.items() if not v]
+    if missing:
+        logger.error("Faltan variables: %s", ", ".join(missing))
+        return
+
+    threading.Thread(target=telegram_command_loop, daemon=True).start()
+    try:
+        connect_iq()
+    except Exception as exc:
+        logger.exception("No se pudo iniciar IQ Option")
+        telegram_send(f"❌ ERROR DE CONEXIÓN\n\n{exc}")
+        return
+
+    BOT_RUNNING = False
+    telegram_send(
+        "🤖 BOT LISTO\n\n"
+        "📊 Analiza TODOS los OTC disponibles en M5.\n"
+        "🎯 Selecciona SOLO 1 par.\n"
+        "⚡ Opera al abrir la siguiente M1.\n"
+        "⏳ Expiración: 1 minuto.\n"
+        "🚫 Sin indicadores.\n\n"
+        "Usa /start para activar."
+    )
+
+    while True:
+        try:
+            if not BOT_RUNNING:
+                time.sleep(0.25)
+                continue
+            if not ensure_connection():
+                time.sleep(1)
+                continue
+            process_cycle()
+            time.sleep(POLL_SECONDS)
+        except KeyboardInterrupt:
+            BOT_RUNNING = False
+            telegram_send("🔴 BOT DETENIDO MANUALMENTE")
+            break
+        except Exception as exc:
+            logger.exception("Error principal")
+            telegram_send(f"⚠️ ERROR EN BOT\n\n{exc}")
+            time.sleep(1)
+
+
+if __name__ == "__main__":
+    main()
