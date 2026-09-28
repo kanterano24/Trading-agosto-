@@ -16,6 +16,8 @@ SWING_RIGHT = 2
 PULLBACK_LOOKBACK = 4
 PULLBACK_MIN_COUNTER_CANDLES = 1
 SR_ZONE_TOLERANCE = 0.0015
+# Si el precio está en una zona de soporte, jamás se permite PUT.
+# Si el precio está en una zona de resistencia, jamás se permite CALL.
 MIN_WICK_BODY_RATIO = 0.80
 MIN_CLOSE_POSITION = 0.65
 TARGET_EXPIRATION_MINUTES = 2
@@ -86,15 +88,12 @@ def _pullback(data, direction):
 
 
 def _rejection(current, direction, support, resistance):
-    """
-    Detecta la zona que está rechazando el precio SIN usar indicadores.
+    """Clasifica la zona actual y aplica dirección obligatoria.
 
-    Regla obligatoria:
-    - Rechazo de SOPORTE  -> solamente CALL.
-    - Rechazo de RESISTENCIA -> solamente PUT.
-    - Si la señal intenta ir en sentido contrario, queda bloqueada.
-    - Si ambas zonas parecen válidas al mismo tiempo, se bloquea por
-      ambigüedad.
+    SOPORTE -> únicamente CALL.
+    RESISTENCIA -> únicamente PUT.
+    Si el precio está cerca de soporte, PUT queda bloqueado aunque no haya
+    una mecha de rechazo perfecta. Lo mismo para CALL en resistencia.
     """
     op = float(current["open"])
     high = float(current["high"])
@@ -105,84 +104,73 @@ def _rejection(current, direction, support, resistance):
     rng = max(high - low, 1e-12)
     close_pos = (close - low) / rng
 
-    support_rejection = False
-    resistance_rejection = False
-
     support_wick = (min(op, close) - low) / body
     resistance_wick = (high - max(op, close)) / body
 
-    # Rechazo alcista de soporte:
-    # toca/perfora soporte y recupera cerrando por encima.
-    if support is not None:
-        near_support = low <= support * (1 + SR_ZONE_TOLERANCE)
-        recovered_support = close > support
+    near_support = (
+        support is not None
+        and low <= float(support) * (1.0 + SR_ZONE_TOLERANCE)
+    )
+    near_resistance = (
+        resistance is not None
+        and high >= float(resistance) * (1.0 - SR_ZONE_TOLERANCE)
+    )
 
-        support_rejection = (
-            near_support
-            and recovered_support
-            and support_wick >= MIN_WICK_BODY_RATIO
-            and close_pos >= MIN_CLOSE_POSITION
-        )
+    support_rejection = bool(
+        near_support
+        and close > float(support)
+        and support_wick >= MIN_WICK_BODY_RATIO
+        and close_pos >= MIN_CLOSE_POSITION
+    )
 
-    # Rechazo bajista de resistencia:
-    # toca/supera resistencia y vuelve a cerrar por debajo.
-    if resistance is not None:
-        near_resistance = high >= resistance * (1 - SR_ZONE_TOLERANCE)
-        rejected_resistance = close < resistance
+    resistance_rejection = bool(
+        near_resistance
+        and close < float(resistance)
+        and resistance_wick >= MIN_WICK_BODY_RATIO
+        and close_pos <= (1.0 - MIN_CLOSE_POSITION)
+    )
 
-        resistance_rejection = (
-            near_resistance
-            and rejected_resistance
-            and resistance_wick >= MIN_WICK_BODY_RATIO
-            and close_pos <= (1 - MIN_CLOSE_POSITION)
-        )
-
-    # Zona única y dirección obligatoria.
-    if support_rejection and not resistance_rejection:
-        zone = "support_rejection"
+    # Regla de seguridad principal: zona determina dirección.
+    if near_support and not near_resistance:
+        zone = "support"
         allowed_direction = "bullish"
-        rejection_ok = direction == "bullish"
+        rejection_ok = direction == "bullish" and support_rejection
         reason = (
             "Rechazo de SOPORTE: solo CALL"
             if rejection_ok
-            else "Entrada bloqueada: rechazo de SOPORTE no permite PUT"
+            else "Entrada bloqueada: precio en SOPORTE, solo se permite CALL"
         )
         wick = support_wick
 
-    elif resistance_rejection and not support_rejection:
-        zone = "resistance_rejection"
+    elif near_resistance and not near_support:
+        zone = "resistance"
         allowed_direction = "bearish"
-        rejection_ok = direction == "bearish"
+        rejection_ok = direction == "bearish" and resistance_rejection
         reason = (
             "Rechazo de RESISTENCIA: solo PUT"
             if rejection_ok
-            else "Entrada bloqueada: rechazo de RESISTENCIA no permite CALL"
+            else "Entrada bloqueada: precio en RESISTENCIA, solo se permite PUT"
         )
         wick = resistance_wick
 
-    elif support_rejection and resistance_rejection:
+    elif near_support and near_resistance:
         zone = "ambiguous_sr"
         allowed_direction = None
         rejection_ok = False
-        reason = "Entrada bloqueada: soporte y resistencia rechazados simultáneamente"
+        reason = "Entrada bloqueada: soporte y resistencia demasiado cercanos"
         wick = max(support_wick, resistance_wick)
 
     else:
         zone = None
         allowed_direction = None
         rejection_ok = False
-        reason = "Sin rechazo válido de soporte/resistencia"
+        reason = "Entrada bloqueada: precio no está en una zona S/R válida"
         wick = 0.0
 
     return (
-        rejection_ok,
-        zone,
-        wick,
-        close_pos,
-        allowed_direction,
-        support_rejection,
-        resistance_rejection,
-        reason,
+        rejection_ok, zone, wick, close_pos, allowed_direction,
+        support_rejection, resistance_rejection, reason,
+        near_support, near_resistance,
     )
 
 
@@ -227,6 +215,8 @@ def analyze_market(df: Optional[pd.DataFrame] = None, candle_1m: Any = None,
         support_rejection,
         resistance_rejection,
         rejection_reason,
+        near_support,
+        near_resistance,
     ) = _rejection(cur, direction, support, resistance)
 
     # REGLA DURA DE DIRECCIÓN POR ZONA:
@@ -271,6 +261,8 @@ def analyze_market(df: Optional[pd.DataFrame] = None, candle_1m: Any = None,
             "pullback_ok": pullback_ok, "counter_candles": counter,
             "support": support, "resistance": resistance,
             "rejection_ok": rejection_ok,
+            "near_support": near_support,
+            "near_resistance": near_resistance,
             "zone_direction_ok": zone_direction_ok,
             "allowed_direction": allowed_direction,
             "support_rejection": support_rejection,
@@ -292,8 +284,12 @@ def analyze_market(df: Optional[pd.DataFrame] = None, candle_1m: Any = None,
             "reason": ("CALL" if signal == "call" else "PUT") + " | " + " | ".join(reasons)
         })
     else:
-        if support_rejection and direction != "bullish":
+        if near_support and not near_resistance and direction != "bullish":
+            result["reason"] = "Entrada bloqueada: precio en SOPORTE = solo CALL"
+        elif support_rejection and direction != "bullish":
             result["reason"] = "Entrada bloqueada: rechazo de SOPORTE = solo CALL"
+        elif near_resistance and not near_support and direction != "bearish":
+            result["reason"] = "Entrada bloqueada: precio en RESISTENCIA = solo PUT"
         elif resistance_rejection and direction != "bearish":
             result["reason"] = "Entrada bloqueada: rechazo de RESISTENCIA = solo PUT"
         elif support_rejection and resistance_rejection:
