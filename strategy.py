@@ -1,26 +1,29 @@
 from __future__ import annotations
 
-"""Estrategia M1 basada únicamente en el patrón visual definido por el usuario.
+"""Estrategia M1 basada EXCLUSIVAMENTE en Choppiness Index.
 
-PUT:
-1) último máximo/resistencia;
-2) precio se aleja del nivel;
-3) regresa al mismo nivel y lo toca/rechaza;
-4) la vela de rechazo cierra debajo de la resistencia;
-5) la siguiente vela cierra roja;
-6) entrada PUT, expiración 1 minuto.
+Configuracion exacta del usuario:
+- Choppiness Index: periodo 14.
+- Sobrecompra: 61.8.
+- Sobreventa: 38.2.
+- Si el CI cruza hacia ARRIBA 61.8 y la vela que produce el cruce termina ROJA:
+  entrada CALL en la siguiente vela M1.
+- Si el CI cruza hacia ABAJO 38.2 y la vela que produce el cruce termina VERDE:
+  entrada PUT en la siguiente vela M1.
+- Expiracion: 1 minuto.
 
-CALL: exactamente al contrario.
+No utiliza RSI, EMA, MACD, Bollinger, ATR como filtro independiente, score,
+soporte/resistencia, tendencia, volumen ni ninguna otra condicion de entrada.
 """
 
 from typing import Any, Dict, Optional
+import math
 import pandas as pd
 
-MIN_BARS = 25
-LOOKBACK = 24
-TOUCH_TOLERANCE = 0.0010
-MIN_AWAY_TOLERANCE = 0.0015
-WICK_RATIO = 0.50
+MIN_BARS = 30
+CI_PERIOD = 14
+OVERBOUGHT = 61.8
+OVERSOLD = 38.2
 
 MODE_CONFIG = {
     "M1_M1": {"analysis_tf": "M1", "entry_tf": "M1", "expiration": 1},
@@ -47,146 +50,115 @@ def _empty(reason: str = "sin señal") -> Dict[str, Any]:
 def _normalize(df: Optional[pd.DataFrame]) -> pd.DataFrame:
     if df is None or not isinstance(df, pd.DataFrame) or df.empty:
         return pd.DataFrame()
+
     d = df.copy().rename(columns={"max": "high", "min": "low"})
     required = ["open", "high", "low", "close"]
     if any(c not in d.columns for c in required):
         return pd.DataFrame()
+
     for c in required:
         d[c] = pd.to_numeric(d[c], errors="coerce")
+
     if "from" in d.columns:
         d["from"] = pd.to_numeric(d["from"], errors="coerce")
         d = d.sort_values("from")
+
     return d.dropna(subset=required).reset_index(drop=True)
 
 
-def _candle(row: pd.Series) -> Dict[str, float]:
-    o = float(row["open"]); h = float(row["high"])
-    l = float(row["low"]); c = float(row["close"])
-    rng = max(h - l, 1e-12)
-    return {
-        "open": o, "high": h, "low": l, "close": c,
-        "range": rng,
-        "body": abs(c - o),
-        "upper_wick": h - max(o, c),
-        "lower_wick": min(o, c) - l,
-    }
+def _choppiness_index(data: pd.DataFrame, period: int = CI_PERIOD) -> pd.Series:
+    """Calcula Choppiness Index estandar con TR y ventana de periodo."""
+    high = data["high"].astype(float)
+    low = data["low"].astype(float)
+    close = data["close"].astype(float)
+
+    previous_close = close.shift(1)
+    true_range = pd.concat(
+        [
+            high - low,
+            (high - previous_close).abs(),
+            (low - previous_close).abs(),
+        ],
+        axis=1,
+    ).max(axis=1)
+
+    atr_sum = true_range.rolling(period, min_periods=period).sum()
+    highest_high = high.rolling(period, min_periods=period).max()
+    lowest_low = low.rolling(period, min_periods=period).min()
+    price_range = highest_high - lowest_low
+
+    denominator = math.log10(period)
+    values = pd.Series(float("nan"), index=data.index, dtype=float)
+
+    valid = (
+        atr_sum.notna()
+        & highest_high.notna()
+        & lowest_low.notna()
+        & (price_range > 0)
+        & (atr_sum > 0)
+    )
+
+    values.loc[valid] = (
+        100.0
+        * (atr_sum.loc[valid] / price_range.loc[valid]).map(math.log10)
+        / denominator
+    )
+
+    return values
 
 
-def _near(price: float, level: float) -> bool:
-    return abs(price - level) <= max(abs(level) * TOUCH_TOLERANCE, 1e-12)
+def _cross_and_candle(data: pd.DataFrame) -> Optional[Dict[str, Any]]:
+    if len(data) < MIN_BARS:
+        return None
 
+    ci = _choppiness_index(data)
+    current = len(data) - 1
+    previous = current - 1
 
-def _last_swing_high(data: pd.DataFrame, end: int) -> Optional[tuple[int, float]]:
-    # Solo utiliza velas ya cerradas dentro del historial disponible.
-    start = max(1, end - LOOKBACK)
-    for i in range(end - 1, start - 1, -1):
-        h = float(data.iloc[i]["high"])
-        if h >= float(data.iloc[i - 1]["high"]) and h >= float(data.iloc[i + 1]["high"]):
-            return i, h
+    ci_prev = ci.iloc[previous]
+    ci_now = ci.iloc[current]
+    if pd.isna(ci_prev) or pd.isna(ci_now):
+        return None
+
+    row = data.iloc[current]
+    open_price = float(row["open"])
+    close_price = float(row["close"])
+    red = close_price < open_price
+    green = close_price > open_price
+
+    # Sobrecompra: CI cruza 61.8 hacia arriba + vela roja -> CALL siguiente vela.
+    crossed_overbought = float(ci_prev) <= OVERBOUGHT and float(ci_now) > OVERBOUGHT
+    if crossed_overbought and red:
+        return {
+            "signal": "call",
+            "ci_previous": float(ci_prev),
+            "ci_current": float(ci_now),
+            "threshold": OVERBOUGHT,
+            "level": "sobrecompra",
+            "candle_color": "roja",
+            "reason": (
+                f"CALL | Choppiness cruza sobrecompra {OVERBOUGHT:.1f} "
+                f"({ci_prev:.2f}->{ci_now:.2f}) | vela roja | siguiente M1"
+            ),
+        }
+
+    # Sobreventa: CI cruza 38.2 hacia abajo + vela verde -> PUT siguiente vela.
+    crossed_oversold = float(ci_prev) >= OVERSOLD and float(ci_now) < OVERSOLD
+    if crossed_oversold and green:
+        return {
+            "signal": "put",
+            "ci_previous": float(ci_prev),
+            "ci_current": float(ci_now),
+            "threshold": OVERSOLD,
+            "level": "sobreventa",
+            "candle_color": "verde",
+            "reason": (
+                f"PUT | Choppiness cruza sobreventa {OVERSOLD:.1f} "
+                f"({ci_prev:.2f}->{ci_now:.2f}) | vela verde | siguiente M1"
+            ),
+        }
+
     return None
-
-
-def _last_swing_low(data: pd.DataFrame, end: int) -> Optional[tuple[int, float]]:
-    start = max(1, end - LOOKBACK)
-    for i in range(end - 1, start - 1, -1):
-        l = float(data.iloc[i]["low"])
-        if l <= float(data.iloc[i - 1]["low"]) and l <= float(data.iloc[i + 1]["low"]):
-            return i, l
-    return None
-
-
-def _put_pattern(data: pd.DataFrame) -> Optional[Dict[str, Any]]:
-    # data[-1] = vela de confirmación. data[-2] = vela de rechazo.
-    confirm_idx = len(data) - 1
-    rejection_idx = confirm_idx - 1
-    if rejection_idx < 2:
-        return None
-
-    swing = _last_swing_high(data, rejection_idx)
-    if swing is None:
-        return None
-    swing_idx, resistance = swing
-    if swing_idx >= rejection_idx:
-        return None
-
-    rejection = _candle(data.iloc[rejection_idx])
-    confirmation = _candle(data.iloc[confirm_idx])
-
-    # Debe existir alejamiento real entre el primer toque y el regreso.
-    between = data.iloc[swing_idx + 1:rejection_idx]
-    if between.empty:
-        return None
-    away_low = float(between["low"].min())
-    min_away = max(abs(resistance) * MIN_AWAY_TOLERANCE, 1e-12)
-    if resistance - away_low < min_away:
-        return None
-
-    # Segundo toque/rechazo: la mecha llega al nivel y el cierre queda debajo.
-    touched = rejection["high"] >= resistance * (1 - TOUCH_TOLERANCE)
-    closed_below = rejection["close"] < resistance
-    wick_reject = rejection["upper_wick"] >= max(rejection["body"] * WICK_RATIO, 1e-12)
-    if not (touched and closed_below and wick_reject):
-        return None
-
-    # La siguiente vela debe ser roja.
-    confirmation_red = confirmation["close"] < confirmation["open"]
-    if not confirmation_red:
-        return None
-
-    return {
-        "signal": "put",
-        "level": resistance,
-        "level_type": "resistance",
-        "first_touch_index": swing_idx,
-        "rejection_index": rejection_idx,
-        "confirmation_index": confirm_idx,
-        "reason": "PUT | último máximo/resistencia | recorrido | segundo toque y rechazo | cierre debajo | siguiente vela roja",
-    }
-
-
-def _call_pattern(data: pd.DataFrame) -> Optional[Dict[str, Any]]:
-    confirm_idx = len(data) - 1
-    rejection_idx = confirm_idx - 1
-    if rejection_idx < 2:
-        return None
-
-    swing = _last_swing_low(data, rejection_idx)
-    if swing is None:
-        return None
-    swing_idx, support = swing
-    if swing_idx >= rejection_idx:
-        return None
-
-    rejection = _candle(data.iloc[rejection_idx])
-    confirmation = _candle(data.iloc[confirm_idx])
-
-    between = data.iloc[swing_idx + 1:rejection_idx]
-    if between.empty:
-        return None
-    away_high = float(between["high"].max())
-    min_away = max(abs(support) * MIN_AWAY_TOLERANCE, 1e-12)
-    if away_high - support < min_away:
-        return None
-
-    touched = rejection["low"] <= support * (1 + TOUCH_TOLERANCE)
-    closed_above = rejection["close"] > support
-    wick_reject = rejection["lower_wick"] >= max(rejection["body"] * WICK_RATIO, 1e-12)
-    if not (touched and closed_above and wick_reject):
-        return None
-
-    confirmation_green = confirmation["close"] > confirmation["open"]
-    if not confirmation_green:
-        return None
-
-    return {
-        "signal": "call",
-        "level": support,
-        "level_type": "support",
-        "first_touch_index": swing_idx,
-        "rejection_index": rejection_idx,
-        "confirmation_index": confirm_idx,
-        "reason": "CALL | último mínimo/soporte | recorrido | segundo toque y rechazo | cierre encima | siguiente vela verde",
-    }
 
 
 def analyze_market(
@@ -200,23 +172,18 @@ def analyze_market(
     if len(data) < MIN_BARS:
         return _empty(f"historial insuficiente {len(data)}/{MIN_BARS}")
 
-    # La función recibe únicamente velas cerradas desde bot.py.
-    put = _put_pattern(data)
-    call = _call_pattern(data)
+    pattern = _cross_and_candle(data)
+    if pattern is None:
+        return _empty("sin cruce CI + color de vela confirmado")
 
-    # Nunca se inventa una preferencia si ambos aparecieran simultáneamente.
-    if put and call:
-        return _empty("dos patrones simultáneos; entrada descartada")
+    ts = None
+    if "from" in data.columns and pd.notna(data.iloc[-1]["from"]):
+        ts = int(data.iloc[-1]["from"])
 
-    pattern = put or call
-    if not pattern:
-        return _empty("sin patrón confirmado")
-
-    ts = int(data.iloc[-1]["from"]) if "from" in data.columns and pd.notna(data.iloc[-1]["from"]) else None
     return {
         "signal": pattern["signal"],
         "direction": "bullish" if pattern["signal"] == "call" else "bearish",
-        "trend": "bullish" if pattern["signal"] == "call" else "bearish",
+        "trend": "range",
         "higher_trend": "range",
         "reason": pattern["reason"],
         "score": 0,
