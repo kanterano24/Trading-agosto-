@@ -1,41 +1,33 @@
 from __future__ import annotations
 
-"""Patron exacto de la imagen para entradas M1 con expiracion de 1 minuto.
+"""Estrategia M1 basada únicamente en el patrón visual definido por el usuario.
 
 PUT:
-1. Se toma el ultimo maximo confirmado como resistencia.
-2. El precio se aleja de esa resistencia.
-3. El precio regresa y toca la resistencia.
-4. La vela de rechazo toca la resistencia y termina por debajo de ella.
-5. La siguiente vela termina roja.
-6. Entrada PUT con expiracion de 1 minuto.
+1) último máximo/resistencia;
+2) precio se aleja del nivel;
+3) regresa al mismo nivel y lo toca/rechaza;
+4) la vela de rechazo cierra debajo de la resistencia;
+5) la siguiente vela cierra roja;
+6) entrada PUT, expiración 1 minuto.
 
-CALL es exactamente lo contrario:
-1. Ultimo minimo confirmado como soporte.
-2. El precio se aleja del soporte.
-3. Regresa y toca el soporte.
-4. La vela de rechazo toca el soporte y termina por encima.
-5. La siguiente vela termina verde.
-6. Entrada CALL con expiracion de 1 minuto.
-
-No se usan indicadores ni filtros adicionales.
+CALL: exactamente al contrario.
 """
 
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional
 import pandas as pd
 
-MIN_BARS = 20
-SWING_LEFT = 2
-SWING_RIGHT = 2
-SWING_LOOKBACK = 30
-ZONE_TOLERANCE = 0.0015
+MIN_BARS = 25
+LOOKBACK = 24
+TOUCH_TOLERANCE = 0.0010
+MIN_AWAY_TOLERANCE = 0.0015
+WICK_RATIO = 0.50
 
 MODE_CONFIG = {
     "M1_M1": {"analysis_tf": "M1", "entry_tf": "M1", "expiration": 1},
 }
 
 
-def _empty(reason: str = "sin señal", mode: str = "M1_M1") -> Dict[str, Any]:
+def _empty(reason: str = "sin señal") -> Dict[str, Any]:
     return {
         "signal": None,
         "direction": "range",
@@ -44,7 +36,7 @@ def _empty(reason: str = "sin señal", mode: str = "M1_M1") -> Dict[str, Any]:
         "reason": reason,
         "score": 0,
         "blocked": True,
-        "mode": mode,
+        "mode": "M1_M1",
         "analysis_timeframe": "M1",
         "entry_timeframe": "M1",
         "target_expiration_minutes": 1,
@@ -55,178 +47,145 @@ def _empty(reason: str = "sin señal", mode: str = "M1_M1") -> Dict[str, Any]:
 def _normalize(df: Optional[pd.DataFrame]) -> pd.DataFrame:
     if df is None or not isinstance(df, pd.DataFrame) or df.empty:
         return pd.DataFrame()
-
     d = df.copy().rename(columns={"max": "high", "min": "low"})
     required = ["open", "high", "low", "close"]
     if any(c not in d.columns for c in required):
         return pd.DataFrame()
-
     for c in required:
         d[c] = pd.to_numeric(d[c], errors="coerce")
-
     if "from" in d.columns:
         d["from"] = pd.to_numeric(d["from"], errors="coerce")
         d = d.sort_values("from")
-
     return d.dropna(subset=required).reset_index(drop=True)
 
 
-def _direction(row: pd.Series) -> str:
-    o = float(row["open"])
-    c = float(row["close"])
-    if c > o:
-        return "bullish"
-    if c < o:
-        return "bearish"
-    return "neutral"
+def _candle(row: pd.Series) -> Dict[str, float]:
+    o = float(row["open"]); h = float(row["high"])
+    l = float(row["low"]); c = float(row["close"])
+    rng = max(h - l, 1e-12)
+    return {
+        "open": o, "high": h, "low": l, "close": c,
+        "range": rng,
+        "body": abs(c - o),
+        "upper_wick": h - max(o, c),
+        "lower_wick": min(o, c) - l,
+    }
 
 
-def _swings(data: pd.DataFrame) -> Tuple[list, list]:
-    highs, lows = [], []
-    if len(data) < SWING_LEFT + SWING_RIGHT + 1:
-        return highs, lows
+def _near(price: float, level: float) -> bool:
+    return abs(price - level) <= max(abs(level) * TOUCH_TOLERANCE, 1e-12)
 
-    start = max(SWING_LEFT, len(data) - SWING_LOOKBACK - SWING_RIGHT)
-    end = len(data) - SWING_RIGHT
 
-    for i in range(start, end):
+def _last_swing_high(data: pd.DataFrame, end: int) -> Optional[tuple[int, float]]:
+    # Solo utiliza velas ya cerradas dentro del historial disponible.
+    start = max(1, end - LOOKBACK)
+    for i in range(end - 1, start - 1, -1):
         h = float(data.iloc[i]["high"])
+        if h >= float(data.iloc[i - 1]["high"]) and h >= float(data.iloc[i + 1]["high"]):
+            return i, h
+    return None
+
+
+def _last_swing_low(data: pd.DataFrame, end: int) -> Optional[tuple[int, float]]:
+    start = max(1, end - LOOKBACK)
+    for i in range(end - 1, start - 1, -1):
         l = float(data.iloc[i]["low"])
-
-        left_high = float(data.iloc[i - SWING_LEFT:i]["high"].max())
-        right_high = float(data.iloc[i + 1:i + 1 + SWING_RIGHT]["high"].max())
-        left_low = float(data.iloc[i - SWING_LEFT:i]["low"].min())
-        right_low = float(data.iloc[i + 1:i + 1 + SWING_RIGHT]["low"].min())
-
-        if h >= left_high and h >= right_high:
-            highs.append((i, h))
-        if l <= left_low and l <= right_low:
-            lows.append((i, l))
-
-    return highs, lows
-
-
-def _m15_direction(higher: pd.DataFrame) -> str:
-    """Solo conserva el contexto M15 ya usado por el bot."""
-    if higher is None or len(higher) < 4:
-        return "range"
-
-    highs, lows = _swings(higher)
-    if len(highs) < 2 or len(lows) < 2:
-        return "range"
-
-    if highs[-1][1] < highs[-2][1] and lows[-1][1] < lows[-2][1]:
-        return "bearish"
-    if highs[-1][1] > highs[-2][1] and lows[-1][1] > lows[-2][1]:
-        return "bullish"
-    return "range"
+        if l <= float(data.iloc[i - 1]["low"]) and l <= float(data.iloc[i + 1]["low"]):
+            return i, l
+    return None
 
 
 def _put_pattern(data: pd.DataFrame) -> Optional[Dict[str, Any]]:
-    """Detecta solamente el patron PUT dibujado en la imagen."""
-    # La ultima vela es la confirmacion roja. La anterior es el rechazo.
-    if len(data) < 4:
+    # data[-1] = vela de confirmación. data[-2] = vela de rechazo.
+    confirm_idx = len(data) - 1
+    rejection_idx = confirm_idx - 1
+    if rejection_idx < 2:
         return None
 
-    rejection_idx = len(data) - 2
-    rejection = data.iloc[rejection_idx]
-
-    # El ultimo maximo confirmado antes del recorrido/regreso.
-    search_end = rejection_idx - SWING_RIGHT
-    if search_end <= SWING_LEFT:
+    swing = _last_swing_high(data, rejection_idx)
+    if swing is None:
+        return None
+    swing_idx, resistance = swing
+    if swing_idx >= rejection_idx:
         return None
 
-    search_data = data.iloc[: search_end + 1].copy()
-    highs, _ = _swings(search_data)
-    if not highs:
+    rejection = _candle(data.iloc[rejection_idx])
+    confirmation = _candle(data.iloc[confirm_idx])
+
+    # Debe existir alejamiento real entre el primer toque y el regreso.
+    between = data.iloc[swing_idx + 1:rejection_idx]
+    if between.empty:
+        return None
+    away_low = float(between["low"].min())
+    min_away = max(abs(resistance) * MIN_AWAY_TOLERANCE, 1e-12)
+    if resistance - away_low < min_away:
         return None
 
-    swing_idx, resistance = highs[-1]
-
-    # Debe existir recorrido despues del maximo antes de volver a tocarlo.
-    after_swing = data.iloc[swing_idx + 1:rejection_idx]
-    if after_swing.empty:
+    # Segundo toque/rechazo: la mecha llega al nivel y el cierre queda debajo.
+    touched = rejection["high"] >= resistance * (1 - TOUCH_TOLERANCE)
+    closed_below = rejection["close"] < resistance
+    wick_reject = rejection["upper_wick"] >= max(rejection["body"] * WICK_RATIO, 1e-12)
+    if not (touched and closed_below and wick_reject):
         return None
 
-    lowest_after_swing = float(after_swing["low"].min())
-    if lowest_after_swing >= resistance:
-        return None
-
-    # La vela de rechazo toca la resistencia y termina por debajo.
-    rejection_high = float(rejection["high"])
-    rejection_close = float(rejection["close"])
-    if rejection_high < resistance * (1 - ZONE_TOLERANCE):
-        return None
-    if rejection_close >= resistance:
-        return None
-
-    # La vela siguiente debe terminar roja.
-    confirmation = data.iloc[-1]
-    if _direction(confirmation) != "bearish":
+    # La siguiente vela debe ser roja.
+    confirmation_red = confirmation["close"] < confirmation["open"]
+    if not confirmation_red:
         return None
 
     return {
         "signal": "put",
-        "swing_index": int(swing_idx),
-        "level": float(resistance),
-        "rejection_index": int(rejection_idx),
-        "confirmation_index": int(len(data) - 1),
-        "rejection_close": rejection_close,
-        "rejection_high": rejection_high,
-        "confirmation_close": float(confirmation["close"]),
+        "level": resistance,
+        "level_type": "resistance",
+        "first_touch_index": swing_idx,
+        "rejection_index": rejection_idx,
+        "confirmation_index": confirm_idx,
+        "reason": "PUT | último máximo/resistencia | recorrido | segundo toque y rechazo | cierre debajo | siguiente vela roja",
     }
 
 
 def _call_pattern(data: pd.DataFrame) -> Optional[Dict[str, Any]]:
-    """Detecta solamente el patron CALL inverso al PUT de la imagen."""
-    if len(data) < 4:
+    confirm_idx = len(data) - 1
+    rejection_idx = confirm_idx - 1
+    if rejection_idx < 2:
         return None
 
-    rejection_idx = len(data) - 2
-    rejection = data.iloc[rejection_idx]
-
-    search_end = rejection_idx - SWING_RIGHT
-    if search_end <= SWING_LEFT:
+    swing = _last_swing_low(data, rejection_idx)
+    if swing is None:
+        return None
+    swing_idx, support = swing
+    if swing_idx >= rejection_idx:
         return None
 
-    search_data = data.iloc[: search_end + 1].copy()
-    _, lows = _swings(search_data)
-    if not lows:
+    rejection = _candle(data.iloc[rejection_idx])
+    confirmation = _candle(data.iloc[confirm_idx])
+
+    between = data.iloc[swing_idx + 1:rejection_idx]
+    if between.empty:
+        return None
+    away_high = float(between["high"].max())
+    min_away = max(abs(support) * MIN_AWAY_TOLERANCE, 1e-12)
+    if away_high - support < min_away:
         return None
 
-    swing_idx, support = lows[-1]
-
-    # Debe existir recorrido despues del minimo antes de volver a tocarlo.
-    after_swing = data.iloc[swing_idx + 1:rejection_idx]
-    if after_swing.empty:
+    touched = rejection["low"] <= support * (1 + TOUCH_TOLERANCE)
+    closed_above = rejection["close"] > support
+    wick_reject = rejection["lower_wick"] >= max(rejection["body"] * WICK_RATIO, 1e-12)
+    if not (touched and closed_above and wick_reject):
         return None
 
-    highest_after_swing = float(after_swing["high"].max())
-    if highest_after_swing <= support:
-        return None
-
-    # La vela de rechazo toca el soporte y termina por encima.
-    rejection_low = float(rejection["low"])
-    rejection_close = float(rejection["close"])
-    if rejection_low > support * (1 + ZONE_TOLERANCE):
-        return None
-    if rejection_close <= support:
-        return None
-
-    # La vela siguiente debe terminar verde.
-    confirmation = data.iloc[-1]
-    if _direction(confirmation) != "bullish":
+    confirmation_green = confirmation["close"] > confirmation["open"]
+    if not confirmation_green:
         return None
 
     return {
         "signal": "call",
-        "swing_index": int(swing_idx),
-        "level": float(support),
-        "rejection_index": int(rejection_idx),
-        "confirmation_index": int(len(data) - 1),
-        "rejection_close": rejection_close,
-        "rejection_low": rejection_low,
-        "confirmation_close": float(confirmation["close"]),
+        "level": support,
+        "level_type": "support",
+        "first_touch_index": swing_idx,
+        "rejection_index": rejection_idx,
+        "confirmation_index": confirm_idx,
+        "reason": "CALL | último mínimo/soporte | recorrido | segundo toque y rechazo | cierre encima | siguiente vela verde",
     }
 
 
@@ -237,66 +196,43 @@ def analyze_market(
     higher_tf_df: Optional[pd.DataFrame] = None,
     **kwargs: Any,
 ) -> Dict[str, Any]:
-    mode = "M1_M1"
     data = _normalize(df)
-
     if len(data) < MIN_BARS:
-        return _empty(f"historial M1 insuficiente {len(data)}/{MIN_BARS}", mode)
+        return _empty(f"historial insuficiente {len(data)}/{MIN_BARS}")
 
-    higher = _normalize(higher_tf_df)
-    m15_trend = _m15_direction(higher)
-
-    # La imagen define la señal solo por el patron de nivel + recorrido +
-    # regreso + rechazo + vela siguiente. No se agrega otro filtro a la señal.
+    # La función recibe únicamente velas cerradas desde bot.py.
     put = _put_pattern(data)
     call = _call_pattern(data)
 
+    # Nunca se inventa una preferencia si ambos aparecieran simultáneamente.
+    if put and call:
+        return _empty("dos patrones simultáneos; entrada descartada")
+
     pattern = put or call
-    if pattern is None:
-        return {
-            **_empty("patron de la imagen no confirmado", mode),
-            "higher_trend": m15_trend,
-            "analysis": {
-                "pair": pair,
-                "m15_trend": m15_trend,
-            },
-        }
+    if not pattern:
+        return _empty("sin patrón confirmado")
 
-    signal = pattern["signal"]
-    level_name = "RESISTENCIA" if signal == "put" else "SOPORTE"
-    rejection_color = "bajista" if signal == "put" else "alcista"
-    confirmation_color = "roja" if signal == "put" else "verde"
-
-    reason = (
-        f"{signal.upper()} | ultimo nivel {level_name} | "
-        f"recorrido y regreso | rechazo {rejection_color} "
-        f"cerrado {'debajo' if signal == 'put' else 'encima'} del nivel | "
-        f"siguiente vela {confirmation_color} | expiracion 1m"
-    )
-
+    ts = int(data.iloc[-1]["from"]) if "from" in data.columns and pd.notna(data.iloc[-1]["from"]) else None
     return {
-        "signal": signal,
-        "direction": signal,
-        "trend": m15_trend,
-        "higher_trend": m15_trend,
-        "reason": reason,
+        "signal": pattern["signal"],
+        "direction": "bullish" if pattern["signal"] == "call" else "bearish",
+        "trend": "bullish" if pattern["signal"] == "call" else "bearish",
+        "higher_trend": "range",
+        "reason": pattern["reason"],
         "score": 0,
         "blocked": False,
-        "mode": mode,
+        "mode": "M1_M1",
         "analysis_timeframe": "M1",
         "entry_timeframe": "M1",
         "target_expiration_minutes": 1,
-        "analysis": {
-            "pair": pair,
-            "m15_trend": m15_trend,
-            "pattern": pattern,
-        },
+        "candle_timestamp": ts,
+        "analysis": pattern,
     }
 
 
-def get_signal(df: pd.DataFrame) -> Optional[str]:
-    return analyze_market(df=df, mode="M1_M1").get("signal")
+def get_signal(df):
+    return analyze_market(df=df).get("signal")
 
 
-def signal(df: pd.DataFrame) -> Optional[str]:
+def signal(df):
     return get_signal(df)
