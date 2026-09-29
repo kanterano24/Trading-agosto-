@@ -164,7 +164,7 @@ def telegram_loop() -> None:
                         "M2→M2 2m\n"
                         "M5→M5 5m\n\n"
                         f"OTC analizados: hasta {MAX_PAIRS}\n"
-                        "Regla de entrada: rechazo S/R + confirmacion.\n"
+                        "Regla de entrada: estructura + tendencia + impulso en 30 velas.\n"
                         "Solo una entrada por evento."
                     )
 
@@ -293,7 +293,7 @@ def connect() -> None:
         "M2→M2 2m\n"
         "M5→M5 5m\n"
         f"OTC seleccionados: {len(PAIRS)}\n"
-        "Entrada: rechazo S/R + confirmacion"
+        "Entrada: estructura + tendencia + impulso en 30 velas"
     )
 
 
@@ -854,7 +854,7 @@ def main() -> None:
         "M2→M2 | análisis M2 | expiración 2m\n"
         "M5→M5 | análisis M5 | expiración 5m\n\n"
         f"Hasta {MAX_PAIRS} OTC.\n"
-        "Entrada solo con rechazo S/R + confirmacion.\n"
+        "Entrada solo a favor de estructura + tendencia + impulso.\n"
         "Usa /start para activar."
     )
 
