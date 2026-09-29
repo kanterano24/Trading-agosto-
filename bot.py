@@ -89,6 +89,10 @@ TRADE_COOLDOWN = float(os.getenv("TRADE_COOLDOWN", "60"))
 # Con la nueva estrategia, 80 significa confluencia fuerte.
 MIN_SCORE = int(os.getenv("MIN_SCORE_TO_TRADE", "80"))
 
+# No se ejecuta una señal si el análisis ya perdió la vela de entrada.
+# Esto evita entrar tarde después de analizar los 50 pares.
+MAX_ENTRY_DELAY_SECONDS = float(os.getenv("MAX_ENTRY_DELAY_SECONDS", "2.0"))
+
 
 # ---------------------------------------------------------------------------
 # STATE
@@ -164,7 +168,7 @@ def telegram_loop() -> None:
                         "M2→M2 2m\n"
                         "M5→M5 5m\n\n"
                         f"OTC analizados: hasta {MAX_PAIRS}\n"
-                        "Regla de entrada: estructura + tendencia + impulso en 30 velas.\n"
+                        "Regla de entrada: rechazo S/R + confirmacion + estructura.\n"
                         "Solo una entrada por evento."
                     )
 
@@ -293,7 +297,7 @@ def connect() -> None:
         "M2→M2 2m\n"
         "M5→M5 5m\n"
         f"OTC seleccionados: {len(PAIRS)}\n"
-        "Entrada: estructura + tendencia + impulso en 30 velas"
+        "Entrada: rechazo S/R + confirmacion + estructura"
     )
 
 
@@ -643,14 +647,30 @@ def analyze_event(
         ),
     )
 
-    # Una sola operacion por evento: la mayor confluencia.
-    return max(
-        candidates,
-        key=lambda c: (
-            int(c["score"]),
-            1 if c["signal"] == "call" else 0,
-        ),
-    )
+    # Una sola operacion por evento.
+    # Desempatamos por calidad objetiva del setup, no por CALL/PUT.
+    def rank(c):
+        a = c.get("analysis", {}) or {}
+        rejection = a.get("rejection", {}) or {}
+        confirmation = a.get("confirmation", {}) or {}
+        pressure = a.get("pressure", {}) or {}
+        room = a.get("room", {}) or {}
+
+        freshness = max(0, 4 - int(rejection.get("age", 4) or 4))
+        break_bonus = 1 if confirmation.get("break_rejection") else 0
+        pressure_count = int(pressure.get("aligned_count", 0) or 0)
+        room_ranges = float(room.get("ranges", 0.0) or 0.0)
+
+        return (
+            int(c.get("score", 0)),
+            break_bonus,
+            freshness,
+            pressure_count,
+            room_ranges,
+        )
+
+    candidates.sort(key=rank, reverse=True)
+    return candidates[0]
 
 
 # ---------------------------------------------------------------------------
@@ -805,12 +825,25 @@ def process() -> None:
 
         if current_entry > candidate["entry_ts"]:
             tg(
-                f"⚠️ ANÁLISIS TERMINÓ TARDE\n\n"
+                f"⏭️ SEÑAL DESCARTADA POR RETRASO\n\n"
                 f"Par: {candidate['pair']}\n"
                 f"Modo: {MODE_LABEL[candidate['mode']]}\n"
                 f"Tiempo análisis: {elapsed:.2f}s\n"
-                f"Se ejecutará en la vela actual."
+                "La oportunidad ya no corresponde a la vela analizada."
             )
+            continue
+
+        if current_entry == candidate["entry_ts"]:
+            delay = max(0.0, current - candidate["entry_ts"])
+            if delay > MAX_ENTRY_DELAY_SECONDS:
+                tg(
+                    f"⏭️ SEÑAL DESCARTADA POR ENTRADA TARDÍA\n\n"
+                    f"Par: {candidate['pair']}\n"
+                    f"Modo: {MODE_LABEL[candidate['mode']]}\n"
+                    f"Retraso: {delay:.2f}s\n"
+                    f"Límite: {MAX_ENTRY_DELAY_SECONDS:.1f}s"
+                )
+                continue
 
         execute(candidate)
 
@@ -854,7 +887,7 @@ def main() -> None:
         "M2→M2 | análisis M2 | expiración 2m\n"
         "M5→M5 | análisis M5 | expiración 5m\n\n"
         f"Hasta {MAX_PAIRS} OTC.\n"
-        "Entrada solo a favor de estructura + tendencia + impulso.\n"
+        "Entrada solo con rechazo S/R + confirmacion + estructura.\n"
         "Usa /start para activar."
     )
 
