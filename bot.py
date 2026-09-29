@@ -44,40 +44,26 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 # ---------------------------------------------------------------------------
 
 M1 = 60
-M2 = 120
-M5 = 300
+M15 = 900
 
-EXPIRATION = {
-    "M1_M1": 1,
-    "M2_M2": 2,
-    "M5_M5": 5,
-}
+EXPIRATION = {"M1_M1": 1}
 
-TIMEFRAME = {
-    "M1": M1,
-    "M2": M2,
-    "M5": M5,
-}
+TIMEFRAME = {"M1": M1, "M15": M15}
 
-MODE_LABEL = {
-    "M1_M1": "M1→M1",
-    "M2_M2": "M2→M2",
-    "M5_M5": "M5→M5",
-}
+MODE_LABEL = {"M1_M1": "M15→M1"}
 
 
 # ---------------------------------------------------------------------------
 # PERFORMANCE / SELECTION
 # ---------------------------------------------------------------------------
 
-AMOUNT = float(os.getenv("AMOUNT", "500"))
+AMOUNT = float(os.getenv("AMOUNT", "600"))
 
-# Para M5 necesitamos aproximadamente 160 M1 para reconstruir 30 velas M5
-# mas contexto. 180 deja margen sin pedir 360 velas innecesariamente.
-CANDLE_COUNT_M1 = int(os.getenv("CANDLE_COUNT_M1", "180"))
+# Para M15 necesitamos bloques M1 suficientes para contexto y estructura.
+CANDLE_COUNT_M1 = int(os.getenv("CANDLE_COUNT_M1", "240"))
 
-# Se analizan exactamente hasta 50 OTC, como se solicito.
-MAX_PAIRS = int(os.getenv("MAX_OTC_PAIRS", "50"))
+# Se analizan exactamente 3 OTC disponibles.
+MAX_PAIRS = 30
 
 # 12 es un punto medio para acelerar sin disparar demasiado las peticiones
 # simultaneas al websocket.
@@ -160,11 +146,9 @@ def telegram_loop() -> None:
                     BOT_RUNNING = True
                     tg(
                         "🟢 BOT ACTIVADO\n\n"
-                        "M1→M1 1m\n"
-                        "M2→M2 2m\n"
-                        "M5→M5 5m\n\n"
+                        "M15→M1 | expiracion 1m\n"
                         f"OTC analizados: hasta {MAX_PAIRS}\n"
-                        "Regla de entrada: estructura + tendencia + impulso en 30 velas.\n"
+                        "Regla: M15 tendencia + M1 LH/LL o HL/HH + rechazo S/R + confirmación.\n"
                         "Solo una entrada por evento."
                     )
 
@@ -289,11 +273,9 @@ def connect() -> None:
 
     tg(
         "🟢 IQ OPTION CONECTADO\n\n"
-        "M1→M1 1m\n"
-        "M2→M2 2m\n"
-        "M5→M5 5m\n"
+        "M15→M1 | expiración 1m\n"
         f"OTC seleccionados: {len(PAIRS)}\n"
-        "Entrada: estructura + tendencia + impulso en 30 velas"
+        "Entrada: M15 + estructura M1 + rechazo S/R + ruptura + confirmacion"
     )
 
 
@@ -357,7 +339,7 @@ def aggregate_m1(
     timeframe: int,
     last_closed_start: int,
 ) -> pd.DataFrame:
-    """Construye M2/M5 solo con bloques M1 completos ya cerrados."""
+    """Construye M15 solo con bloques M1 completos ya cerrados."""
 
     if m1 is None or m1.empty:
         return pd.DataFrame()
@@ -431,14 +413,12 @@ def higher_context(
     mode: str,
     closed_start: int,
 ) -> Optional[pd.DataFrame]:
-    # M1/M2 se validan contra M5.
-    if mode in ("M1_M1", "M2_M2"):
+    if mode == "M1_M1":
         return aggregate_m1(
             m1,
-            M5,
-            floor_ts(closed_start, M5),
+            M15,
+            floor_ts(closed_start, M15),
         )
-
     return None
 
 
@@ -685,8 +665,15 @@ def execute(candidate) -> bool:
     if current_entry < candidate["entry_ts"]:
         return False
 
-    # Si termina tarde, se conserva la instruccion del usuario:
-    # se entra en la vela del timeframe que este actualmente abierta.
+    # Para una expiracion de 1 minuto no se entra tarde.
+    # Si el analisis perdio la apertura, la senal queda invalidada.
+    if current_entry > candidate["entry_ts"]:
+        logger.info(
+            "SEÑAL DESCARTADA POR RETRASO | %s | evento=%s | actual=%s",
+            candidate["pair"], candidate["entry_ts"], current_entry,
+        )
+        return False
+
     if current_entry == LAST_TRADE_ENTRY:
         return False
 
@@ -767,15 +754,7 @@ def process() -> None:
     now = server_ts()
     current_m1 = floor_ts(now, M1)
 
-    events = [
-        ("M1_M1", current_m1),
-    ]
-
-    if current_m1 % M2 == 0:
-        events.append(("M2_M2", current_m1))
-
-    if current_m1 % M5 == 0:
-        events.append(("M5_M5", current_m1))
+    events = [("M1_M1", current_m1)]
 
     for mode, event_ts in events:
         event_key = f"{mode}:{event_ts}"
@@ -796,21 +775,6 @@ def process() -> None:
 
         if not candidate:
             continue
-
-        current = server_ts()
-        current_entry = floor_ts(
-            current,
-            candidate["entry_tf"],
-        )
-
-        if current_entry > candidate["entry_ts"]:
-            tg(
-                f"⚠️ ANÁLISIS TERMINÓ TARDE\n\n"
-                f"Par: {candidate['pair']}\n"
-                f"Modo: {MODE_LABEL[candidate['mode']]}\n"
-                f"Tiempo análisis: {elapsed:.2f}s\n"
-                f"Se ejecutará en la vela actual."
-            )
 
         execute(candidate)
 
@@ -850,11 +814,9 @@ def main() -> None:
 
     tg(
         "🤖 BOT LISTO\n\n"
-        "M1→M1 | análisis M1 | expiración 1m\n"
-        "M2→M2 | análisis M2 | expiración 2m\n"
-        "M5→M5 | análisis M5 | expiración 5m\n\n"
+        "M15→M1 | analisis M1 | expiracion 1m\n"
         f"Hasta {MAX_PAIRS} OTC.\n"
-        "Entrada solo a favor de estructura + tendencia + impulso.\n"
+        "Entrada: M15 + estructura M1 + rechazo S/R + confirmación.\n"
         "Usa /start para activar."
     )
 
