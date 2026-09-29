@@ -2,15 +2,16 @@ from __future__ import annotations
 
 """Estrategia de accion del precio para M1, M2 y M5.
 
-Reglas principales:
-- M1 -> expiracion 1 minuto.
-- M2 -> expiracion 2 minutos.
-- M5 -> expiracion 5 minutos.
-- Solo usa velas cerradas y accion del precio; no usa indicadores.
-- La entrada siempre va en la direccion de la vela analizada.
-- M1 y M2 no pueden operar contra la tendencia M5 cerrada.
-- Una vela de reversa por si sola NO genera una entrada contra la tendencia.
-- Dojis/indecision bloquean la entrada.
+Objetivo:
+- M1 -> M1 -> 1 minuto.
+- M2 -> M2 -> 2 minutos.
+- M5 -> M5 -> 5 minutos.
+- M1/M2 solo operan en la direccion de una tendencia M5 clara.
+- Toda entrada exige un rechazo real de soporte/resistencia y una vela
+  posterior de confirmacion en la misma direccion.
+- Una reversa aislada, una vela sin cuerpo suficiente o una entrada pegada
+  al nivel contrario se bloquean.
+- Solo se usan velas cerradas y precio/estructura; no se usan indicadores.
 """
 
 from typing import Any, Dict, Optional, Tuple
@@ -21,11 +22,17 @@ SWING_LEFT = 2
 SWING_RIGHT = 2
 SWING_LOOKBACK = 30
 SR_LOOKBACK = 20
+
+# Tolerancia para considerar que una mecha toco una zona.
 ZONE_TOLERANCE = 0.0015
+
 DOJI_BODY_MAX = 0.10
 INDECISION_BODY_MAX = 0.25
+CONFIRM_BODY_MIN = 0.35
 STRONG_BODY_MIN = 0.55
 WICK_BODY_MIN = 1.20
+MIN_ROOM_RANGES = 1.20
+REJECTION_LOOKBACK = 3
 
 MODE_CONFIG = {
     "M1_M1": {"analysis_tf": "M1", "entry_tf": "M1", "expiration": 1},
@@ -55,23 +62,28 @@ def _empty(reason: str = "sin señal", mode: str = "") -> Dict[str, Any]:
 def _normalize(df: Optional[pd.DataFrame]) -> pd.DataFrame:
     if df is None or not isinstance(df, pd.DataFrame) or df.empty:
         return pd.DataFrame()
-    d = df.copy()
-    d = d.rename(columns={"max": "high", "min": "low"})
+
+    d = df.copy().rename(columns={"max": "high", "min": "low"})
     required = ["open", "high", "low", "close"]
     if any(c not in d.columns for c in required):
         return pd.DataFrame()
+
     for c in required:
         d[c] = pd.to_numeric(d[c], errors="coerce")
+
     if "from" in d.columns:
         d["from"] = pd.to_numeric(d["from"], errors="coerce")
         d = d.sort_values("from")
+
     return d.dropna(subset=required).reset_index(drop=True)
 
 
 def _direction(row: pd.Series) -> str:
-    if float(row["close"]) > float(row["open"]):
+    close = float(row["close"])
+    open_ = float(row["open"])
+    if close > open_:
         return "bullish"
-    if float(row["close"]) < float(row["open"]):
+    if close < open_:
         return "bearish"
     return "neutral"
 
@@ -83,8 +95,12 @@ def _metrics(row: pd.Series) -> Dict[str, float]:
     upper = h - max(o, c)
     lower = min(o, c) - l
     return {
-        "open": o, "high": h, "low": l, "close": c,
-        "range": rng, "body": body,
+        "open": o,
+        "high": h,
+        "low": l,
+        "close": c,
+        "range": rng,
+        "body": body,
         "body_ratio": body / rng,
         "upper_wick": upper,
         "lower_wick": lower,
@@ -98,32 +114,39 @@ def _swings(data: pd.DataFrame) -> Tuple[list, list]:
     highs, lows = [], []
     start = max(SWING_LEFT, len(data) - SWING_LOOKBACK - SWING_RIGHT)
     end = len(data) - SWING_RIGHT
+
     for i in range(start, end):
         h = float(data.iloc[i]["high"])
         l = float(data.iloc[i]["low"])
-        lh = data.iloc[i-SWING_LEFT:i]["high"].max()
-        rh = data.iloc[i+1:i+1+SWING_RIGHT]["high"].max()
-        ll = data.iloc[i-SWING_LEFT:i]["low"].min()
-        rl = data.iloc[i+1:i+1+SWING_RIGHT]["low"].min()
+
+        lh = data.iloc[i - SWING_LEFT:i]["high"].max()
+        rh = data.iloc[i + 1:i + 1 + SWING_RIGHT]["high"].max()
+        ll = data.iloc[i - SWING_LEFT:i]["low"].min()
+        rl = data.iloc[i + 1:i + 1 + SWING_RIGHT]["low"].min()
+
         if h >= float(lh) and h >= float(rh):
             highs.append((i, h))
         if l <= float(ll) and l <= float(rl):
             lows.append((i, l))
+
     return highs, lows
 
 
 def _structure(data: pd.DataFrame) -> Dict[str, Any]:
     highs, lows = _swings(data)
     structure = "range"
+
     if len(highs) >= 2 and len(lows) >= 2:
         hh = highs[-1][1] > highs[-2][1]
         hl = lows[-1][1] > lows[-2][1]
         lh = highs[-1][1] < highs[-2][1]
         ll = lows[-1][1] < lows[-2][1]
+
         if hh and hl:
             structure = "bullish"
         elif lh and ll:
             structure = "bearish"
+
     return {
         "structure": structure,
         "highs": highs,
@@ -135,37 +158,100 @@ def _structure(data: pd.DataFrame) -> Dict[str, Any]:
     }
 
 
+def _price_action_trend(data: pd.DataFrame, lookback: int = 7) -> str:
+    if data is None or len(data) < lookback:
+        return "range"
+
+    recent = data.iloc[-lookback:]
+    dirs = [_direction(row) for _, row in recent.iterrows()]
+    bull = sum(x == "bullish" for x in dirs)
+    bear = sum(x == "bearish" for x in dirs)
+
+    net = float(recent.iloc[-1]["close"]) - float(recent.iloc[0]["close"])
+    ranges = (recent["high"] - recent["low"]).astype(float)
+    typical = float(ranges.median()) if not ranges.empty else 0.0
+
+    if typical <= 0:
+        return "range"
+
+    # No basta con el color de las velas: debe existir desplazamiento.
+    if bull >= 5 and net > 0.8 * typical:
+        return "bullish"
+    if bear >= 5 and net < -0.8 * typical:
+        return "bearish"
+    if bull >= 4 and net > 1.2 * typical:
+        return "bullish"
+    if bear >= 4 and net < -1.2 * typical:
+        return "bearish"
+
+    return "range"
+
+
+def _combined_trend(data: pd.DataFrame) -> Dict[str, Any]:
+    st = _structure(data)
+    swing = st["structure"]
+    price = _price_action_trend(data, lookback=7)
+
+    if swing == price and swing in ("bullish", "bearish"):
+        combined = swing
+    elif swing in ("bullish", "bearish") and price == "range":
+        combined = swing
+    elif price in ("bullish", "bearish") and swing == "range":
+        combined = price
+    else:
+        # Dos lecturas opuestas = no se adivina.
+        combined = "range"
+
+    return {
+        "trend": combined,
+        "swing": swing,
+        "price": price,
+        "structure": st,
+    }
+
+
 def _candle_info(data: pd.DataFrame) -> Dict[str, Any]:
     i = len(data) - 1
     cur = _metrics(data.iloc[i])
     prev = _metrics(data.iloc[i - 1]) if i else cur
+
     direction = _direction(data.iloc[i])
-    prev_direction = _direction(data.iloc[i - 1]) if i else "neutral"
+    previous_direction = _direction(data.iloc[i - 1]) if i else "neutral"
+
     doji = cur["body_ratio"] <= DOJI_BODY_MAX
     indecision = cur["body_ratio"] <= INDECISION_BODY_MAX
     strong = cur["body_ratio"] >= STRONG_BODY_MIN
+
     bullish_momentum = (
-        direction == "bullish" and cur["body_ratio"] >= 0.50
-        and cur["close_pos"] >= 0.70 and cur["close"] > prev["high"]
+        direction == "bullish"
+        and cur["body_ratio"] >= 0.50
+        and cur["close_pos"] >= 0.70
+        and cur["close"] > prev["high"]
     )
     bearish_momentum = (
-        direction == "bearish" and cur["body_ratio"] >= 0.50
-        and cur["close_pos"] <= 0.30 and cur["close"] < prev["low"]
+        direction == "bearish"
+        and cur["body_ratio"] >= 0.50
+        and cur["close_pos"] <= 0.30
+        and cur["close"] < prev["low"]
     )
+
     bullish_engulf = (
-        direction == "bullish" and prev_direction == "bearish"
-        and cur["open"] <= prev["close"] and cur["close"] >= prev["open"]
+        direction == "bullish"
+        and previous_direction == "bearish"
+        and cur["open"] <= prev["close"]
+        and cur["close"] >= prev["open"]
     )
     bearish_engulf = (
-        direction == "bearish" and prev_direction == "bullish"
-        and cur["open"] >= prev["close"] and cur["close"] <= prev["open"]
+        direction == "bearish"
+        and previous_direction == "bullish"
+        and cur["open"] >= prev["close"]
+        and cur["close"] <= prev["open"]
     )
-    upper_rejection = cur["upper_body"] >= WICK_BODY_MIN and cur["close_pos"] <= 0.45
-    lower_rejection = cur["lower_body"] >= WICK_BODY_MIN and cur["close_pos"] >= 0.55
+
     return {
         **cur,
         "direction": direction,
-        "previous_direction": prev_direction,
+        "previous_direction": previous_direction,
         "doji": doji,
         "indecision": indecision,
         "strong": strong,
@@ -173,28 +259,34 @@ def _candle_info(data: pd.DataFrame) -> Dict[str, Any]:
         "bearish_momentum": bearish_momentum,
         "bullish_engulf": bullish_engulf,
         "bearish_engulf": bearish_engulf,
-        "upper_rejection": upper_rejection,
-        "lower_rejection": lower_rejection,
     }
 
 
 def _recent_pressure(data: pd.DataFrame, trend: str) -> Dict[str, Any]:
-    """Presion reciente estricta: evita una vela aislada contra el movimiento."""
     if len(data) < 5 or trend not in ("bullish", "bearish"):
-        return {"aligned": False, "aligned_count": 0, "opposite_count": 0,
-                "last_two_aligned": False, "net_aligned": False, "directions": []}
+        return {
+            "aligned": False,
+            "aligned_count": 0,
+            "opposite_count": 0,
+            "last_two_aligned": False,
+            "net_aligned": False,
+            "directions": [],
+            "net_move": 0.0,
+        }
 
     recent = data.iloc[-5:]
     dirs = [_direction(row) for _, row in recent.iterrows()]
-    aligned = trend
-    aligned_count = sum(1 for x in dirs if x == aligned)
-    opposite_count = sum(1 for x in dirs if x not in (aligned, "neutral"))
-    last_two_aligned = dirs[-1] == aligned and dirs[-2] == aligned
-    # Desplazamiento neto de las ultimas 5 velas.
+    aligned_count = sum(1 for x in dirs if x == trend)
+    opposite_count = sum(
+        1 for x in dirs if x not in (trend, "neutral")
+    )
+
+    last_two_aligned = dirs[-1] == trend and dirs[-2] == trend
+
     first_close = float(recent.iloc[0]["close"])
     last_close = float(recent.iloc[-1]["close"])
     net_move = last_close - first_close
-    net_aligned = net_move > 0 if aligned == "bullish" else net_move < 0
+    net_aligned = net_move > 0 if trend == "bullish" else net_move < 0
 
     return {
         "aligned": aligned_count >= 3 and net_aligned,
@@ -207,221 +299,442 @@ def _recent_pressure(data: pd.DataFrame, trend: str) -> Dict[str, Any]:
     }
 
 
-def _price_action_trend(data: pd.DataFrame, lookback: int = 7) -> str:
-    """Clasifica impulso reciente con precio/velas, sin indicadores."""
-    if data is None or len(data) < lookback:
-        return "range"
-    recent = data.iloc[-lookback:]
-    dirs = [_direction(row) for _, row in recent.iterrows()]
-    bull = sum(x == "bullish" for x in dirs)
-    bear = sum(x == "bearish" for x in dirs)
-    net = float(recent.iloc[-1]["close"]) - float(recent.iloc[0]["close"])
-    ranges = (recent["high"] - recent["low"]).astype(float)
-    typical = float(ranges.median()) if not ranges.empty else 0.0
-    if typical <= 0:
-        return "range"
-    # Un impulso debe tener desplazamiento real, no solo alternancia de velas.
-    if bull >= 5 and net > 0.8 * typical:
-        return "bullish"
-    if bear >= 5 and net < -0.8 * typical:
-        return "bearish"
-    if bull >= 4 and net > 1.2 * typical:
-        return "bullish"
-    if bear >= 4 and net < -1.2 * typical:
-        return "bearish"
-    return "range"
-
-
 def _zones(data: pd.DataFrame, st: Dict[str, Any]):
-    recent = data.iloc[-SR_LOOKBACK:]
+    # Importante: no usamos la vela actual para definir el nivel.
+    # Asi no se crea una "zona" artificial con la propia vela de entrada.
+    recent = data.iloc[max(0, len(data) - SR_LOOKBACK - 1):-1]
+
     support = st.get("last_low")
     resistance = st.get("last_high")
-    if support is None:
+
+    if support is None and not recent.empty:
         support = float(recent["low"].min())
-    if resistance is None:
+    if resistance is None and not recent.empty:
         resistance = float(recent["high"].max())
-    return support, resistance
+
+    if support is None:
+        support = float(data["low"].min())
+    if resistance is None:
+        resistance = float(data["high"].max())
+
+    return float(support), float(resistance)
 
 
-def _zone_rejection(cur: pd.Series, support, resistance) -> Dict[str, Any]:
-    m = _metrics(cur)
-    near_support = m["low"] <= support * (1 + ZONE_TOLERANCE) and m["close"] >= support
-    near_resistance = m["high"] >= resistance * (1 - ZONE_TOLERANCE) and m["close"] <= resistance
-    bull = near_support and m["lower_body"] >= WICK_BODY_MIN and m["close_pos"] >= 0.60
-    bear = near_resistance and m["upper_body"] >= WICK_BODY_MIN and m["close_pos"] <= 0.40
-    if near_support and near_resistance:
-        zone = "ambiguous"
-    elif near_support:
-        zone = "support"
-    elif near_resistance:
-        zone = "resistance"
+def _rejection_for_candle(row: pd.Series, support: float, resistance: float) -> Dict[str, Any]:
+    m = _metrics(row)
+
+    near_support = (
+        m["low"] <= support * (1 + ZONE_TOLERANCE)
+        and m["close"] >= support
+    )
+    near_resistance = (
+        m["high"] >= resistance * (1 - ZONE_TOLERANCE)
+        and m["close"] <= resistance
+    )
+
+    bull_rejection = (
+        near_support
+        and _direction(row) == "bullish"
+        and m["lower_body"] >= WICK_BODY_MIN
+        and m["close_pos"] >= 0.60
+    )
+
+    bear_rejection = (
+        near_resistance
+        and _direction(row) == "bearish"
+        and m["upper_body"] >= WICK_BODY_MIN
+        and m["close_pos"] <= 0.40
+    )
+
+    return {
+        "bull_rejection": bull_rejection,
+        "bear_rejection": bear_rejection,
+        "near_support": near_support,
+        "near_resistance": near_resistance,
+        "metrics": m,
+    }
+
+
+def _find_recent_rejection(
+    data: pd.DataFrame,
+    support: float,
+    resistance: float,
+    allowed: str,
+) -> Dict[str, Any]:
+    # La ultima vela es la confirmacion. La rechazadora debe estar antes.
+    start = max(0, len(data) - 1 - REJECTION_LOOKBACK)
+    end = len(data) - 1
+
+    for idx in range(end - 1, start - 1, -1):
+        row = data.iloc[idx]
+        r = _rejection_for_candle(row, support, resistance)
+
+        if allowed == "bullish" and r["bull_rejection"]:
+            return {
+                "found": True,
+                "type": "support",
+                "index": idx,
+                "age": end - idx,
+                "timestamp": int(row["from"]) if "from" in data.columns and pd.notna(row["from"]) else None,
+                "quality": r,
+            }
+
+        if allowed == "bearish" and r["bear_rejection"]:
+            return {
+                "found": True,
+                "type": "resistance",
+                "index": idx,
+                "age": end - idx,
+                "timestamp": int(row["from"]) if "from" in data.columns and pd.notna(row["from"]) else None,
+                "quality": r,
+            }
+
+    return {
+        "found": False,
+        "type": None,
+        "index": None,
+        "age": None,
+        "timestamp": None,
+        "quality": {},
+    }
+
+
+def _confirmation_quality(data: pd.DataFrame, signal: str, rejection: Dict[str, Any]) -> Dict[str, Any]:
+    cur = _metrics(data.iloc[-1])
+    prev = _metrics(data.iloc[-2])
+
+    if signal == "call":
+        direction_ok = _direction(data.iloc[-1]) == "bullish"
+        body_ok = cur["body_ratio"] >= CONFIRM_BODY_MIN
+        close_progress = cur["close"] > prev["close"]
+        break_rejection = (
+            rejection.get("index") is not None
+            and cur["close"] >= float(data.iloc[rejection["index"]]["high"])
+        )
+        momentum = cur["body_ratio"] >= STRONG_BODY_MIN and cur["close_pos"] >= 0.65
     else:
-        zone = "none"
-    return {"zone": zone, "bull_rejection": bull, "bear_rejection": bear,
-            "near_support": near_support, "near_resistance": near_resistance}
+        direction_ok = _direction(data.iloc[-1]) == "bearish"
+        body_ok = cur["body_ratio"] >= CONFIRM_BODY_MIN
+        close_progress = cur["close"] < prev["close"]
+        break_rejection = (
+            rejection.get("index") is not None
+            and cur["close"] <= float(data.iloc[rejection["index"]]["low"])
+        )
+        momentum = cur["body_ratio"] >= STRONG_BODY_MIN and cur["close_pos"] <= 0.35
+
+    return {
+        "direction_ok": direction_ok,
+        "body_ok": body_ok,
+        "close_progress": close_progress,
+        "break_rejection": break_rejection,
+        "momentum": momentum,
+        "strong": direction_ok and body_ok and close_progress,
+    }
 
 
-def _blocked(data, st, info, zone, mode, reason, higher="range"):
+def _room_from_opposite_zone(
+    data: pd.DataFrame,
+    signal: str,
+    support: float,
+    resistance: float,
+) -> Dict[str, Any]:
+    recent = data.iloc[-7:]
+    typical = float((recent["high"] - recent["low"]).median())
+    if typical <= 0:
+        return {"ok": False, "distance": 0.0, "ranges": 0.0}
+
+    last_close = float(data.iloc[-1]["close"])
+
+    if signal == "call":
+        distance = resistance - last_close
+    else:
+        distance = last_close - support
+
+    ranges = distance / typical
+    return {
+        "ok": ranges >= MIN_ROOM_RANGES,
+        "distance": distance,
+        "ranges": ranges,
+    }
+
+
+def _blocked(
+    data: pd.DataFrame,
+    st: Dict[str, Any],
+    info: Dict[str, Any],
+    zone: Dict[str, Any],
+    mode: str,
+    reason: str,
+    higher: str = "range",
+) -> Dict[str, Any]:
     r = _empty(reason, mode)
     ts = None
     if "from" in data.columns and pd.notna(data.iloc[-1]["from"]):
         ts = int(data.iloc[-1]["from"])
-    r.update({
-        "direction": info["direction"],
-        "trend": st["structure"],
-        "higher_trend": higher,
-        "candle_timestamp": ts,
-        "analysis": {
-            "structure": st["structure"], "higher_structure": higher,
-            "candle": info, "zone": zone,
-        },
-    })
+
+    r.update(
+        {
+            "direction": info.get("direction", "neutral"),
+            "trend": st.get("structure", "range"),
+            "higher_trend": higher,
+            "candle_timestamp": ts,
+            "analysis": {
+                "structure": st,
+                "higher_structure": higher,
+                "candle": info,
+                "zone": zone,
+            },
+        }
+    )
     return r
 
 
-def analyze_market(df: Optional[pd.DataFrame] = None, pair: Optional[str] = None,
-                   mode: str = "M1_M1", higher_tf_df: Optional[pd.DataFrame] = None,
-                   **kwargs: Any) -> Dict[str, Any]:
+def analyze_market(
+    df: Optional[pd.DataFrame] = None,
+    pair: Optional[str] = None,
+    mode: str = "M1_M1",
+    higher_tf_df: Optional[pd.DataFrame] = None,
+    **kwargs: Any,
+) -> Dict[str, Any]:
     mode = mode if mode in MODE_CONFIG else "M1_M1"
     data = _normalize(df)
-    result = _empty(mode=mode)
-    if len(data) < MIN_BARS:
-        return _blocked(data, {"structure": "range"}, {"direction": "neutral"}, {}, mode,
-                        f"historial insuficiente {len(data)}/{MIN_BARS}")
 
-    st = _structure(data)
-    swing_trend = st["structure"]
-    price_trend = _price_action_trend(data, lookback=7)
-    trend = swing_trend
-    if price_trend in ("bullish", "bearish"):
-        trend = price_trend
+    if len(data) < MIN_BARS:
+        return _blocked(
+            data,
+            {"structure": "range"},
+            {"direction": "neutral"},
+            {},
+            mode,
+            f"historial insuficiente {len(data)}/{MIN_BARS}",
+        )
+
+    local = _combined_trend(data)
+    trend = local["trend"]
+    st = local["structure"]
     info = _candle_info(data)
     support, resistance = _zones(data, st)
-    zone = _zone_rejection(data.iloc[-1], support, resistance)
 
     higher_trend = "range"
-    if higher_tf_df is not None and isinstance(higher_tf_df, pd.DataFrame) and not higher_tf_df.empty:
+    higher_detail: Dict[str, Any] = {}
+
+    if (
+        higher_tf_df is not None
+        and isinstance(higher_tf_df, pd.DataFrame)
+        and not higher_tf_df.empty
+    ):
         h = _normalize(higher_tf_df)
         if len(h) >= MIN_BARS:
-            higher_swing = _structure(h)["structure"]
-            higher_price = _price_action_trend(h, lookback=7)
-            higher_trend = higher_price if higher_price in ("bullish", "bearish") else higher_swing
+            higher_detail = _combined_trend(h)
+            higher_trend = higher_detail["trend"]
 
-    # M1 y M2 SOLO operan si M5 tiene una direccion clara.
-    # Si M5 esta en rango/ambiguo, se bloquea: no se adivina la tendencia.
+    # M1/M2 SOLO siguen una tendencia M5 clara.
     if mode in ("M1_M1", "M2_M2"):
         if higher_trend not in ("bullish", "bearish"):
-            return _blocked(data, st, info, zone, mode,
-                            "M1/M2 bloqueado: M5 sin tendencia clara", higher_trend)
+            return _blocked(
+                data,
+                st,
+                info,
+                {"support": support, "resistance": resistance},
+                mode,
+                "M1/M2 bloqueado: M5 sin tendencia clara",
+                higher_trend,
+            )
         allowed = higher_trend
+
+        # Si la lectura local es claramente contraria, no se entra.
+        if trend in ("bullish", "bearish") and trend != allowed:
+            return _blocked(
+                data,
+                st,
+                info,
+                {"support": support, "resistance": resistance},
+                mode,
+                f"estructura local {trend} contra M5 {allowed}",
+                higher_trend,
+            )
     else:
+        if trend not in ("bullish", "bearish"):
+            return _blocked(
+                data,
+                st,
+                info,
+                {"support": support, "resistance": resistance},
+                mode,
+                "M5 bloqueado: tendencia local ambigua",
+                higher_trend,
+            )
         allowed = trend
 
-    if trend == "range":
-        return _blocked(data, st, info, zone, mode, "sin tendencia clara", higher_trend)
-
-    if higher_trend in ("bullish", "bearish") and mode in ("M1_M1", "M2_M2"):
-        if trend in ("bullish", "bearish") and trend != higher_trend:
-            # Puede ser un retroceso; nunca se toma como una reversa contra M5.
-            return _blocked(data, st, info, zone, mode,
-                            f"estructura {trend} contra M5 {higher_trend}", higher_trend)
-
-    # La vela cerrada debe ir en la direccion de la entrada.
+    # Nunca se usa una vela abierta.
     if info["doji"] or info["indecision"]:
-        return _blocked(data, st, info, zone, mode, "vela cerrada sin direccion suficiente", higher_trend)
+        return _blocked(
+            data,
+            st,
+            info,
+            {"support": support, "resistance": resistance},
+            mode,
+            "vela cerrada sin direccion suficiente",
+            higher_trend,
+        )
 
     signal = "call" if info["direction"] == "bullish" else "put"
 
-    # La ultima vela cerrada debe demostrar desplazamiento en la misma
-    # direccion de la entrada, no solamente tener color verde/rojo.
-    prev_close = float(data.iloc[-2]["close"])
-    if signal == "call":
-        if float(info["close"]) <= prev_close or info["body_ratio"] < 0.35:
-            return _blocked(data, st, info, zone, mode,
-                            "CALL bloqueado: M1/M2 no confirma impulso alcista en la vela cerrada",
-                            higher_trend)
-    else:
-        if float(info["close"]) >= prev_close or info["body_ratio"] < 0.35:
-            return _blocked(data, st, info, zone, mode,
-                            "PUT bloqueado: M1/M2 no confirma impulso bajista en la vela cerrada",
-                            higher_trend)
+    if signal != ("call" if allowed == "bullish" else "put"):
+        return _blocked(
+            data,
+            st,
+            info,
+            {"support": support, "resistance": resistance},
+            mode,
+            f"{signal.upper()} contra tendencia establecida {allowed}",
+            higher_trend,
+        )
 
-    if signal == "call" and allowed != "bullish":
-        return _blocked(data, st, info, zone, mode, "CALL contra tendencia", higher_trend)
-    if signal == "put" and allowed != "bearish":
-        return _blocked(data, st, info, zone, mode, "PUT contra tendencia", higher_trend)
+    # ---------------------------------------------------------------
+    # REGLA PRINCIPAL:
+    # La entrada debe venir de un rechazo S/R y luego confirmacion.
+    # No hay entrada por "momentum" aislado.
+    # ---------------------------------------------------------------
+    rejection = _find_recent_rejection(
+        data,
+        support=support,
+        resistance=resistance,
+        allowed=allowed,
+    )
+
+    if not rejection["found"]:
+        return _blocked(
+            data,
+            st,
+            info,
+            {
+                "support": support,
+                "resistance": resistance,
+                "rejection": rejection,
+            },
+            mode,
+            "entrada bloqueada: no hubo rechazo reciente de S/R a favor de la tendencia",
+            higher_trend,
+        )
+
+    confirmation = _confirmation_quality(data, signal, rejection)
+
+    if not confirmation["direction_ok"]:
+        return _blocked(
+            data,
+            st,
+            info,
+            {
+                "support": support,
+                "resistance": resistance,
+                "rejection": rejection,
+                "confirmation": confirmation,
+            },
+            mode,
+            "entrada bloqueada: la vela posterior al rechazo no confirma la direccion",
+            higher_trend,
+        )
+
+    if not confirmation["body_ok"] or not confirmation["close_progress"]:
+        return _blocked(
+            data,
+            st,
+            info,
+            {
+                "support": support,
+                "resistance": resistance,
+                "rejection": rejection,
+                "confirmation": confirmation,
+            },
+            mode,
+            "entrada bloqueada: confirmacion debil despues del rechazo",
+            higher_trend,
+        )
+
+    # Rechazo demasiado viejo = no se persigue el movimiento.
+    if int(rejection["age"]) > REJECTION_LOOKBACK:
+        return _blocked(
+            data,
+            st,
+            info,
+            {
+                "support": support,
+                "resistance": resistance,
+                "rejection": rejection,
+                "confirmation": confirmation,
+            },
+            mode,
+            "entrada bloqueada: rechazo demasiado antiguo",
+            higher_trend,
+        )
+
+    room = _room_from_opposite_zone(data, signal, support, resistance)
+    if not room["ok"]:
+        return _blocked(
+            data,
+            st,
+            info,
+            {
+                "support": support,
+                "resistance": resistance,
+                "rejection": rejection,
+                "confirmation": confirmation,
+                "room": room,
+            },
+            mode,
+            "entrada bloqueada: poco recorrido libre hasta la zona contraria",
+            higher_trend,
+        )
 
     pressure = _recent_pressure(data, allowed)
-    continuation = (
-        pressure["aligned"]
-        or pressure["last_two_aligned"]
-        or (signal == "call" and info["bullish_momentum"])
-        or (signal == "put" and info["bearish_momentum"])
-    )
 
-    # Reversa solo es valida si vuelve a favor de la tendencia superior.
-    aligned_reversal = (
-        (signal == "call" and allowed == "bullish" and info["bullish_engulf"] and info["previous_direction"] == "bearish")
-        or
-        (signal == "put" and allowed == "bearish" and info["bearish_engulf"] and info["previous_direction"] == "bullish")
-    )
-
-    # En M1/M2 no basta una vela aislada: exigimos presion o momentum.
-    # En M5 permitimos continuidad fuerte o rechazo en zona real.
-    rejection = (
-        (signal == "call" and zone.get("zone") == "support" and zone.get("bull_rejection"))
-        or
-        (signal == "put" and zone.get("zone") == "resistance" and zone.get("bear_rejection"))
-    )
-
-    if mode in ("M1_M1", "M2_M2"):
-        strong_break = (
-            (signal == "call" and info["bullish_momentum"])
-            or (signal == "put" and info["bearish_momentum"])
+    # El objetivo es entrar despues del rechazo, no en una vela extendida
+    # que ya se haya alejado demasiado de la zona.
+    if rejection["age"] > 2 and not confirmation["momentum"]:
+        return _blocked(
+            data,
+            st,
+            info,
+            {
+                "support": support,
+                "resistance": resistance,
+                "rejection": rejection,
+                "confirmation": confirmation,
+                "room": room,
+                "pressure": pressure,
+            },
+            mode,
+            "entrada bloqueada: rechazo no suficientemente fresco",
+            higher_trend,
         )
-        valid = (pressure["last_two_aligned"] or pressure["aligned"] or strong_break) and aligned_reversal is False
-    else:
-        valid = continuation or aligned_reversal or rejection
 
-    if not valid:
-        return _blocked(data, st, info, zone, mode,
-                        "sin continuidad suficiente para confirmar la entrada", higher_trend)
+    # Score = confluencia, NO probabilidad matematica.
+    score = 40
+    score += 15  # tendencia establecida + rechazo alineado
+    score += 15 if confirmation["break_rejection"] else 8
+    score += 10 if confirmation["momentum"] else 5
+    score += 10 if pressure["aligned_count"] >= 3 else 5 if pressure["aligned_count"] >= 2 else 0
+    score += 10 if room["ranges"] >= 2.0 else 5
+    score = min(100, int(score))
 
-    # Evitar entradas de continuacion directamente contra un nivel cercano
-    # cuando no existe ruptura: el bot no inventa una reversa.
-    if mode in ("M1_M1", "M2_M2"):
-        if signal == "put" and zone.get("near_support") and float(info["close"]) >= float(support):
-            return _blocked(data, st, info, zone, mode,
-                            "PUT bloqueado: soporte cercano sin ruptura bajista", higher_trend)
-        if signal == "call" and zone.get("near_resistance") and float(info["close"]) <= float(resistance):
-            return _blocked(data, st, info, zone, mode,
-                            "CALL bloqueado: resistencia cercana sin ruptura alcista", higher_trend)
-
-    # No permitimos comprar dentro de impulso bajista ni vender dentro de impulso alcista.
-    if signal == "call" and allowed != "bullish":
-        return _blocked(data, st, info, zone, mode, "CALL contra movimiento", higher_trend)
-    if signal == "put" and allowed != "bearish":
-        return _blocked(data, st, info, zone, mode, "PUT contra movimiento", higher_trend)
-
-    score = 50
-    score += 15 if trend == allowed else 0
-    score += 15 if pressure["aligned_count"] >= 3 else 5 if pressure["aligned_count"] >= 2 else 0
-    score += 10 if (info["bullish_momentum"] or info["bearish_momentum"]) else 0
-    score += 10 if aligned_reversal else 0
-    score += 10 if rejection else 0
-    score = min(100, score)
+    rejection_age = int(rejection["age"])
+    rejection_name = "SOPORTE" if signal == "call" else "RESISTENCIA"
 
     reason = (
-        f"{signal.upper()} | tendencia {allowed} | vela anterior {signal} | "
-        f"presion {pressure['aligned_count']}/4 | "
-        f"{'momentum' if (info['bullish_momentum'] or info['bearish_momentum']) else 'continuidad'}"
+        f"{signal.upper()} | tendencia {allowed} | "
+        f"rechazo {rejection_name} hace {rejection_age} vela(s) | "
+        f"confirmacion {'ruptura' if confirmation['break_rejection'] else 'alcista/bajista'} | "
+        f"presion {pressure['aligned_count']}/5 | "
+        f"recorrido {room['ranges']:.1f}R"
     )
-    if aligned_reversal:
-        reason += " | reversion alineada"
-    if rejection:
-        reason += " | rechazo en zona"
 
-    ts = int(data.iloc[-1]["from"]) if "from" in data.columns and pd.notna(data.iloc[-1]["from"]) else None
+    ts = (
+        int(data.iloc[-1]["from"])
+        if "from" in data.columns and pd.notna(data.iloc[-1]["from"])
+        else None
+    )
+
     return {
         "signal": signal,
         "direction": info["direction"],
@@ -436,11 +749,19 @@ def analyze_market(df: Optional[pd.DataFrame] = None, pair: Optional[str] = None
         "target_expiration_minutes": MODE_CONFIG[mode]["expiration"],
         "candle_timestamp": ts,
         "analysis": {
-            "structure": trend, "higher_structure": higher_trend,
-            "allowed_direction": allowed, "candle": info,
-            "pressure": pressure, "continuation": continuation,
-            "aligned_reversal": aligned_reversal, "zone": zone,
+            "structure": trend,
+            "local_swing": local["swing"],
+            "local_price_trend": local["price"],
+            "higher_structure": higher_trend,
+            "higher_detail": higher_detail,
+            "allowed_direction": allowed,
+            "candle": info,
+            "pressure": pressure,
             "rejection": rejection,
+            "confirmation": confirmation,
+            "room": room,
+            "support": support,
+            "resistance": resistance,
         },
     }
 
