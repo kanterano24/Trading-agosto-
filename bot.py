@@ -45,11 +45,11 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 M1 = 60
 EXPIRATION = 1
-AMOUNT = float(os.getenv("AMOUNT", "500"))
+AMOUNT = float(os.getenv("AMOUNT", "50"))
 
 # Solo 3 pares OTC disponibles.
-MAX_PAIRS = 3
-WORKERS = 3
+MAX_PAIRS = 50
+WORKERS = 50
 
 # La orden solo se permite en la nueva vela M1.
 # Si la apertura ya paso esta ventana, la senal se descarta.
