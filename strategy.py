@@ -11,9 +11,6 @@ Objetivo:
   posterior de confirmacion en la misma direccion.
 - Una reversa aislada, una vela sin cuerpo suficiente o una entrada pegada
   al nivel contrario se bloquean.
-- La estructura debe ser estrictamente alcista para CALL o bajista para PUT.
-- La ultima vela cerrada (vela anterior a la entrada) debe tener el mismo
-  color de la operacion: verde para CALL, roja para PUT.
 - Solo se usan velas cerradas y precio/estructura; no se usan indicadores.
 """
 
@@ -515,12 +512,10 @@ def analyze_market(
     local = _combined_trend(data)
     trend = local["trend"]
     st = local["structure"]
-    local_structure = st["structure"]
     info = _candle_info(data)
     support, resistance = _zones(data, st)
 
     higher_trend = "range"
-    higher_structure = "range"
     higher_detail: Dict[str, Any] = {}
 
     if (
@@ -532,45 +527,44 @@ def analyze_market(
         if len(h) >= MIN_BARS:
             higher_detail = _combined_trend(h)
             higher_trend = higher_detail["trend"]
-            higher_structure = higher_detail["structure"]["structure"]
 
-    # REGLA ESTRICTA DE ESTRUCTURA.
-    # M1/M2 deben coincidir con la estructura M5.
+    # M1/M2 SOLO siguen una tendencia M5 clara.
     if mode in ("M1_M1", "M2_M2"):
-        if higher_structure not in ("bullish", "bearish"):
+        if higher_trend not in ("bullish", "bearish"):
             return _blocked(
                 data,
                 st,
                 info,
                 {"support": support, "resistance": resistance},
                 mode,
-                "M1/M2 bloqueado: estructura M5 no es alcista ni bajista",
-                higher_structure,
+                "M1/M2 bloqueado: M5 sin tendencia clara",
+                higher_trend,
             )
-        allowed = higher_structure
+        allowed = higher_trend
 
-        if local_structure != allowed:
+        # Si la lectura local es claramente contraria, no se entra.
+        if trend in ("bullish", "bearish") and trend != allowed:
             return _blocked(
                 data,
                 st,
                 info,
                 {"support": support, "resistance": resistance},
                 mode,
-                f"estructura local {local_structure} contra M5 {allowed}",
-                higher_structure,
+                f"estructura local {trend} contra M5 {allowed}",
+                higher_trend,
             )
     else:
-        if local_structure not in ("bullish", "bearish"):
+        if trend not in ("bullish", "bearish"):
             return _blocked(
                 data,
                 st,
                 info,
                 {"support": support, "resistance": resistance},
                 mode,
-                "M5 bloqueado: estructura local no es alcista ni bajista",
-                local_structure,
+                "M5 bloqueado: tendencia local ambigua",
+                higher_trend,
             )
-        allowed = local_structure
+        allowed = trend
 
     # Nunca se usa una vela abierta.
     if info["doji"] or info["indecision"]:
@@ -584,24 +578,7 @@ def analyze_market(
             higher_trend,
         )
 
-    # La ultima vela cerrada es la vela anterior a la ejecucion.
-    # CALL solo con vela verde; PUT solo con vela roja.
-    previous_candle = info["direction"]
-    expected_signal = "call" if allowed == "bullish" else "put"
-
-    if previous_candle != allowed:
-        candle_name = "verde" if previous_candle == "bullish" else "roja" if previous_candle == "bearish" else "neutral"
-        return _blocked(
-            data,
-            st,
-            info,
-            {"support": support, "resistance": resistance},
-            mode,
-            f"entrada bloqueada: vela anterior {candle_name}; {expected_signal.upper()} exige vela {'verde' if expected_signal == 'call' else 'roja'}",
-            higher_structure if mode in ("M1_M1", "M2_M2") else local_structure,
-        )
-
-    signal = expected_signal
+    signal = "call" if info["direction"] == "bullish" else "put"
 
     if signal != ("call" if allowed == "bullish" else "put"):
         return _blocked(
@@ -744,10 +721,8 @@ def analyze_market(
     rejection_age = int(rejection["age"])
     rejection_name = "SOPORTE" if signal == "call" else "RESISTENCIA"
 
-    candle_color = "verde" if signal == "call" else "roja"
     reason = (
-        f"{signal.upper()} | estructura {allowed} | "
-        f"vela anterior {candle_color} | "
+        f"{signal.upper()} | tendencia {allowed} | "
         f"rechazo {rejection_name} hace {rejection_age} vela(s) | "
         f"confirmacion {'ruptura' if confirmation['break_rejection'] else 'alcista/bajista'} | "
         f"presion {pressure['aligned_count']}/5 | "
@@ -774,11 +749,10 @@ def analyze_market(
         "target_expiration_minutes": MODE_CONFIG[mode]["expiration"],
         "candle_timestamp": ts,
         "analysis": {
-            "structure": local_structure,
+            "structure": trend,
             "local_swing": local["swing"],
             "local_price_trend": local["price"],
-            "higher_structure": higher_structure,
-            "higher_trend": higher_trend,
+            "higher_structure": higher_trend,
             "higher_detail": higher_detail,
             "allowed_direction": allowed,
             "candle": info,
