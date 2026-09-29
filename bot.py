@@ -57,13 +57,13 @@ MODE_LABEL = {"M1_M1": "M15→M1"}
 # PERFORMANCE / SELECTION
 # ---------------------------------------------------------------------------
 
-AMOUNT = float(os.getenv("AMOUNT", "600"))
+AMOUNT = float(os.getenv("AMOUNT", "650"))
 
 # Para M15 necesitamos bloques M1 suficientes para contexto y estructura.
 CANDLE_COUNT_M1 = int(os.getenv("CANDLE_COUNT_M1", "240"))
 
 # Se analizan exactamente 3 OTC disponibles.
-MAX_PAIRS = 30
+MAX_PAIRS = 50
 
 # 12 es un punto medio para acelerar sin disparar demasiado las peticiones
 # simultaneas al websocket.
@@ -72,8 +72,6 @@ WORKERS = int(os.getenv("ANALYSIS_WORKERS", "12"))
 PAIR_REFRESH_SECONDS = 600.0
 TRADE_COOLDOWN = float(os.getenv("TRADE_COOLDOWN", "60"))
 
-# Con la nueva estrategia, 80 significa confluencia fuerte.
-MIN_SCORE = int(os.getenv("MIN_SCORE_TO_TRADE", "80"))
 
 
 # ---------------------------------------------------------------------------
@@ -162,7 +160,6 @@ def telegram_loop() -> None:
                         f"{'🟢 ACTIVO' if BOT_RUNNING else '🔴 DETENIDO'}\n"
                         f"OTC: {len(PAIRS)}\n"
                         f"Importe: {AMOUNT:g}\n"
-                        f"Score minimo: {MIN_SCORE}"
                     )
 
         except Exception:
@@ -275,7 +272,7 @@ def connect() -> None:
         "🟢 IQ OPTION CONECTADO\n\n"
         "M15→M1 | expiración 1m\n"
         f"OTC seleccionados: {len(PAIRS)}\n"
-        "Entrada: M15 + estructura M1 + rechazo S/R + ruptura + confirmacion"
+        "Entrada: recorrido + regreso + rechazo + confirmacion"
     )
 
 
@@ -465,15 +462,13 @@ def analyze_pair_mode(
     )
 
     signal = result.get("signal")
-    score = int(result.get("score", 0))
     reason = result.get("reason", "")
 
-    # Diagnostico incluso cuando se bloquea.
-    if signal not in ("call", "put") or score < MIN_SCORE:
+    if signal not in ("call", "put"):
         return {
             "pair": pair,
             "signal": signal,
-            "score": score,
+            "score": 0,
             "reason": reason or "sin señal",
         }
 
@@ -572,9 +567,7 @@ def analyze_event(
                 if not result:
                     continue
 
-                if result.get("signal") in ("call", "put") and int(
-                    result.get("score", 0)
-                ) >= MIN_SCORE:
+                if result.get("signal") in ("call", "put"):
                     candidates.append(result)
                 else:
                     diagnostics.append(result)
@@ -613,24 +606,13 @@ def analyze_event(
         mode,
         len(candidates),
         " | ".join(
-            f"{c['pair']} {c['signal'].upper()} "
-            f"score={c['score']} {c['reason']}"
-            for c in sorted(
-                candidates,
-                key=lambda x: x["score"],
-                reverse=True,
-            )[:8]
+            f"{c['pair']} {c['signal'].upper()} {c['reason']}"
+            for c in candidates[:8]
         ),
     )
 
-    # Una sola operacion por evento: la mayor confluencia.
-    return max(
-        candidates,
-        key=lambda c: (
-            int(c["score"]),
-            1 if c["signal"] == "call" else 0,
-        ),
-    )
+    # El patron es la condicion de entrada; no se agrega score.
+    return candidates[0]
 
 
 # ---------------------------------------------------------------------------
@@ -686,12 +668,11 @@ def execute(candidate) -> bool:
     )
 
     logger.info(
-        "EJECUTANDO | %s | %s | %s | score=%s | exp=%sm | "
+        "EJECUTANDO | %s | %s | %s | exp=%sm | "
         "delay=%.2fs | %s",
         candidate["pair"],
         MODE_LABEL[candidate["mode"]],
         candidate["signal"].upper(),
-        candidate["score"],
         candidate["expiration"],
         delay,
         candidate["reason"],
@@ -717,7 +698,7 @@ def execute(candidate) -> bool:
             f"Par: {candidate['pair']}\n"
             f"Modo: {MODE_LABEL[candidate['mode']]}\n"
             f"Dirección: {candidate['signal'].upper()}\n"
-            f"Score: {candidate['score']}/100\n"
+
             f"Expiración: {candidate['expiration']} min"
         )
         return False
@@ -816,7 +797,7 @@ def main() -> None:
         "🤖 BOT LISTO\n\n"
         "M15→M1 | analisis M1 | expiracion 1m\n"
         f"Hasta {MAX_PAIRS} OTC.\n"
-        "Entrada: M15 + estructura M1 + rechazo S/R + confirmación.\n"
+        "Entrada: recorrido + regreso + rechazo + confirmacion.\n"
         "Usa /start para activar."
     )
 
