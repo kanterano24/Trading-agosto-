@@ -99,7 +99,11 @@ def aggregate(m1,tf,closed):
         g=g.sort_values('from');expected=[int(b)+i*M1 for i in range(n)]
         if g['from'].astype(int).tolist()!=expected:continue
         out.append({'from':int(b),'open':float(g.iloc[0].open),'high':float(g.high.max()),'low':float(g.low.min()),'close':float(g.iloc[-1].close)})
-    return pd.DataFrame(out).query('from<=@closed').sort_values('from').reset_index(drop=True) if out else pd.DataFrame()
+    if not out:
+        return pd.DataFrame()
+    result = pd.DataFrame(out)
+    result = result[result['from'] <= int(closed)]
+    return result.sort_values('from').reset_index(drop=True)
 
 def analyze_mode(pair,mode,event,m1):
     atf,etf=MODES[mode];closed=event-atf
@@ -108,27 +112,38 @@ def analyze_mode(pair,mode,event,m1):
     if d.empty or d[d['from']==closed].empty:return None
     r=analyze_market(df=d,mode=mode,pair=pair);sig=r.get('signal');score=int(r.get('score',0))
 
-    # FILTRO ADICIONAL:
-    # La entrada REAL debe ir a favor de la vela anterior.
-    # Vela verde (close > open) -> CALL.
-    # Vela roja (close < open) -> PUT.
-    # Doji -> no operar.
-    if len(d) < 1:
+    if sig not in ('call','put') or score<MIN_SCORE:return None
+
+    # FILTRO ADICIONAL: solo se opera a favor de la vela anterior a la ENTRADA.
+    # Como el bot mantiene la inversion CALL<->PUT, comprobamos la direccion
+    # que realmente se va a enviar a IQ Option.
+    execution_signal = 'put' if sig == 'call' else 'call'
+    previous_entry_candle = None
+    previous_entry_ts = int(event - etf)
+
+    if etf == M1:
+        rows = m1[m1['from'] == previous_entry_ts]
+        if not rows.empty:
+            previous_entry_candle = rows.iloc[-1]
+    elif etf == M5:
+        prev_m5 = aggregate(m1, M5, previous_entry_ts)
+        if not prev_m5.empty and int(prev_m5.iloc[-1]['from']) == previous_entry_ts:
+            previous_entry_candle = prev_m5.iloc[-1]
+
+    if previous_entry_candle is None:
         return None
-    previous_candle = d.iloc[-1]
-    if float(previous_candle['close']) > float(previous_candle['open']):
+
+    prev_open = float(previous_entry_candle['open'])
+    prev_close = float(previous_entry_candle['close'])
+    if prev_close > prev_open:
         previous_direction = 'call'
-    elif float(previous_candle['close']) < float(previous_candle['open']):
+    elif prev_close < prev_open:
         previous_direction = 'put'
     else:
         previous_direction = None
 
-    # El bot conserva la inversión CALL<->PUT que ya tenía.
-    execution_signal = 'put' if sig == 'call' else 'call'
     if previous_direction is None or execution_signal != previous_direction:
         return None
-
-    if sig not in ('call','put') or score<MIN_SCORE:return None
     return {'pair':pair,'mode':mode,'signal':sig,'score':score,'analysis_ts':int(closed),'entry_tf':etf,'entry_ts':int(event),'expiration':EXP[mode],'reason':r.get('reason',''),'analysis':r.get('analysis',{})}
 
 def analyze_event(mode_event,event):
