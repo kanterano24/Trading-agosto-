@@ -5,7 +5,7 @@
 - En cada cierre de vela M5 analiza TODOS los pares disponibles.
 - Selecciona como maximo UN par con la senal mas fuerte.
 - Ejecuta inmediatamente al abrir la siguiente vela M1.
-- Expiracion Binary: 1 minuto.
+- Expiracion Binary: 5 minutos.
 - La estrategia esta en strategy.py y NO usa indicadores.
 """
 from __future__ import annotations
@@ -51,14 +51,13 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 M1_TIMEFRAME = 60
 M5_TIMEFRAME = 300
-EXPIRATION = 1
-AMOUNT = float(os.getenv("AMOUNT", "500"))
+EXPIRATION = 5
+AMOUNT = float(os.getenv("AMOUNT", "1300"))
 CANDLE_COUNT_M1 = int(os.getenv("CANDLE_COUNT_M1", "250"))
 PAIR_REFRESH_SECONDS = 600.0
 POLL_SECONDS = 0.05
 TRADE_COOLDOWN = 60.0
 ANALYSIS_WORKERS = 8
-ENTRY_MAX_DELAY_SECONDS = 0.80
 
 # Se descubren todos los OTC disponibles, pero SOLO se puede elegir un par
 # para operar por cada cierre M5.
@@ -139,7 +138,7 @@ def telegram_command_loop() -> None:
                         "🔎 Analiza todos los OTC disponibles\n"
                         "🎯 Opera solo 1 par por cierre M5\n"
                         "⚡ Entrada: apertura de la siguiente M1\n"
-                        "⏳ Expiracion: 1 minuto\n"
+                        "⏳ Expiracion: 5 minutos\n"
                         "🚫 Sin indicadores"
                     )
                 elif text == "/stop":
@@ -152,7 +151,7 @@ def telegram_command_loop() -> None:
                         f"Estado: {status}\n"
                         "Analisis: M5\n"
                         "Entrada: apertura M1 siguiente\n"
-                        "Expiracion: 1 minuto\n"
+                        "Expiracion: 5 minutos\n"
                         f"OTC disponibles: {len(PAIRS)}\n"
                         f"Importe: {AMOUNT:g}\n"
                         "Indicadores: NO"
@@ -368,7 +367,7 @@ def connect_iq() -> bool:
         "🟢 IQ OPTION CONECTADO\n\n"
         "🧠 Analisis M5 por accion del precio\n"
         "⚡ Entrada inmediata en apertura M1\n"
-        "⏳ Expiracion: 1 minuto"
+        "⏳ Expiracion: 5 minutos"
     )
     return True
 
@@ -525,7 +524,7 @@ def analyze_all_pairs_at_m5_close(closed_m5_ts: int) -> Optional[Dict[str, Any]]
         f"Score: {best['score']}/100\n"
         f"M5 cerrada: {best['m5_ts']}\n"
         "⚡ Entrada: apertura de la siguiente M1\n"
-        "⏳ Expiración: 1 minuto\n\n"
+        "⏳ Expiración: 5 minutos\n\n"
         f"{best['reason']}"
     )
     return best
@@ -549,50 +548,69 @@ def buy_binary(pair: str, signal: str) -> Tuple[bool, Optional[Any]]:
 
 
 def execute_candidate(candidate: Dict[str, Any], current_m1_open: int, server_ts: float) -> bool:
+    """
+    Ejecuta la señal en cuanto el análisis termina.
+
+    No se cancela la entrada porque haya pasado el segundo 00 de la M1
+    objetivo. Si el análisis tardó, se ejecuta en la M1 que esté abierta
+    en ese momento.
+    """
     global LAST_TRADE_M1, LAST_TRADE_TIME
+
     target_m1 = int(candidate["execution_m1_ts"])
-    if target_m1 != int(current_m1_open):
+
+    # Nunca ejecutar antes de la M1 que corresponde a la señal.
+    if int(current_m1_open) < target_m1:
         return False
-    # No ejecutar si ya pasó demasiado tiempo desde la apertura real.
-    if float(server_ts) - float(target_m1) > ENTRY_MAX_DELAY_SECONDS:
-        logger.warning(
-            "Entrada perdida por latencia: par=%s retraso=%.3fs",
-            candidate.get("pair"),
-            float(server_ts) - float(target_m1),
-        )
+
+    if LAST_TRADE_M1 == int(current_m1_open):
         return False
-    if LAST_TRADE_M1 == current_m1_open:
-        return False
+
     if time.time() - LAST_TRADE_TIME < TRADE_COOLDOWN:
         return False
 
     pair = str(candidate["pair"])
     signal = str(candidate["signal"])
+    delay = max(0.0, float(server_ts) - float(target_m1))
 
     ok, order_id = buy_binary(pair, signal)
+
     if not ok:
         telegram_send(
             "❌ ORDEN RECHAZADA\n\n"
-            f"Par: {pair}\nDirección: {signal.upper()}\n"
+            f"Par: {pair}\n"
+            f"Dirección: {signal.upper()}\n"
+            f"Retraso desde M1 objetivo: {delay:.2f}s\n"
             "La señal no se trasladara a otra vela."
         )
         return False
 
-    LAST_TRADE_M1 = current_m1_open
+    LAST_TRADE_M1 = int(current_m1_open)
     LAST_TRADE_TIME = time.time()
+
     telegram_send(
         "⚡ ENTRADA EJECUTADA\n\n"
         f"Par: {pair}\n"
         f"Dirección: {signal.upper()}\n"
-        f"Apertura M1: {current_m1_open}\n"
         f"M5 analizada: {candidate['m5_ts']}\n"
+        f"M1 objetivo: {target_m1}\n"
+        f"M1 ejecutada: {current_m1_open}\n"
+        f"Retraso desde apertura objetivo: {delay:.2f}s\n"
         f"ID: {order_id}\n"
-        "⏳ Expiración: 1 minuto"
+        "⏳ Expiración: 5 minutos"
     )
+
     logger.info(
-        "%s | %s | M5=%s | M1=%s | ID=%s",
-        pair, signal.upper(), candidate["m5_ts"], current_m1_open, order_id,
+        "%s | %s | M5=%s | M1_OBJETIVO=%s | M1_EJECUTADA=%s | RETRASO=%.3fs | ID=%s",
+        pair,
+        signal.upper(),
+        candidate["m5_ts"],
+        target_m1,
+        current_m1_open,
+        delay,
+        order_id,
     )
+
     return True
 
 # ============================================================
@@ -633,25 +651,28 @@ def process_cycle() -> None:
     candidate["execution_m1_ts"] = int(current_m1_open)
     LAST_CANDIDATE = candidate
 
-    # Refrescar el reloj después del análisis. Si el análisis tardó demasiado,
-    # no se entra tarde en la vela M1.
+    # El análisis puede tardar. No se cancela la señal si la M1 objetivo
+    # ya comenzó: se ejecuta inmediatamente en la M1 que esté abierta.
     final_server_ts = get_iq_server_timestamp()
     final_m1_open = floor_m1(final_server_ts)
 
     if final_m1_open != current_m1_open:
         logger.warning(
-            "Señal M5 descartada: análisis tardó %.3fs y ya abrió otra M1 | par=%s",
+            "Analisis terminado tarde: %.3fs | par=%s | M1 objetivo=%s | M1 actual=%s. Se ejecutara igualmente.",
             analysis_elapsed,
             candidate.get("pair"),
+            current_m1_open,
+            final_m1_open,
         )
+
         telegram_send(
-            "⚠️ ENTRADA NO EJECUTADA\n\n"
+            "⚠️ ANÁLISIS TERMINÓ DESPUÉS DE LA APERTURA\n\n"
             f"Par: {candidate['pair']}\n"
             f"Tiempo de análisis: {analysis_elapsed:.2f}s\n"
-            "La siguiente M1 ya había comenzado; no se entra tarde."
+            f"M1 objetivo: {current_m1_open}\n"
+            f"M1 actual: {final_m1_open}\n"
+            "⚡ Se ejecutara igualmente en la M1 actual."
         )
-        LAST_CANDIDATE = None
-        return
 
     if execute_candidate(
         candidate,
@@ -667,7 +688,7 @@ def main() -> None:
     global BOT_RUNNING
     logger.info("========================================")
     logger.info("BOT BINARY OTC - ACCION DEL PRECIO")
-    logger.info("Analisis M5 | Entrada apertura M1 | Expiracion 1 minuto")
+    logger.info("Analisis M5 | Entrada apertura M1 | Expiracion 5 minutos")
     logger.info("Opera SOLO UN par por cada cierre M5")
     logger.info("Analisis paralelo OTC: %d workers", ANALYSIS_WORKERS)
     logger.info("Sin EMA | Sin RSI | Sin ATR | Sin indicadores")
@@ -698,7 +719,7 @@ def main() -> None:
         "📊 Analiza TODOS los OTC disponibles en M5.\n"
         "🎯 Selecciona SOLO 1 par.\n"
         "⚡ Opera al abrir la siguiente M1.\n"
-        "⏳ Expiración: 1 minuto.\n"
+        "⏳ Expiración: 5 minutos.\n"
         "🚫 Sin indicadores.\n\n"
         "Usa /start para activar."
     )
