@@ -110,40 +110,27 @@ def analyze_mode(pair,mode,event,m1):
     if atf==M1:d=m1[m1['from']<=closed].copy()
     else:d=aggregate(m1,atf,closed)
     if d.empty or d[d['from']==closed].empty:return None
-    r=analyze_market(df=d,mode=mode,pair=pair);sig=r.get('signal');score=int(r.get('score',0))
 
+    r=analyze_market(df=d,mode=mode,pair=pair);sig=r.get('signal');score=int(r.get('score',0))
     if sig not in ('call','put') or score<MIN_SCORE:return None
 
-    # FILTRO ADICIONAL: solo se opera a favor de la vela anterior a la ENTRADA.
-    # Como el bot mantiene la inversion CALL<->PUT, comprobamos la direccion
-    # que realmente se va a enviar a IQ Option.
-    execution_signal = 'put' if sig == 'call' else 'call'
-    previous_entry_candle = None
-    previous_entry_ts = int(event - etf)
-
-    if etf == M1:
-        rows = m1[m1['from'] == previous_entry_ts]
-        if not rows.empty:
-            previous_entry_candle = rows.iloc[-1]
-    elif etf == M5:
-        prev_m5 = aggregate(m1, M5, previous_entry_ts)
-        if not prev_m5.empty and int(prev_m5.iloc[-1]['from']) == previous_entry_ts:
-            previous_entry_candle = prev_m5.iloc[-1]
-
-    if previous_entry_candle is None:
-        return None
-
-    prev_open = float(previous_entry_candle['open'])
-    prev_close = float(previous_entry_candle['close'])
-    if prev_close > prev_open:
-        previous_direction = 'call'
-    elif prev_close < prev_open:
-        previous_direction = 'put'
+    # FILTRO DE DIRECCION: se usa la vela CERRADA que genero el analisis.
+    # Verde (close > open) -> CALL. Roja (close < open) -> PUT. Doji -> no operar.
+    # Esto es especialmente importante en M5/M15: no se reemplaza la direccion
+    # de la vela de estructura por una vela M1 aislada que pueda ir en contra.
+    analysis_candle=d.iloc[-1]
+    candle_open=float(analysis_candle['open'])
+    candle_close=float(analysis_candle['close'])
+    if candle_close>candle_open:
+        previous_direction='call'
+    elif candle_close<candle_open:
+        previous_direction='put'
     else:
-        previous_direction = None
+        previous_direction=None
 
-    if previous_direction is None or execution_signal != previous_direction:
+    if previous_direction is None or sig!=previous_direction:
         return None
+
     return {'pair':pair,'mode':mode,'signal':sig,'score':score,'analysis_ts':int(closed),'entry_tf':etf,'entry_ts':int(event),'expiration':EXP[mode],'reason':r.get('reason',''),'analysis':r.get('analysis',{})}
 
 def analyze_event(mode_event,event):
@@ -170,11 +157,9 @@ def analyze_event(mode_event,event):
 
 def buy(c):
     try:
-        # Invertir la dirección únicamente al momento de ejecutar.
-        # La señal original de la estrategia permanece intacta.
-        original_signal = c['signal']
-        execution_signal = 'put' if original_signal == 'call' else 'call'
-        return IQ.buy(AMOUNT,c['pair'],execution_signal,int(c['expiration']))
+        # La estrategia y la orden usan la MISMA direccion.
+        # No se invierte la entrada: verde=CALL, roja=PUT.
+        return IQ.buy(AMOUNT,c['pair'],c['signal'],int(c['expiration']))
     except Exception as e:
         logger.error('buy: %s',e);return False,None
 
@@ -184,9 +169,8 @@ def execute(c):
     if entry<c['entry_ts'] or entry==LAST_TRADE_ENTRY or time.time()-LAST_TRADE_TIME<COOLDOWN:return False
     res=buy(c);ok=bool(res[0]) if isinstance(res,tuple) else res not in (False,None,'error',-1);oid=res[1] if isinstance(res,tuple) and len(res)>1 else res
     if not ok:tg(f"❌ ORDEN RECHAZADA\n\n{c['pair']} | {LABEL[c['mode']]} | {c['signal'].upper()} | {c['expiration']} min");return False
-    LAST_TRADE_ENTRY=entry;LAST_TRADE_TIME=time.time();delay=max(0,now-c['entry_ts']);original_signal = c['signal'].upper()
-    execution_signal = 'PUT' if original_signal == 'CALL' else 'CALL'
-    tg(f"⚡ ENTRADA EJECUTADA\n\nPar: {c['pair']}\nModo: {LABEL[c['mode']]}\nSeñal estrategia: {original_signal}\nEntrada ejecutada (invertida): {execution_signal}\nScore: {c['score']}/100\nExpiración: {c['expiration']} min\nRetraso: {delay:.2f}s\nID: {oid}");return True
+    LAST_TRADE_ENTRY=entry;LAST_TRADE_TIME=time.time();delay=max(0,now-c['entry_ts']);execution_signal = c['signal'].upper()
+    tg(f"⚡ ENTRADA EJECUTADA\n\nPar: {c['pair']}\nModo: {LABEL[c['mode']]}\nDirección: {execution_signal}\nScore: {c['score']}/100\nExpiración: {c['expiration']} min\nRetraso: {delay:.2f}s\nID: {oid}");return True
 
 def process():
     refresh_pairs()
