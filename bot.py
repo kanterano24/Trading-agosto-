@@ -70,7 +70,7 @@ MODE_LABEL = {
 # PERFORMANCE / SELECTION
 # ---------------------------------------------------------------------------
 
-AMOUNT = float(os.getenv("AMOUNT", "10000"))
+AMOUNT = float(os.getenv("AMOUNT", "5000"))
 
 # Para M5 necesitamos aproximadamente 160 M1 para reconstruir 30 velas M5
 # mas contexto. 180 deja margen sin pedir 360 velas innecesariamente.
@@ -487,32 +487,6 @@ def analyze_pair_mode(
     signal = result.get("signal")
     score = int(result.get("score", 0))
     reason = result.get("reason", "")
-    analysis = result.get("analysis", {}) or {}
-
-    # Bloqueo final independiente de la estrategia:
-    # CALL solo con estructura alcista y vela anterior verde.
-    # PUT solo con estructura bajista y vela anterior roja.
-    structure = analysis.get("structure", "range")
-    higher_structure = analysis.get("higher_structure", "range")
-    expected_structure = "bullish" if signal == "call" else "bearish" if signal == "put" else "range"
-
-    if signal in ("call", "put") and structure != expected_structure:
-        return {
-            "pair": pair,
-            "signal": None,
-            "score": 0,
-            "reason": f"bloqueado: estructura {structure} no permite {signal.upper()}",
-        }
-
-    if signal in ("call", "put") and mode in ("M1_M1", "M2_M2") and (
-        higher_structure != expected_structure
-    ):
-        return {
-            "pair": pair,
-            "signal": None,
-            "score": 0,
-            "reason": f"bloqueado: estructura M5 {higher_structure} no permite {signal.upper()}",
-        }
 
     # Diagnostico incluso cuando se bloquea.
     if signal not in ("call", "put") or score < MIN_SCORE:
@@ -556,7 +530,7 @@ def analyze_pair_mode(
         "entry_ts": int(event_ts),
         "expiration": int(cfg["expiration"]),
         "reason": reason,
-        "analysis": analysis,
+        "analysis": result.get("analysis", {}),
     }
 
 
