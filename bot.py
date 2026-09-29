@@ -70,7 +70,7 @@ MODE_LABEL = {
 # PERFORMANCE / SELECTION
 # ---------------------------------------------------------------------------
 
-AMOUNT = float(os.getenv("AMOUNT", "3333"))
+AMOUNT = float(os.getenv("AMOUNT", "10000"))
 
 # Para M5 necesitamos aproximadamente 160 M1 para reconstruir 30 velas M5
 # mas contexto. 180 deja margen sin pedir 360 velas innecesariamente.
