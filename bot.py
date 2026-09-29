@@ -45,16 +45,14 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 M1 = 60
 EXPIRATION = 1
-AMOUNT = float(os.getenv("AMOUNT", "5000"))
+AMOUNT = float(os.getenv("AMOUNT", "500"))
 
 # Solo 3 pares OTC disponibles.
-MAX_PAIRS = 60
-
-# Tres workers: uno por cada par disponible.
+MAX_PAIRS = 3
 WORKERS = 3
 
-# La orden solo se permite al inicio de la nueva M1.
-# Si el analisis tarda mas que esto, se descarta y NO se entra tarde.
+# La orden solo se permite en la nueva vela M1.
+# Si la apertura ya paso esta ventana, la senal se descarta.
 MAX_ENTRY_DELAY = float(os.getenv("MAX_ENTRY_DELAY", "2.0"))
 
 CANDLE_COUNT_M1 = int(os.getenv("CANDLE_COUNT_M1", "120"))
@@ -131,7 +129,8 @@ def telegram_loop() -> None:
                         "🟢 BOT ACTIVADO\n\n"
                         "M1→M1 | expiración 1 minuto\n"
                         "OTC analizados: 3\n"
-                        "Patrón: último nivel → recorrido → regreso → rechazo → confirmación.\n"
+                        "Indicador: Choppiness Index 14\n"
+                        "61.8 sobrecompra / 38.2 sobreventa\n"
                         "Entrada tardía: BLOQUEADA."
                     )
 
@@ -145,6 +144,7 @@ def telegram_loop() -> None:
                         f"{'🟢 ACTIVO' if BOT_RUNNING else '🔴 DETENIDO'}\n"
                         f"OTC: {len(PAIRS)}/3\n"
                         f"Importe: {AMOUNT:g}\n"
+                        f"CI: periodo 14 | OB 61.8 | OS 38.2\n"
                         f"Ventana máxima de entrada: {MAX_ENTRY_DELAY:.1f}s"
                     )
 
@@ -244,7 +244,7 @@ def connect() -> None:
         "🟢 IQ OPTION CONECTADO\n\n"
         "M1→M1 | 1 minuto\n"
         f"OTC seleccionados: {len(PAIRS)}/3\n"
-        "La entrada se ejecuta solo en la nueva vela."
+        "Estrategia: Choppiness Index 14."
     )
 
 
@@ -302,7 +302,7 @@ def analyze_pair(pair: str, event_ts: int) -> dict:
     if m1 is None:
         return {"pair": pair, "signal": None, "reason": "sin datos M1"}
 
-    # Solo velas completamente cerradas antes de la nueva M1.
+    # La vela que termino justo antes de event_ts es la vela de la senal.
     closed_start = event_ts - M1
     data = m1[m1["from"] <= closed_start].copy().reset_index(drop=True)
 
@@ -324,7 +324,7 @@ def analyze_pair(pair: str, event_ts: int) -> dict:
         return {
             "pair": pair,
             "signal": None,
-            "reason": result.get("reason", "sin patrón confirmado"),
+            "reason": result.get("reason", "sin señal CI"),
         }
 
     return {
@@ -356,20 +356,20 @@ def analyze_event(event_ts: int) -> Optional[dict]:
     valid = [r for r in results if r.get("signal") in ("call", "put")]
 
     logger.info(
-        "ANALISIS M1 | evento=%s | tiempo=%.3fs | %s",
+        "ANALISIS CI M1 | evento=%s | tiempo=%.3fs | %s",
         event_ts,
         time.time() - started,
         " | ".join(
             f"{r['pair']}={r['signal'].upper()}" for r in valid
-        ) if valid else "sin patrón confirmado",
+        ) if valid else "sin señal",
     )
 
     for r in results:
         if r.get("signal") not in ("call", "put"):
             logger.info("SIN SEÑAL | %s | %s", r["pair"], r.get("reason", ""))
 
-    # Si dos pares tienen señal al mismo tiempo, no se inventa un ranking.
-    # Se conserva el orden de los 3 pares seleccionados por el catálogo.
+    # No se inventa ranking: si hay varias señales, se usa el primer par
+    # del conjunto de 3 pares seleccionado por el catalogo.
     if len(valid) > 1:
         valid.sort(key=lambda x: PAIRS.index(x["pair"]))
 
@@ -399,7 +399,8 @@ def execute(candidate: dict, event_ts: int) -> bool:
     now = server_ts()
     delay = now - event_ts
 
-    # Regla clave: nunca entrar en una vela ya avanzada.
+    # Solo se permite la nueva vela. Si ya estamos en una vela posterior,
+    # la senal se descarta para evitar una entrada tarde.
     if floor_m1(now) != event_ts:
         logger.info(
             "SEÑAL DESCARTADA | %s | apertura perdida | delay=%.3fs",
@@ -407,12 +408,9 @@ def execute(candidate: dict, event_ts: int) -> bool:
         )
         return False
 
-    if delay < 0:
-        return False
-
-    if delay > MAX_ENTRY_DELAY:
+    if delay < 0 or delay > MAX_ENTRY_DELAY:
         logger.info(
-            "SEÑAL DESCARTADA | %s | entrada tardía %.3fs > %.3fs",
+            "SEÑAL DESCARTADA | %s | entrada tardia %.3fs > %.3fs",
             candidate["pair"], delay, MAX_ENTRY_DELAY,
         )
         return False
@@ -477,14 +475,14 @@ def process() -> None:
     if LAST_EVENT == event_ts:
         return
 
-    # Solo se analiza una vez por apertura M1.
+    # Una sola evaluacion por nueva vela M1.
     LAST_EVENT = event_ts
 
     candidate = analyze_event(event_ts)
     if not candidate:
         return
 
-    # Revisa de nuevo el reloj justo antes de enviar la orden.
+    # Revisa el reloj justo antes de enviar la orden.
     execute(candidate, event_ts)
 
 
@@ -509,8 +507,9 @@ def main() -> None:
         "🤖 BOT LISTO\n\n"
         "M1→M1 | expiración 1m\n"
         "3 pares OTC\n"
-        "Patrón exacto: nivel → recorrido → regreso → rechazo → confirmación.\n"
-        "Las entradas tardías se descartan.\n\n"
+        "Choppiness Index: periodo 14\n"
+        "Sobrecompra: 61.8 | Sobreventa: 38.2\n"
+        "Entrada tardía: bloqueada.\n\n"
         "Usa /start para activar."
     )
 
