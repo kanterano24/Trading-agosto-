@@ -179,14 +179,57 @@ def _candle_info(data: pd.DataFrame) -> Dict[str, Any]:
 
 
 def _recent_pressure(data: pd.DataFrame, trend: str) -> Dict[str, Any]:
-    if len(data) < 4:
-        return {"aligned": False, "aligned_count": 0, "opposite_count": 0}
-    recent = data.iloc[-4:]
+    """Presion reciente estricta: evita una vela aislada contra el movimiento."""
+    if len(data) < 5 or trend not in ("bullish", "bearish"):
+        return {"aligned": False, "aligned_count": 0, "opposite_count": 0,
+                "last_two_aligned": False, "net_aligned": False, "directions": []}
+
+    recent = data.iloc[-5:]
     dirs = [_direction(row) for _, row in recent.iterrows()]
-    aligned = "bullish" if trend == "bullish" else "bearish" if trend == "bearish" else None
+    aligned = trend
     aligned_count = sum(1 for x in dirs if x == aligned)
-    opposite_count = sum(1 for x in dirs if x not in (aligned, "neutral")) if aligned else 0
-    return {"aligned": aligned_count >= 2, "aligned_count": aligned_count, "opposite_count": opposite_count, "directions": dirs}
+    opposite_count = sum(1 for x in dirs if x not in (aligned, "neutral"))
+    last_two_aligned = dirs[-1] == aligned and dirs[-2] == aligned
+    # Desplazamiento neto de las ultimas 5 velas.
+    first_close = float(recent.iloc[0]["close"])
+    last_close = float(recent.iloc[-1]["close"])
+    net_move = last_close - first_close
+    net_aligned = net_move > 0 if aligned == "bullish" else net_move < 0
+
+    return {
+        "aligned": aligned_count >= 3 and net_aligned,
+        "aligned_count": aligned_count,
+        "opposite_count": opposite_count,
+        "last_two_aligned": last_two_aligned,
+        "net_aligned": net_aligned,
+        "directions": dirs,
+        "net_move": net_move,
+    }
+
+
+def _price_action_trend(data: pd.DataFrame, lookback: int = 7) -> str:
+    """Clasifica impulso reciente con precio/velas, sin indicadores."""
+    if data is None or len(data) < lookback:
+        return "range"
+    recent = data.iloc[-lookback:]
+    dirs = [_direction(row) for _, row in recent.iterrows()]
+    bull = sum(x == "bullish" for x in dirs)
+    bear = sum(x == "bearish" for x in dirs)
+    net = float(recent.iloc[-1]["close"]) - float(recent.iloc[0]["close"])
+    ranges = (recent["high"] - recent["low"]).astype(float)
+    typical = float(ranges.median()) if not ranges.empty else 0.0
+    if typical <= 0:
+        return "range"
+    # Un impulso debe tener desplazamiento real, no solo alternancia de velas.
+    if bull >= 5 and net > 0.8 * typical:
+        return "bullish"
+    if bear >= 5 and net < -0.8 * typical:
+        return "bearish"
+    if bull >= 4 and net > 1.2 * typical:
+        return "bullish"
+    if bear >= 4 and net < -1.2 * typical:
+        return "bearish"
+    return "range"
 
 
 def _zones(data: pd.DataFrame, st: Dict[str, Any]):
@@ -247,7 +290,11 @@ def analyze_market(df: Optional[pd.DataFrame] = None, pair: Optional[str] = None
                         f"historial insuficiente {len(data)}/{MIN_BARS}")
 
     st = _structure(data)
-    trend = st["structure"]
+    swing_trend = st["structure"]
+    price_trend = _price_action_trend(data, lookback=7)
+    trend = swing_trend
+    if price_trend in ("bullish", "bearish"):
+        trend = price_trend
     info = _candle_info(data)
     support, resistance = _zones(data, st)
     zone = _zone_rejection(data.iloc[-1], support, resistance)
@@ -256,10 +303,16 @@ def analyze_market(df: Optional[pd.DataFrame] = None, pair: Optional[str] = None
     if higher_tf_df is not None and isinstance(higher_tf_df, pd.DataFrame) and not higher_tf_df.empty:
         h = _normalize(higher_tf_df)
         if len(h) >= MIN_BARS:
-            higher_trend = _structure(h)["structure"]
+            higher_swing = _structure(h)["structure"]
+            higher_price = _price_action_trend(h, lookback=7)
+            higher_trend = higher_price if higher_price in ("bullish", "bearish") else higher_swing
 
-    # M1 y M2 deben respetar M5. M5 se evalua con su propia estructura.
-    if mode in ("M1_M1", "M2_M2") and higher_trend in ("bullish", "bearish"):
+    # M1 y M2 SOLO operan si M5 tiene una direccion clara.
+    # Si M5 esta en rango/ambiguo, se bloquea: no se adivina la tendencia.
+    if mode in ("M1_M1", "M2_M2"):
+        if higher_trend not in ("bullish", "bearish"):
+            return _blocked(data, st, info, zone, mode,
+                            "M1/M2 bloqueado: M5 sin tendencia clara", higher_trend)
         allowed = higher_trend
     else:
         allowed = trend
@@ -278,16 +331,32 @@ def analyze_market(df: Optional[pd.DataFrame] = None, pair: Optional[str] = None
         return _blocked(data, st, info, zone, mode, "vela cerrada sin direccion suficiente", higher_trend)
 
     signal = "call" if info["direction"] == "bullish" else "put"
+
+    # La ultima vela cerrada debe demostrar desplazamiento en la misma
+    # direccion de la entrada, no solamente tener color verde/rojo.
+    prev_close = float(data.iloc[-2]["close"])
+    if signal == "call":
+        if float(info["close"]) <= prev_close or info["body_ratio"] < 0.35:
+            return _blocked(data, st, info, zone, mode,
+                            "CALL bloqueado: M1/M2 no confirma impulso alcista en la vela cerrada",
+                            higher_trend)
+    else:
+        if float(info["close"]) >= prev_close or info["body_ratio"] < 0.35:
+            return _blocked(data, st, info, zone, mode,
+                            "PUT bloqueado: M1/M2 no confirma impulso bajista en la vela cerrada",
+                            higher_trend)
+
     if signal == "call" and allowed != "bullish":
         return _blocked(data, st, info, zone, mode, "CALL contra tendencia", higher_trend)
     if signal == "put" and allowed != "bearish":
         return _blocked(data, st, info, zone, mode, "PUT contra tendencia", higher_trend)
 
     pressure = _recent_pressure(data, allowed)
-    continuation = pressure["aligned"] or (
-        signal == "call" and info["bullish_momentum"]
-    ) or (
-        signal == "put" and info["bearish_momentum"]
+    continuation = (
+        pressure["aligned"]
+        or pressure["last_two_aligned"]
+        or (signal == "call" and info["bullish_momentum"])
+        or (signal == "put" and info["bearish_momentum"])
     )
 
     # Reversa solo es valida si vuelve a favor de la tendencia superior.
@@ -306,13 +375,27 @@ def analyze_market(df: Optional[pd.DataFrame] = None, pair: Optional[str] = None
     )
 
     if mode in ("M1_M1", "M2_M2"):
-        valid = continuation or aligned_reversal
+        strong_break = (
+            (signal == "call" and info["bullish_momentum"])
+            or (signal == "put" and info["bearish_momentum"])
+        )
+        valid = (pressure["last_two_aligned"] or pressure["aligned"] or strong_break) and aligned_reversal is False
     else:
         valid = continuation or aligned_reversal or rejection
 
     if not valid:
         return _blocked(data, st, info, zone, mode,
                         "sin continuidad suficiente para confirmar la entrada", higher_trend)
+
+    # Evitar entradas de continuacion directamente contra un nivel cercano
+    # cuando no existe ruptura: el bot no inventa una reversa.
+    if mode in ("M1_M1", "M2_M2"):
+        if signal == "put" and zone.get("near_support") and float(info["close"]) >= float(support):
+            return _blocked(data, st, info, zone, mode,
+                            "PUT bloqueado: soporte cercano sin ruptura bajista", higher_trend)
+        if signal == "call" and zone.get("near_resistance") and float(info["close"]) <= float(resistance):
+            return _blocked(data, st, info, zone, mode,
+                            "CALL bloqueado: resistencia cercana sin ruptura alcista", higher_trend)
 
     # No permitimos comprar dentro de impulso bajista ni vender dentro de impulso alcista.
     if signal == "call" and allowed != "bullish":
