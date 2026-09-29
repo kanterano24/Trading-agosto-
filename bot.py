@@ -107,6 +107,27 @@ def analyze_mode(pair,mode,event,m1):
     else:d=aggregate(m1,atf,closed)
     if d.empty or d[d['from']==closed].empty:return None
     r=analyze_market(df=d,mode=mode,pair=pair);sig=r.get('signal');score=int(r.get('score',0))
+
+    # FILTRO ADICIONAL:
+    # La entrada REAL debe ir a favor de la vela anterior.
+    # Vela verde (close > open) -> CALL.
+    # Vela roja (close < open) -> PUT.
+    # Doji -> no operar.
+    if len(d) < 1:
+        return None
+    previous_candle = d.iloc[-1]
+    if float(previous_candle['close']) > float(previous_candle['open']):
+        previous_direction = 'call'
+    elif float(previous_candle['close']) < float(previous_candle['open']):
+        previous_direction = 'put'
+    else:
+        previous_direction = None
+
+    # El bot conserva la inversión CALL<->PUT que ya tenía.
+    execution_signal = 'put' if sig == 'call' else 'call'
+    if previous_direction is None or execution_signal != previous_direction:
+        return None
+
     if sig not in ('call','put') or score<MIN_SCORE:return None
     return {'pair':pair,'mode':mode,'signal':sig,'score':score,'analysis_ts':int(closed),'entry_tf':etf,'entry_ts':int(event),'expiration':EXP[mode],'reason':r.get('reason',''),'analysis':r.get('analysis',{})}
 
@@ -133,8 +154,14 @@ def analyze_event(mode_event,event):
     return max(candidates,key=lambda c:(c['score'],c['confluence'],1 if c['analysis'].get('support_rejection') or c['analysis'].get('resistance_rejection') else 0,1 if c['analysis'].get('pullback') else 0))
 
 def buy(c):
-    try:return IQ.buy(AMOUNT,c['pair'],c['signal'],int(c['expiration']))
-    except Exception as e:logger.error('buy: %s',e);return False,None
+    try:
+        # Invertir la dirección únicamente al momento de ejecutar.
+        # La señal original de la estrategia permanece intacta.
+        original_signal = c['signal']
+        execution_signal = 'put' if original_signal == 'call' else 'call'
+        return IQ.buy(AMOUNT,c['pair'],execution_signal,int(c['expiration']))
+    except Exception as e:
+        logger.error('buy: %s',e);return False,None
 
 def execute(c):
     global LAST_TRADE_ENTRY,LAST_TRADE_TIME
@@ -142,7 +169,9 @@ def execute(c):
     if entry<c['entry_ts'] or entry==LAST_TRADE_ENTRY or time.time()-LAST_TRADE_TIME<COOLDOWN:return False
     res=buy(c);ok=bool(res[0]) if isinstance(res,tuple) else res not in (False,None,'error',-1);oid=res[1] if isinstance(res,tuple) and len(res)>1 else res
     if not ok:tg(f"❌ ORDEN RECHAZADA\n\n{c['pair']} | {LABEL[c['mode']]} | {c['signal'].upper()} | {c['expiration']} min");return False
-    LAST_TRADE_ENTRY=entry;LAST_TRADE_TIME=time.time();delay=max(0,now-c['entry_ts']);tg(f"⚡ ENTRADA EJECUTADA\n\nPar: {c['pair']}\nModo: {LABEL[c['mode']]}\nDirección: {c['signal'].upper()}\nScore: {c['score']}/100\nExpiración: {c['expiration']} min\nRetraso: {delay:.2f}s\nID: {oid}");return True
+    LAST_TRADE_ENTRY=entry;LAST_TRADE_TIME=time.time();delay=max(0,now-c['entry_ts']);original_signal = c['signal'].upper()
+    execution_signal = 'PUT' if original_signal == 'CALL' else 'CALL'
+    tg(f"⚡ ENTRADA EJECUTADA\n\nPar: {c['pair']}\nModo: {LABEL[c['mode']]}\nSeñal estrategia: {original_signal}\nEntrada ejecutada (invertida): {execution_signal}\nScore: {c['score']}/100\nExpiración: {c['expiration']} min\nRetraso: {delay:.2f}s\nID: {oid}");return True
 
 def process():
     refresh_pairs()
