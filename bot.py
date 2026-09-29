@@ -57,7 +57,7 @@ MODE_LABEL = {"M1_M1": "M15→M1"}
 # PERFORMANCE / SELECTION
 # ---------------------------------------------------------------------------
 
-AMOUNT = float(os.getenv("AMOUNT", "650"))
+AMOUNT = float(os.getenv("AMOUNT", "5000"))
 
 # Para M15 necesitamos bloques M1 suficientes para contexto y estructura.
 CANDLE_COUNT_M1 = int(os.getenv("CANDLE_COUNT_M1", "240"))
@@ -222,7 +222,7 @@ def refresh_pairs(force: bool = False) -> list[str]:
             continue
 
     if found:
-        # Stable: mismas 50 mientras el catalogo no cambie.
+        # Stable: mismos 3 mientras el catalogo no cambie.
         PAIRS = sorted(set(found))[:MAX_PAIRS]
         LAST_REFRESH = now
 
@@ -444,7 +444,6 @@ def analyze_pair_mode(
         return {
             "pair": pair,
             "signal": None,
-            "score": 0,
             "reason": "datos incompletos para la vela cerrada",
         }
 
@@ -468,7 +467,6 @@ def analyze_pair_mode(
         return {
             "pair": pair,
             "signal": signal,
-            "score": 0,
             "reason": reason or "sin señal",
         }
 
@@ -483,7 +481,6 @@ def analyze_pair_mode(
         return {
             "pair": pair,
             "signal": None,
-            "score": 0,
             "reason": "vela final neutra",
         }
 
@@ -491,7 +488,6 @@ def analyze_pair_mode(
         return {
             "pair": pair,
             "signal": None,
-            "score": 0,
             "reason": "señal no coincide con vela cerrada",
         }
 
@@ -499,7 +495,6 @@ def analyze_pair_mode(
         "pair": pair,
         "mode": mode,
         "signal": signal,
-        "score": score,
         "analysis_ts": closed_start,
         "entry_tf": TIMEFRAME[cfg["entry_tf"]],
         "entry_ts": int(event_ts),
@@ -523,7 +518,6 @@ def analyze_event(
             return {
                 "pair": pair,
                 "signal": None,
-                "score": 0,
                 "reason": "sin datos M1",
             }
 
@@ -543,7 +537,6 @@ def analyze_event(
             return {
                 "pair": pair,
                 "signal": None,
-                "score": 0,
                 "reason": f"error: {type(exc).__name__}",
             }
 
@@ -576,11 +569,7 @@ def analyze_event(
                 pass
 
     # Siempre dejamos diagnostico en Railway.
-    top_diag = sorted(
-        diagnostics,
-        key=lambda x: int(x.get("score", 0)),
-        reverse=True,
-    )[:8]
+    top_diag = diagnostics[:8]
 
     if top_diag:
         logger.info(
@@ -712,7 +701,6 @@ def execute(candidate) -> bool:
         f"Modo: {MODE_LABEL[candidate['mode']]}\n"
         f"Análisis: {candidate['analysis'].get('analysis_timeframe', MODE_LABEL[candidate['mode']])}\n"
         f"Dirección: {candidate['signal'].upper()}\n"
-        f"Score: {candidate['score']}/100\n"
         f"Razón: {candidate['reason']}\n"
         f"Expiración: {candidate['expiration']} min\n"
         f"Retraso: {delay:.2f}s\n"
