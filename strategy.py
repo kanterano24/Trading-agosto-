@@ -326,6 +326,48 @@ def analyze_market(
     direction = p["direction"]
     patterns = _pattern_names(p)
 
+    # PRESION REAL DE LA VELA: no usamos los patrones solo como etiquetas.
+    # Una vela roja con fuerza, mecha superior/rechazo y/o reversion debe
+    # aportar directamente a una entrada PUT cuando la estructura es bajista.
+    bearish_upper_wick = (
+        direction == "bearish"
+        and p["upper_body"] >= 1.00
+        and p["close_pos"] <= 0.60
+    )
+    bullish_lower_wick = (
+        direction == "bullish"
+        and p["lower_body"] >= 1.00
+        and p["close_pos"] >= 0.40
+    )
+    bearish_strength = (
+        direction == "bearish"
+        and p["body_ratio"] >= 0.50
+        and p["close_pos"] <= 0.45
+    )
+    bullish_strength = (
+        direction == "bullish"
+        and p["body_ratio"] >= 0.50
+        and p["close_pos"] >= 0.55
+    )
+    bearish_reversal = direction == "bearish" and (
+        p["reversal"] or bearish_upper_wick
+    )
+    bullish_reversal = direction == "bullish" and (
+        p["reversal"] or bullish_lower_wick
+    )
+    bearish_pressure = sum((
+        bearish_strength,
+        bearish_upper_wick,
+        bearish_reversal,
+        p["momentum_bear"],
+    ))
+    bullish_pressure = sum((
+        bullish_strength,
+        bullish_lower_wick,
+        bullish_reversal,
+        p["momentum_bull"],
+    ))
+
     # La senal debe venir de una estructura clara y de accion del precio.
     bullish_context = structure == "bullish"
     bearish_context = structure == "bearish"
@@ -342,26 +384,28 @@ def analyze_market(
     call_momentum = bullish_context and direction == "bullish" and p["momentum_bull"] and bull_pullback
     put_momentum = bearish_context and direction == "bearish" and p["momentum_bear"] and bear_pullback
 
-    # Prohibiciones duras de zona.
-    if rej["zone"] == "support" and direction == "bearish":
-        return _blocked_result(data, st, p, rej, patterns, counter, "PUT bloqueada: precio en SOPORTE")
-    if rej["zone"] == "resistance" and direction == "bullish":
-        return _blocked_result(data, st, p, rej, patterns, counter, "CALL bloqueada: precio en RESISTENCIA")
-    if rej["zone"] == "ambiguous":
-        return _blocked_result(data, st, p, rej, patterns, counter, "Entrada bloqueada: S/R ambiguos")
+    # La estructura manda: una vela alineada con la tendencia puede generar
+    # señal por PRESION REAL aunque no toque exactamente una zona S/R.
+    # Esto evita perder movimientos como el de la captura: tendencia bajista
+    # + vela roja + fuerza + mecha superior/reversion.
+    call_ok = bullish_context and direction == "bullish" and bullish_pressure >= 1
+    put_ok = bearish_context and direction == "bearish" and bearish_pressure >= 1
 
-    call_ok = call_rejection or call_momentum
-    put_ok = put_rejection or put_momentum
+    # El rechazo/momentum sigue sumando confirmacion, no reemplaza la vela.
+    call_ok = call_ok or call_rejection or call_momentum
+    put_ok = put_ok or put_rejection or put_momentum
 
-    # No se opera doji/indecision puro, descanso puro ni patron de agotamiento
-    # sin confirmacion estructural posterior.
+    # Doji/indecision no tiene direccion suficiente.
     if p["doji"] or p["indecision"]:
         call_ok = False
         put_ok = False
-    if p["shooting_star"] and not call_rejection:
+
+    # Una estrella/reversion contraria no cancela automaticamente una senal
+    # si la propia vela esta alineada con la tendencia y tiene presion real.
+    if p["shooting_star"] and direction == "bullish" and not bullish_pressure:
         call_ok = False
-    if p["evening_star"] and not put_rejection:
-        put_ok = False
+    if p["evening_star"] and direction == "bullish" and not bullish_pressure:
+        call_ok = False
 
     if call_ok == put_ok:
         reason = "sin señal: accion del precio ambigua"
@@ -372,11 +416,12 @@ def analyze_market(
     signal = "call" if call_ok else "put"
     score = 0
     score += 25 if structure in ("bullish", "bearish") else 0
-    score += 15 if pullback_ok else 0
-    score += 25 if (call_rejection or put_rejection) else 0
-    score += 20 if (call_momentum or put_momentum) else 0
-    score += 10 if p["reversal"] or p["continuation"] else 0
-    score += 5 if p["strength"] else 0
+    score += 20 if direction == ("bullish" if signal == "call" else "bearish") else 0
+    pressure = bullish_pressure if signal == "call" else bearish_pressure
+    score += min(25, pressure * 8)
+    score += 15 if (call_rejection or put_rejection) else 0
+    score += 10 if (call_momentum or put_momentum) else 0
+    score += 5 if pullback_ok else 0
     score = min(100, score)
 
     reasons = [
@@ -426,6 +471,14 @@ def analyze_market(
             "put_rejection": put_rejection,
             "call_momentum": call_momentum,
             "put_momentum": put_momentum,
+            "bullish_pressure": bullish_pressure,
+            "bearish_pressure": bearish_pressure,
+            "bullish_strength": bullish_strength,
+            "bearish_strength": bearish_strength,
+            "bullish_lower_wick": bullish_lower_wick,
+            "bearish_upper_wick": bearish_upper_wick,
+            "bullish_reversal": bullish_reversal,
+            "bearish_reversal": bearish_reversal,
             "target_expiration_minutes": 1,
         },
     })
