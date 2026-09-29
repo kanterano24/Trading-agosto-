@@ -315,6 +315,15 @@ def analyze_event(mode: str, event_ts: int):
         return None
 
     # Una sola operacion por evento. Se prioriza score y luego confluencia.
+    logger.info(
+        "CANDIDATOS %s | total=%d | %s",
+        mode,
+        len(candidates),
+        " | ".join(
+            f"{c['pair']} {c['signal'].upper()} score={c['score']} {c['reason']}"
+            for c in sorted(candidates, key=lambda x: x['score'], reverse=True)[:5]
+        ),
+    )
     for candidate in candidates:
         candidate["confluence"] = sum(
             1 for other in candidates
@@ -353,6 +362,12 @@ def execute(candidate) -> bool:
     if time.time() - LAST_TRADE_TIME < TRADE_COOLDOWN:
         return False
 
+    logger.info(
+        "EJECUTANDO | %s | %s | %s | score=%s | exp=%sm | delay=%.2fs",
+        candidate["pair"], MODE_LABEL[candidate["mode"]],
+        candidate["signal"].upper(), candidate["score"],
+        candidate["expiration"], max(0.0, now - candidate["entry_ts"]),
+    )
     ok_result = buy(candidate)
     ok = bool(ok_result[0]) if isinstance(ok_result, tuple) else ok_result not in (False, None, "error", -1)
     order_id = ok_result[1] if isinstance(ok_result, tuple) and len(ok_result) > 1 else ok_result
@@ -377,6 +392,7 @@ def execute(candidate) -> bool:
         f"Análisis: {candidate['analysis']['analysis_timeframe'] if 'analysis_timeframe' in candidate['analysis'] else MODE_LABEL[candidate['mode']]}\n"
         f"Dirección: {candidate['signal'].upper()}\n"
         f"Score: {candidate['score']}/100\n"
+        f"Razón: {candidate['reason']}\n"
         f"Expiración: {candidate['expiration']} min\n"
         f"Retraso: {delay:.2f}s\n"
         f"ID: {order_id}"
