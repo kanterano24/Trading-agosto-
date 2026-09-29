@@ -48,7 +48,7 @@ EXPIRATION = 1
 AMOUNT = float(os.getenv("AMOUNT", "5000"))
 
 # Solo 3 pares OTC disponibles.
-MAX_PAIRS = 6
+MAX_PAIRS = 60
 
 # Tres workers: uno por cada par disponible.
 WORKERS = 3
