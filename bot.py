@@ -77,7 +77,7 @@ AMOUNT = float(os.getenv("AMOUNT", "5000"))
 CANDLE_COUNT_M1 = int(os.getenv("CANDLE_COUNT_M1", "180"))
 
 # Se analizan exactamente hasta 50 OTC, como se solicito.
-MAX_PAIRS = int(os.getenv("MAX_OTC_PAIRS", "50"))
+MAX_PAIRS = 3
 
 # 12 es un punto medio para acelerar sin disparar demasiado las peticiones
 # simultaneas al websocket.
