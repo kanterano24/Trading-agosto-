@@ -41,12 +41,11 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 M1 = 60
 EXPIRATION = 1
 AMOUNT = float(os.getenv("AMOUNT", "500"))
-MAX_PAIRS = 30
+MAX_PAIRS = 50
 WORKERS = 30
 CANDLE_COUNT_M1 = int(os.getenv("CANDLE_COUNT_M1", "180"))
 PAIR_REFRESH_SECONDS = 600.0
 TRADE_COOLDOWN = float(os.getenv("TRADE_COOLDOWN", "60"))
-MAX_ENTRY_DELAY = float(os.getenv("MAX_ENTRY_DELAY", "1.5"))
 STREAM_REFRESH = float(os.getenv("STREAM_REFRESH", "0.10"))
 
 # ---------------------------------------------------------------------------
@@ -55,6 +54,7 @@ STREAM_REFRESH = float(os.getenv("STREAM_REFRESH", "0.10"))
 PAIRS: list[str] = []
 LAST_REFRESH = 0.0
 LAST_EVENT = -1
+TRADED_FORCE_CANDLES: set[tuple[str, int]] = set()
 LAST_TRADE_TIME = 0.0
 LAST_TRADE_ENTRY = -1
 LAST_TRADE_DIRECTION: dict[str, str] = {}
@@ -123,7 +123,7 @@ def telegram_loop() -> None:
                         "CALL: tendencia alcista + CI cruza arriba 61.8\n"
                         "PUT: tendencia bajista + CI cruza abajo 38.2\n"
                         "Alternancia por par: CALL ↔ PUT\n"
-                        "Entrada solo en la nueva M1."
+                        "Entrada en cualquier momento dentro de la vela de fuerza M1."
                     )
 
                 elif command == "/stop":
@@ -140,7 +140,7 @@ def telegram_loop() -> None:
                         "CI: 14 | 61.8 / 38.2\n"
                         "CALL = tendencia alcista + cruce arriba\n"
                         "PUT = tendencia bajista + cruce abajo\n"
-                        f"Entrada máxima: {MAX_ENTRY_DELAY:.1f}s"
+                        "Entrada: durante toda la vela de fuerza M1"
                     )
 
         except Exception:
@@ -336,76 +336,45 @@ def update_stream_cache() -> None:
                 STREAM_CACHE[pair] = data
 
 
-def get_closed_from_stream(pair: str, event_ts: int) -> Optional[pd.DataFrame]:
+def get_current_m1_from_stream(pair: str) -> Optional[pd.DataFrame]:
     with STREAM_LOCK:
         data = STREAM_CACHE.get(pair)
         if data is None or data.empty:
             return None
-        data = data.copy()
-
-    # Nunca se utiliza la vela M1 que acaba de abrir.
-    closed = data[data["from"] < event_ts].copy()
-    if closed.empty:
-        return None
-
-    closed = closed.sort_values("from").reset_index(drop=True)
-    expected = event_ts - M1
-
-    # La ultima vela tiene que ser exactamente la M1 recien cerrada.
-    if int(closed.iloc[-1]["from"]) != expected:
-        return None
-
-    return closed
+        return data.copy().sort_values("from").reset_index(drop=True)
 
 
 # ---------------------------------------------------------------------------
 # ANALISIS M1
 # ---------------------------------------------------------------------------
-def analyze_pair(pair: str, event_ts: int) -> dict:
-    data = get_closed_from_stream(pair, event_ts)
+def analyze_pair(pair: str, force_ts: int) -> dict:
+    data = get_current_m1_from_stream(pair)
+    if data is None or data.empty:
+        return {"pair": pair, "signal": None, "reason": "stream M1 no disponible"}
 
-    if data is None:
-        return {
-            "pair": pair,
-            "signal": None,
-            "reason": "M1 cerrada no disponible en stream",
-        }
+    current_ts = int(data.iloc[-1]["from"])
+    if current_ts != force_ts:
+        return {"pair": pair, "signal": None, "reason": "vela M1 actual no coincide"}
 
-    result = analyze_market(
-        df=data,
-        pair=pair,
-        mode="M1_M1",
-    )
-
+    result = analyze_market(df=data, pair=pair, mode="M1_M1")
     signal = result.get("signal")
     if signal not in ("call", "put"):
-        return {
-            "pair": pair,
-            "signal": None,
-            "reason": result.get("reason", "sin señal"),
-        }
+        return {"pair": pair, "signal": None, "reason": result.get("reason", "sin señal")}
 
     return {
-        "pair": pair,
-        "signal": signal,
-        "reason": result.get("reason", ""),
-        "score": result.get("score", 0),
-        "analysis": result.get("analysis", {}),
-        "analysis_ts": int(data.iloc[-1]["from"]),
-        "entry_ts": event_ts,
-        "expiration": EXPIRATION,
+        "pair": pair, "signal": signal, "reason": result.get("reason", ""),
+        "score": result.get("score", 0), "analysis": result.get("analysis", {}),
+        "analysis_ts": current_ts, "force_ts": force_ts, "expiration": EXPIRATION,
     }
 
 
-def analyze_event(event_ts: int) -> Optional[dict]:
+def analyze_event(force_ts: int) -> Optional[dict]:
     if not PAIRS:
         return None
-
     results = []
     started = time.time()
-
     with ThreadPoolExecutor(max_workers=min(WORKERS, len(PAIRS))) as executor:
-        futures = [executor.submit(analyze_pair, pair, event_ts) for pair in PAIRS]
+        futures = [executor.submit(analyze_pair, pair, force_ts) for pair in PAIRS]
         for future in as_completed(futures):
             try:
                 results.append(future.result())
@@ -413,43 +382,21 @@ def analyze_event(event_ts: int) -> Optional[dict]:
                 logger.exception("Error analizando par: %s", exc)
 
     valid = [r for r in results if r.get("signal") in ("call", "put")]
-
-    # Alternancia estricta por par: CALL -> PUT -> CALL / PUT -> CALL -> PUT.
     filtered = []
     for r in valid:
         last_direction = LAST_TRADE_DIRECTION.get(r["pair"])
         if last_direction == r["signal"]:
-            logger.info(
-                "SEÑAL BLOQUEADA | %s | %s repetido | ultimo=%s | requiere=%s",
-                r["pair"],
-                r["signal"].upper(),
-                last_direction.upper(),
-                "PUT" if last_direction == "call" else "CALL",
-            )
+            logger.info("SEÑAL BLOQUEADA | %s | %s repetido", r["pair"], r["signal"].upper())
+            continue
+        if (r["pair"], force_ts) in TRADED_FORCE_CANDLES:
             continue
         filtered.append(r)
 
-    valid = filtered
-
-    logger.info(
-        "ANALISIS M1 | evento=%s | tiempo=%.3fs | %s",
-        event_ts,
-        time.time() - started,
-        " | ".join(
-            f"{r['pair']}={r['signal'].upper()} S{r.get('score', 0)}"
-            for r in valid
-        ) if valid else "sin señal",
-    )
-
-    for r in results:
-        if r.get("signal") not in ("call", "put"):
-            logger.info("SIN SEÑAL | %s | %s", r["pair"], r.get("reason", ""))
-
-    # Mantiene el orden de los 30 pares; no inventa ranking.
-    if len(valid) > 1:
-        valid.sort(key=lambda x: PAIRS.index(x["pair"]))
-
-    return valid[0] if valid else None
+    logger.info("ANALISIS INTRABAR M1 | fuerza=%s | tiempo=%.3fs | %s", force_ts, time.time()-started,
+                " | ".join(f"{r['pair']}={r['signal'].upper()}" for r in filtered) if filtered else "sin señal")
+    if len(filtered) > 1:
+        filtered.sort(key=lambda x: PAIRS.index(x["pair"]))
+    return filtered[0] if filtered else None
 
 
 # ---------------------------------------------------------------------------
@@ -468,93 +415,38 @@ def buy(candidate: dict):
         return False, None
 
 
-def execute(candidate: dict, event_ts: int) -> bool:
+def execute(candidate: dict, force_ts: int) -> bool:
     global LAST_TRADE_TIME, LAST_TRADE_ENTRY, LAST_TRADE_DIRECTION
 
     now = server_ts()
-    delay = now - event_ts
-
-    # Solo se entra en la nueva vela M1.
-    if floor_m1(now) != event_ts:
-        logger.info(
-            "SEÑAL DESCARTADA | %s | apertura perdida | delay=%.3fs",
-            candidate["pair"],
-            delay,
-        )
-        return False
-
-    if delay < 0 or delay > MAX_ENTRY_DELAY:
-        logger.info(
-            "SEÑAL DESCARTADA | %s | entrada tardia %.3fs > %.3fs",
-            candidate["pair"],
-            delay,
-            MAX_ENTRY_DELAY,
-        )
-        return False
-
-    # Solo una entrada por apertura M1 global.
-    if LAST_TRADE_ENTRY == event_ts:
-        return False
-
-    if time.time() - LAST_TRADE_TIME < TRADE_COOLDOWN:
+    current_force = floor_m1(now)
+    if current_force != force_ts:
         return False
 
     pair = candidate["pair"]
     signal = candidate["signal"]
     previous = LAST_TRADE_DIRECTION.get(pair)
-
-    # En el mismo par nunca se repite la dirección consecutivamente.
     if previous == signal:
-        logger.info(
-            "SEÑAL DESCARTADA | %s | %s repetido",
-            pair,
-            signal.upper(),
-        )
+        logger.info("SEÑAL DESCARTADA | %s | %s repetido", pair, signal.upper())
+        return False
+    if (pair, force_ts) in TRADED_FORCE_CANDLES:
+        return False
+    if time.time() - LAST_TRADE_TIME < TRADE_COOLDOWN:
         return False
 
-    logger.info(
-        "ENTRADA M1 | %s | %s | delay=%.3fs | exp=1m | %s",
-        pair,
-        signal.upper(),
-        delay,
-        candidate["reason"],
-    )
-
+    logger.info("ENTRADA DENTRO DE VELA FUERZA | %s | %s | fuerza=%s | exp=1m | %s", pair, signal.upper(), force_ts, candidate["reason"])
     result = buy(candidate)
-    ok = (
-        bool(result[0])
-        if isinstance(result, tuple)
-        else result not in (False, None, -1, "error")
-    )
+    ok = bool(result[0]) if isinstance(result, tuple) else result not in (False, None, -1, "error")
     order_id = result[1] if isinstance(result, tuple) and len(result) > 1 else result
-
     if not ok:
-        tg(
-            "❌ ORDEN RECHAZADA\n\n"
-            f"Par: {pair}\n"
-            f"Dirección: {signal.upper()}\n"
-            f"Razón: {candidate['reason']}\n"
-            "Expiración: 1 minuto"
-        )
+        tg("❌ ORDEN RECHAZADA\n\n" f"Par: {pair}\n" f"Dirección: {signal.upper()}\n" f"Razón: {candidate['reason']}\n" "Expiración: 1 minuto")
         return False
 
-    # Solo se cambia la dirección recordada después de una orden aceptada.
-    LAST_TRADE_ENTRY = event_ts
+    TRADED_FORCE_CANDLES.add((pair, force_ts))
+    LAST_TRADE_ENTRY = force_ts
     LAST_TRADE_TIME = time.time()
     LAST_TRADE_DIRECTION[pair] = signal
-
-    tg(
-        "⚡ ENTRADA EJECUTADA\n\n"
-        f"Par: {pair}\n"
-        "Modo: M1→M1\n"
-        f"Dirección: {signal.upper()}\n"
-        f"Razón: {candidate['reason']}\n"
-        "Confirmación: tendencia M1 + cruce CI 14\n"
-        "Expiración: 1 minuto\n"
-        f"Retraso desde apertura: {delay:.2f}s\n"
-        f"ID: {order_id}"
-    )
-
+    tg("⚡ ENTRADA EJECUTADA\n\n" f"Par: {pair}\n" "Modo: M1 intrabar\n" f"Dirección: {signal.upper()}\n" f"Razón: {candidate['reason']}\n" "Vela de fuerza: misma M1\n" "Expiración: 1 minuto\n" f"ID: {order_id}")
     return True
 
 
@@ -562,25 +454,20 @@ def execute(candidate: dict, event_ts: int) -> bool:
 # CICLO
 # ---------------------------------------------------------------------------
 def process() -> None:
-    global LAST_EVENT
-
     refresh_pairs()
     if not PAIRS:
         return
-
     now = server_ts()
-    event_ts = floor_m1(now)
-
-    if LAST_EVENT == event_ts:
-        return
-
-    # La vela anterior acaba de cerrar. Actualizamos el stream antes de leerla.
+    force_ts = floor_m1(now)
     update_stream_cache()
-
-    LAST_EVENT = event_ts
-    candidate = analyze_event(event_ts)
+    candidate = analyze_event(force_ts)
     if candidate:
-        execute(candidate, event_ts)
+        execute(candidate, force_ts)
+
+    # Limpieza para no crecer indefinidamente. Conservamos las ultimas 5 M1.
+    if len(TRADED_FORCE_CANDLES) > 500:
+        cutoff = force_ts - 5 * M1
+        TRADED_FORCE_CANDLES.difference_update({x for x in TRADED_FORCE_CANDLES if x[1] < cutoff})
 
 
 # ---------------------------------------------------------------------------
@@ -614,8 +501,8 @@ def main() -> None:
         "M1→M1 | expiración 1 minuto\n"
         "30 pares OTC\n"
         "Analisis exclusivo de velas M1\n"
-        "CALL: tendencia alcista + CI cruza arriba 61.8\n"
-        "PUT: tendencia bajista + CI cruza abajo 38.2\n"
+        "CALL: M1 alcista + CI cruza arriba 61.8 + vela verde de rechazo\n"
+        "PUT: M1 bajista + CI cruza abajo 38.2 + vela roja de rechazo\n"
         "Alternancia por par: CALL ↔ PUT\n"
         "Entrada tardía: bloqueada.\n\n"
         "Usa /start para activar."
