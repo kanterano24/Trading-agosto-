@@ -45,11 +45,11 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 M1 = 60
 EXPIRATION = 1
-AMOUNT = float(os.getenv("AMOUNT", "50"))
+AMOUNT = float(os.getenv("AMOUNT", "500"))
 
-# Solo 3 pares OTC disponibles.
-MAX_PAIRS = 50
-WORKERS = 50
+# Solo 30 pares OTC disponibles.
+MAX_PAIRS = 30
+WORKERS = 30
 
 # La orden solo se permite en la nueva vela M1.
 # Si la apertura ya paso esta ventana, la senal se descarta.
@@ -128,7 +128,7 @@ def telegram_loop() -> None:
                     tg(
                         "🟢 BOT ACTIVADO\n\n"
                         "M1→M1 | expiración 1 minuto\n"
-                        "OTC analizados: 3\n"
+                        "OTC analizados: 30\n"
                         "Indicador: Choppiness Index 14\n"
                         "61.8 sobrecompra / 38.2 sobreventa\n"
                         "Entrada tardía: BLOQUEADA."
@@ -142,7 +142,7 @@ def telegram_loop() -> None:
                     tg(
                         f"📊 ESTADO\n\n"
                         f"{'🟢 ACTIVO' if BOT_RUNNING else '🔴 DETENIDO'}\n"
-                        f"OTC: {len(PAIRS)}/3\n"
+                        f"OTC: {len(PAIRS)}/30\n"
                         f"Importe: {AMOUNT:g}\n"
                         f"CI: periodo 14 | OB 61.8 | OS 38.2\n"
                         f"Ventana máxima de entrada: {MAX_ENTRY_DELAY:.1f}s"
@@ -243,7 +243,7 @@ def connect() -> None:
     tg(
         "🟢 IQ OPTION CONECTADO\n\n"
         "M1→M1 | 1 minuto\n"
-        f"OTC seleccionados: {len(PAIRS)}/3\n"
+        f"OTC seleccionados: {len(PAIRS)}/30\n"
         "Estrategia: Choppiness Index 14."
     )
 
@@ -506,7 +506,7 @@ def main() -> None:
     tg(
         "🤖 BOT LISTO\n\n"
         "M1→M1 | expiración 1m\n"
-        "3 pares OTC\n"
+        "30 pares OTC\n"
         "Choppiness Index: periodo 14\n"
         "Sobrecompra: 61.8 | Sobreventa: 38.2\n"
         "Entrada tardía: bloqueada.\n\n"
