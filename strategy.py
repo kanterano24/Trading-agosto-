@@ -1,19 +1,17 @@
 from __future__ import annotations
 
-"""Estrategia M1 basada EXCLUSIVAMENTE en Choppiness Index.
+"""Estrategia M1 basada solamente en Choppiness Index.
 
-Configuracion exacta del usuario:
-- Choppiness Index: periodo 14.
-- Sobrecompra: 61.8.
-- Sobreventa: 38.2.
-- Si el CI cruza hacia ARRIBA 61.8 y la vela que produce el cruce termina ROJA:
-  entrada CALL en la siguiente vela M1.
-- Si el CI cruza hacia ABAJO 38.2 y la vela que produce el cruce termina VERDE:
-  entrada PUT en la siguiente vela M1.
-- Expiracion: 1 minuto.
+Reglas exactas:
+- Choppiness Index periodo 14.
+- Sobrecompra 61.8.
+- Sobreventa 38.2.
+- Cruce ARRIBA de 61.8 + vela que produce el cruce ROJA -> CALL en la siguiente M1.
+- Cruce ABAJO de 38.2 + vela que produce el cruce VERDE -> PUT en la siguiente M1.
+- Expiracion 1 minuto.
 
-No utiliza RSI, EMA, MACD, Bollinger, ATR como filtro independiente, score,
-soporte/resistencia, tendencia, volumen ni ninguna otra condicion de entrada.
+No se agregan EMA, RSI, MACD, ATR como filtro, soporte/resistencia,
+tendencia, volumen, score ni otras condiciones.
 """
 
 from typing import Any, Dict, Optional
@@ -63,11 +61,11 @@ def _normalize(df: Optional[pd.DataFrame]) -> pd.DataFrame:
         d["from"] = pd.to_numeric(d["from"], errors="coerce")
         d = d.sort_values("from")
 
-    return d.dropna(subset=required).reset_index(drop=True)
+    return d.dropna(subset=required).drop_duplicates("from" if "from" in d.columns else None).reset_index(drop=True)
 
 
 def _choppiness_index(data: pd.DataFrame, period: int = CI_PERIOD) -> pd.Series:
-    """Calcula Choppiness Index estandar con TR y ventana de periodo."""
+    """Choppiness Index estandar sobre velas ya cerradas."""
     high = data["high"].astype(float)
     low = data["low"].astype(float)
     close = data["close"].astype(float)
@@ -82,29 +80,20 @@ def _choppiness_index(data: pd.DataFrame, period: int = CI_PERIOD) -> pd.Series:
         axis=1,
     ).max(axis=1)
 
-    atr_sum = true_range.rolling(period, min_periods=period).sum()
+    tr_sum = true_range.rolling(period, min_periods=period).sum()
     highest_high = high.rolling(period, min_periods=period).max()
     lowest_low = low.rolling(period, min_periods=period).min()
     price_range = highest_high - lowest_low
 
+    result = pd.Series(float("nan"), index=data.index, dtype=float)
+    valid = tr_sum.notna() & price_range.notna() & (price_range > 0) & (tr_sum > 0)
     denominator = math.log10(period)
-    values = pd.Series(float("nan"), index=data.index, dtype=float)
-
-    valid = (
-        atr_sum.notna()
-        & highest_high.notna()
-        & lowest_low.notna()
-        & (price_range > 0)
-        & (atr_sum > 0)
-    )
-
-    values.loc[valid] = (
+    result.loc[valid] = (
         100.0
-        * (atr_sum.loc[valid] / price_range.loc[valid]).map(math.log10)
+        * (tr_sum.loc[valid] / price_range.loc[valid]).map(math.log10)
         / denominator
     )
-
-    return values
+    return result
 
 
 def _cross_and_candle(data: pd.DataFrame) -> Optional[Dict[str, Any]]:
@@ -115,46 +104,44 @@ def _cross_and_candle(data: pd.DataFrame) -> Optional[Dict[str, Any]]:
     current = len(data) - 1
     previous = current - 1
 
-    ci_prev = ci.iloc[previous]
-    ci_now = ci.iloc[current]
-    if pd.isna(ci_prev) or pd.isna(ci_now):
+    prev_ci = ci.iloc[previous]
+    curr_ci = ci.iloc[current]
+    if pd.isna(prev_ci) or pd.isna(curr_ci):
         return None
 
     row = data.iloc[current]
-    open_price = float(row["open"])
-    close_price = float(row["close"])
-    red = close_price < open_price
-    green = close_price > open_price
+    op = float(row["open"])
+    cl = float(row["close"])
+    red = cl < op
+    green = cl > op
 
-    # Sobrecompra: CI cruza 61.8 hacia arriba + vela roja -> CALL siguiente vela.
-    crossed_overbought = float(ci_prev) <= OVERBOUGHT and float(ci_now) > OVERBOUGHT
-    if crossed_overbought and red:
+    # El cruce debe ocurrir entre las dos velas cerradas consecutivas.
+    # El valor anterior debe estar en/por debajo del nivel y el actual por encima.
+    if float(prev_ci) <= OVERBOUGHT and float(curr_ci) > OVERBOUGHT and red:
         return {
             "signal": "call",
-            "ci_previous": float(ci_prev),
-            "ci_current": float(ci_now),
+            "ci_previous": float(prev_ci),
+            "ci_current": float(curr_ci),
             "threshold": OVERBOUGHT,
             "level": "sobrecompra",
             "candle_color": "roja",
             "reason": (
                 f"CALL | Choppiness cruza sobrecompra {OVERBOUGHT:.1f} "
-                f"({ci_prev:.2f}->{ci_now:.2f}) | vela roja | siguiente M1"
+                f"({prev_ci:.2f}->{curr_ci:.2f}) | vela roja | siguiente M1"
             ),
         }
 
-    # Sobreventa: CI cruza 38.2 hacia abajo + vela verde -> PUT siguiente vela.
-    crossed_oversold = float(ci_prev) >= OVERSOLD and float(ci_now) < OVERSOLD
-    if crossed_oversold and green:
+    if float(prev_ci) >= OVERSOLD and float(curr_ci) < OVERSOLD and green:
         return {
             "signal": "put",
-            "ci_previous": float(ci_prev),
-            "ci_current": float(ci_now),
+            "ci_previous": float(prev_ci),
+            "ci_current": float(curr_ci),
             "threshold": OVERSOLD,
             "level": "sobreventa",
             "candle_color": "verde",
             "reason": (
                 f"PUT | Choppiness cruza sobreventa {OVERSOLD:.1f} "
-                f"({ci_prev:.2f}->{ci_now:.2f}) | vela verde | siguiente M1"
+                f"({prev_ci:.2f}->{curr_ci:.2f}) | vela verde | siguiente M1"
             ),
         }
 
