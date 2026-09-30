@@ -15,7 +15,7 @@ import iqoptionapi.constants as OP_code
 from strategy import analyze_market
 
 # ---------------------------------------------------------------------------
-# Compatibilidad: desactiva rutas digitales no usadas por este bot.
+# Compatibilidad IQ Option
 # ---------------------------------------------------------------------------
 def _binary_only_digital_underlying(self):
     return {"underlying": []}
@@ -39,16 +39,14 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 # CONFIGURACION
 # ---------------------------------------------------------------------------
 M1 = 60
+M5 = 300
 EXPIRATION = 1
 AMOUNT = float(os.getenv("AMOUNT", "500"))
 MAX_PAIRS = 30
 WORKERS = 30
-CANDLE_COUNT_M1 = int(os.getenv("CANDLE_COUNT_M1", "120"))
+CANDLE_COUNT_M1 = int(os.getenv("CANDLE_COUNT_M1", "180"))
 PAIR_REFRESH_SECONDS = 600.0
 TRADE_COOLDOWN = float(os.getenv("TRADE_COOLDOWN", "60"))
-
-# Ventana maxima desde la apertura. La senal solo se ejecuta en la nueva M1.
-# Con streams en tiempo real, normalmente sera <1 s. Si no llega a tiempo, se descarta.
 MAX_ENTRY_DELAY = float(os.getenv("MAX_ENTRY_DELAY", "1.5"))
 STREAM_REFRESH = float(os.getenv("STREAM_REFRESH", "0.10"))
 
@@ -60,6 +58,7 @@ LAST_REFRESH = 0.0
 LAST_EVENT = -1
 LAST_TRADE_TIME = 0.0
 LAST_TRADE_ENTRY = -1
+LAST_TRADE_DIRECTION: dict[str, str] = {}
 BOT_RUNNING = False
 IQ: Optional[IQ_Option] = None
 STREAM_STARTED: set[str] = set()
@@ -93,7 +92,6 @@ def telegram_loop() -> None:
 
     offset = None
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates"
-
     while True:
         try:
             params = {"timeout": 1}
@@ -115,8 +113,9 @@ def telegram_loop() -> None:
                         "🟢 BOT ACTIVADO\n\n"
                         "M1→M1 | expiración 1 minuto\n"
                         "OTC analizados: 30\n"
-                        "Choppiness Index 14\n"
-                        "61.8 sobrecompra / 38.2 sobreventa\n"
+                        "CI 14: 61.8 / 38.2\n"
+                        "Confirmaciones: M1 + M5 + impulso + acción del precio\n"
+                        "Alternancia por par: CALL ↔ PUT\n"
                         "Entrada solo en la nueva M1."
                     )
                 elif command == "/stop":
@@ -128,7 +127,8 @@ def telegram_loop() -> None:
                         f"{'🟢 ACTIVO' if BOT_RUNNING else '🔴 DETENIDO'}\n"
                         f"OTC: {len(PAIRS)}/30\n"
                         f"Importe: {AMOUNT:g}\n"
-                        f"CI: 14 | OB 61.8 | OS 38.2\n"
+                        "CI: 14 | 61.8 / 38.2\n"
+                        "Confirmaciones: estructura M1/M5 + price action\n"
                         f"Entrada máxima: {MAX_ENTRY_DELAY:.1f}s"
                     )
         except Exception:
@@ -181,10 +181,14 @@ def refresh_pairs(force: bool = False) -> list[str]:
             continue
 
     if found:
-        new_pairs = sorted(set(found))[:MAX_PAIRS]
-        PAIRS = new_pairs
+        PAIRS = sorted(set(found))[:MAX_PAIRS]
         LAST_REFRESH = now
-        logger.info("OTC seleccionados: %d/%d | %s", len(PAIRS), len(set(found)), ", ".join(PAIRS))
+        logger.info(
+            "OTC seleccionados: %d/%d | %s",
+            len(PAIRS),
+            len(set(found)),
+            ", ".join(PAIRS),
+        )
         start_streams(PAIRS)
     return PAIRS
 
@@ -215,7 +219,7 @@ def connect() -> None:
         "🟢 IQ OPTION CONECTADO\n\n"
         "M1→M1 | 1 minuto\n"
         f"OTC seleccionados: {len(PAIRS)}/30\n"
-        "Choppiness Index 14."
+        "CI 14 + estructura M1/M5 + acción del precio."
     )
 
 
@@ -230,9 +234,9 @@ def ensure_connection() -> bool:
     try:
         ok = IQ.connect()[0]
         if ok:
-            # Tras reconectar, los streams deben volver a iniciarse.
             with STREAM_LOCK:
                 STREAM_STARTED.clear()
+                STREAM_CACHE.clear()
             start_streams(PAIRS)
         return bool(ok)
     except Exception:
@@ -240,7 +244,7 @@ def ensure_connection() -> bool:
 
 
 # ---------------------------------------------------------------------------
-# STREAMS EN TIEMPO REAL
+# STREAMS M1 EN TIEMPO REAL
 # ---------------------------------------------------------------------------
 def start_streams(pairs: list[str]) -> None:
     if IQ is None:
@@ -285,15 +289,18 @@ def _realtime_to_df(pair: str) -> Optional[pd.DataFrame]:
         return None
     for c in required:
         data[c] = pd.to_numeric(data[c], errors="coerce")
-    data = data.dropna(subset=required).drop_duplicates("from").sort_values("from").reset_index(drop=True)
+    data = (
+        data.dropna(subset=required)
+        .drop_duplicates("from")
+        .sort_values("from")
+        .reset_index(drop=True)
+    )
     return data if not data.empty else None
 
 
 def update_stream_cache() -> None:
     if not PAIRS:
         return
-    # El contenido de get_realtime_candles es local al stream; no usamos get_candles
-    # porque la documentacion de iqoptionapi advierte que puede llegar ~30 s tarde.
     for pair in PAIRS:
         data = _realtime_to_df(pair)
         if data is not None:
@@ -308,7 +315,6 @@ def get_closed_from_stream(pair: str, event_ts: int) -> Optional[pd.DataFrame]:
             return None
         data = data.copy()
 
-    # Nunca usamos la vela que acaba de abrirse ni una vela futura.
     closed = data[data["from"] < event_ts].copy()
     if closed.empty:
         return None
@@ -320,23 +326,83 @@ def get_closed_from_stream(pair: str, event_ts: int) -> Optional[pd.DataFrame]:
     return closed
 
 
+def build_closed_m5(m1_data: pd.DataFrame, event_ts: int) -> Optional[pd.DataFrame]:
+    """Reconstruye M5 solo con bloques completos ya cerrados."""
+    if m1_data is None or m1_data.empty:
+        return None
+
+    d = m1_data.copy()
+    d = d[d["from"] < event_ts].copy()
+    if d.empty:
+        return None
+
+    d["bucket"] = (d["from"].astype("int64") // M5) * M5
+    groups = []
+    for bucket, g in d.groupby("bucket", sort=True):
+        g = g.sort_values("from")
+        # Un M5 válido debe contener las 5 M1 del bloque.
+        if len(g) < 5:
+            continue
+        expected = [int(bucket) + i * M1 for i in range(5)]
+        got = [int(x) for x in g["from"].tolist()[-5:]]
+        if got != expected:
+            continue
+        last = g.iloc[-1]
+        groups.append(
+            {
+                "from": int(bucket),
+                "open": float(g.iloc[0]["open"]),
+                "high": float(g["high"].max()),
+                "low": float(g["low"].min()),
+                "close": float(last["close"]),
+                "volume": float(g["volume"].sum()) if "volume" in g.columns else 0.0,
+            }
+        )
+
+    if not groups:
+        return None
+    return pd.DataFrame(groups).sort_values("from").reset_index(drop=True)
+
+
 # ---------------------------------------------------------------------------
 # ANALISIS
 # ---------------------------------------------------------------------------
 def analyze_pair(pair: str, event_ts: int) -> dict:
     data = get_closed_from_stream(pair, event_ts)
     if data is None:
-        return {"pair": pair, "signal": None, "reason": "vela M1 cerrada no disponible en stream"}
+        return {
+            "pair": pair,
+            "signal": None,
+            "reason": "M1 cerrada no disponible en stream",
+        }
 
-    result = analyze_market(df=data, pair=pair, mode="M1_M1")
+    m5 = build_closed_m5(data, event_ts)
+    if m5 is None:
+        return {
+            "pair": pair,
+            "signal": None,
+            "reason": "M5 cerrada no disponible para confirmar estructura",
+        }
+
+    result = analyze_market(
+        df=data,
+        pair=pair,
+        mode="M1_M1",
+        higher_tf_df=m5,
+    )
     signal = result.get("signal")
     if signal not in ("call", "put"):
-        return {"pair": pair, "signal": None, "reason": result.get("reason", "sin señal CI")}
+        return {
+            "pair": pair,
+            "signal": None,
+            "reason": result.get("reason", "sin señal"),
+        }
 
     return {
         "pair": pair,
         "signal": signal,
         "reason": result.get("reason", ""),
+        "score": result.get("score", 0),
         "analysis": result.get("analysis", {}),
         "analysis_ts": int(data.iloc[-1]["from"]),
         "entry_ts": event_ts,
@@ -359,16 +425,36 @@ def analyze_event(event_ts: int) -> Optional[dict]:
                 logger.exception("Error analizando par: %s", exc)
 
     valid = [r for r in results if r.get("signal") in ("call", "put")]
+
+    # Alternancia estricta por par: CALL -> PUT -> CALL / PUT -> CALL -> PUT.
+    filtered = []
+    for r in valid:
+        last_direction = LAST_TRADE_DIRECTION.get(r["pair"])
+        if last_direction == r["signal"]:
+            logger.info(
+                "SEÑAL BLOQUEADA | %s | %s repetido | ultimo=%s | requiere=%s",
+                r["pair"],
+                r["signal"].upper(),
+                last_direction.upper(),
+                "PUT" if last_direction == "call" else "CALL",
+            )
+            continue
+        filtered.append(r)
+    valid = filtered
+
     logger.info(
-        "ANALISIS CI M1 | evento=%s | tiempo=%.3fs | %s",
+        "ANALISIS V3 | evento=%s | tiempo=%.3fs | %s",
         event_ts,
         time.time() - started,
-        " | ".join(f"{r['pair']}={r['signal'].upper()}" for r in valid) if valid else "sin señal",
+        " | ".join(f"{r['pair']}={r['signal'].upper()} S{r.get('score', 0)}" for r in valid)
+        if valid else "sin señal",
     )
+
     for r in results:
         if r.get("signal") not in ("call", "put"):
             logger.info("SIN SEÑAL | %s | %s", r["pair"], r.get("reason", ""))
 
+    # Mantiene el orden de los 30 pares para no inventar un ranking.
     if len(valid) > 1:
         valid.sort(key=lambda x: PAIRS.index(x["pair"]))
     return valid[0] if valid else None
@@ -386,26 +472,35 @@ def buy(candidate: dict):
 
 
 def execute(candidate: dict, event_ts: int) -> bool:
-    global LAST_TRADE_TIME, LAST_TRADE_ENTRY
+    global LAST_TRADE_TIME, LAST_TRADE_ENTRY, LAST_TRADE_DIRECTION
 
     now = server_ts()
     delay = now - event_ts
 
-    # Solo la vela que acaba de abrirse. Si la ventana se perdio, no se persigue la entrada.
     if floor_m1(now) != event_ts:
         logger.info("SEÑAL DESCARTADA | %s | apertura perdida | delay=%.3fs", candidate["pair"], delay)
         return False
     if delay < 0 or delay > MAX_ENTRY_DELAY:
-        logger.info("SEÑAL DESCARTADA | %s | entrada tardia %.3fs > %.3fs", candidate["pair"], delay, MAX_ENTRY_DELAY)
+        logger.info(
+            "SEÑAL DESCARTADA | %s | entrada tardia %.3fs > %.3fs",
+            candidate["pair"], delay, MAX_ENTRY_DELAY,
+        )
         return False
     if LAST_TRADE_ENTRY == event_ts:
         return False
     if time.time() - LAST_TRADE_TIME < TRADE_COOLDOWN:
         return False
 
+    pair = candidate["pair"]
+    signal = candidate["signal"]
+    previous = LAST_TRADE_DIRECTION.get(pair)
+    if previous == signal:
+        logger.info("SEÑAL DESCARTADA | %s | %s repetido", pair, signal.upper())
+        return False
+
     logger.info(
-        "ENTRADA | %s | %s | delay=%.3fs | exp=1m | %s",
-        candidate["pair"], candidate["signal"].upper(), delay, candidate["reason"],
+        "ENTRADA V3 | %s | %s | score=%s | delay=%.3fs | exp=1m | %s",
+        pair, signal.upper(), candidate.get("score", 0), delay, candidate["reason"],
     )
 
     result = buy(candidate)
@@ -415,20 +510,25 @@ def execute(candidate: dict, event_ts: int) -> bool:
     if not ok:
         tg(
             "❌ ORDEN RECHAZADA\n\n"
-            f"Par: {candidate['pair']}\n"
-            f"Dirección: {candidate['signal'].upper()}\n"
+            f"Par: {pair}\n"
+            f"Dirección: {signal.upper()}\n"
+            f"Score: {candidate.get('score', 0)}/100\n"
             "Expiración: 1 minuto"
         )
         return False
 
     LAST_TRADE_ENTRY = event_ts
     LAST_TRADE_TIME = time.time()
+    LAST_TRADE_DIRECTION[pair] = signal
+
     tg(
-        "⚡ ENTRADA EJECUTADA\n\n"
-        f"Par: {candidate['pair']}\n"
+        "⚡ ENTRADA EJECUTADA V3\n\n"
+        f"Par: {pair}\n"
         "Modo: M1→M1\n"
-        f"Dirección: {candidate['signal'].upper()}\n"
+        f"Dirección: {signal.upper()}\n"
+        f"Score: {candidate.get('score', 0)}/100\n"
         f"Razón: {candidate['reason']}\n"
+        "Confirmaciones: estructura M1 + M5 + impulso + pullback/rechazo\n"
         "Expiración: 1 minuto\n"
         f"Retraso desde apertura: {delay:.2f}s\n"
         f"ID: {order_id}"
@@ -448,12 +548,13 @@ def process() -> None:
 
     now = server_ts()
     event_ts = floor_m1(now)
-    update_stream_cache()
 
     if LAST_EVENT == event_ts:
         return
 
-    # Marcamos el evento una sola vez. El analisis usa la vela recien cerrada.
+    # Actualizamos antes del análisis para disponer de la vela recién cerrada.
+    update_stream_cache()
+
     LAST_EVENT = event_ts
     candidate = analyze_event(event_ts)
     if candidate:
@@ -476,12 +577,13 @@ def main() -> None:
         return
 
     tg(
-        "🤖 BOT LISTO\n\n"
+        "🤖 BOT V3 LISTO\n\n"
         "M1→M1 | expiración 1m\n"
         "30 pares OTC\n"
-        "Choppiness Index: periodo 14\n"
-        "Sobrecompra: 61.8 | Sobreventa: 38.2\n"
-        "Datos M1: stream en tiempo real\n"
+        "CI 14: 61.8 / 38.2\n"
+        "Estructura: M1 + M5\n"
+        "Price action: impulso + pullback/rechazo\n"
+        "Alternancia por par: CALL ↔ PUT\n"
         "Entrada tardía: bloqueada.\n\n"
         "Usa /start para activar."
     )
@@ -496,7 +598,6 @@ def main() -> None:
                 time.sleep(1)
                 continue
 
-            # Actualizacion frecuente del cache, pero sin bloquear la apertura.
             now = time.time()
             if now - last_stream_update >= STREAM_REFRESH:
                 start_streams(PAIRS)
