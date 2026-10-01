@@ -79,7 +79,7 @@ DEMO_TRADING_ENABLED = (
     os.getenv("ENABLE_DEMO_TRADING", "0").strip().lower()
     in {"1", "true", "yes", "on"}
 )
-DEMO_AMOUNT = float(os.getenv("AMOUNT", "333"))
+DEMO_AMOUNT = float(os.getenv("AMOUNT", "100"))
 DEMO_EXPIRATION = 1
 MAX_DEMO_TRADES = 1
 DEMO_TRADES_EXECUTED = 0
@@ -824,10 +824,12 @@ def format_window(
     )
 
     lines = [
-        "📊 ULTIMAS 10 VELAS M1",
+        "📊 CONTEXTO RECIENTE M1",
         "",
         f"Par: {ACTIVE_PAIR}",
-        f"Secuencia: {seq}",
+        f"Velas acumuladas en esta sesión: {len(CLOSED)}",
+        f"Mostrando las últimas {len(candles)} velas",
+        f"Secuencia reciente: {seq}",
         "",
     ]
 
@@ -1223,21 +1225,17 @@ def process_closed_candle(
 
     CLOSED.append(candle)
 
-    # Conservamos solo las ultimas 10.
-    CLOSED = CLOSED[-WINDOW:]
+    # No recortar CLOSED: conservar todas las velas cerradas de esta sesión.
 
     # Mensaje individual de la vela cerrada.
     tg(
         format_candle_message(candle)
     )
 
-    # Cuando tenemos 10 velas, mostramos contexto y hacemos la nueva
-    # prediccion para la siguiente M1.
-    if len(CLOSED) == WINDOW:
-        tg(
-            format_window(CLOSED)
-        )
-
+    # Desde que hay suficientes datos, mostrar contexto reciente y analizar.
+    # format_window limita solo lo enviado a Telegram; CLOSED permanece completo.
+    if len(CLOSED) >= WINDOW:
+        tg(format_window(CLOSED[-WINDOW:]))
         analyze_and_message()
 
 
