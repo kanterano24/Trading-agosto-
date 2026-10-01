@@ -1,7 +1,9 @@
 from __future__ import annotations
-"""Estrategia de simulacion M1 basada SOLO en anatomia y secuencia de velas.
+"""Estrategia M1 de SIMULACION.
 
-No usa indicadores, S/R ni rechazo. No ejecuta operaciones.
+Solo precio y anatomia de las ultimas 10 velas.
+Sin indicadores, S/R ni rechazo.
+Nunca envia orden real.
 """
 from typing import Any, Dict, Optional
 import pandas as pd
@@ -23,11 +25,15 @@ def normalize(df: Optional[pd.DataFrame]) -> pd.DataFrame:
     if "from" in d.columns:
         d["from"] = pd.to_numeric(d["from"], errors="coerce")
         d = d.dropna(subset=["from"]).sort_values("from")
-    return d.dropna(subset=required).drop_duplicates("from" if "from" in d.columns else required).reset_index(drop=True)
+        d = d.drop_duplicates("from")
+    else:
+        d = d.drop_duplicates()
+    return d.dropna(subset=required).reset_index(drop=True)
 
 
 def candle_metrics(row: pd.Series) -> Dict[str, Any]:
-    o, h, l, c = map(float, (row["open"], row["high"], row["low"], row["close"]))
+    o = float(row["open"]); h = float(row["high"])
+    l = float(row["low"]); c = float(row["close"])
     rng = max(h - l, 1e-12)
     body = abs(c - o)
     upper = max(0.0, h - max(o, c))
@@ -59,20 +65,17 @@ def summarize_window(df: pd.DataFrame) -> Dict[str, Any]:
     return {"ready": len(candles) == WINDOW, "count": len(candles), "candles": candles, "sequence": seq}
 
 
-def _score_direction(candles: list[Dict[str, Any]], direction: str) -> tuple[int, list[str]]:
+def _score(candles: list[Dict[str, Any]], direction: str) -> tuple[int, list[str]]:
     last = candles[-1]
     prev = candles[-2]
-    recent3 = candles[-3:]
-    recent5 = candles[-5:]
+    wanted = "VERDE" if direction == "CALL" else "ROJA"
     score = 0
     reasons: list[str] = []
-    wanted = "VERDE" if direction == "CALL" else "ROJA"
-    opposite = "ROJA" if direction == "CALL" else "VERDE"
 
-    if last["color"] == wanted:
-        score += 1; reasons.append("ultima vela a favor")
-    else:
-        return 0, ["ultima vela no coincide"]
+    if last["color"] != wanted:
+        return 0, ["ultima vela no coincide con la direccion"]
+    score += 1
+    reasons.append("ultima vela a favor")
 
     if last["body_ratio"] >= 0.70:
         score += 2; reasons.append(f"Body/R {last['body_ratio']*100:.1f}% >= 70%")
@@ -85,78 +88,73 @@ def _score_direction(candles: list[Dict[str, Any]], direction: str) -> tuple[int
         elif last["close_pos"] >= 0.75:
             score += 1; reasons.append("cierre en zona alta")
         if last["close"] > prev["close"]:
-            score += 1; reasons.append("cierre sube vs vela anterior")
+            score += 1; reasons.append("cierre mayor que la vela anterior")
     else:
         if last["close_pos"] <= 0.10:
             score += 2; reasons.append("cierre muy cerca del minimo")
         elif last["close_pos"] <= 0.25:
             score += 1; reasons.append("cierre en zona baja")
         if last["close"] < prev["close"]:
-            score += 1; reasons.append("cierre baja vs vela anterior")
+            score += 1; reasons.append("cierre menor que la vela anterior")
 
-    aligned3 = sum(c["color"] == wanted for c in recent3)
-    aligned5 = sum(c["color"] == wanted for c in recent5)
-    if aligned3 >= 2:
-        score += 1; reasons.append(f"{aligned3}/3 velas recientes a favor")
-    if aligned5 >= 3:
-        score += 1; reasons.append(f"{aligned5}/5 velas recientes a favor")
+    recent3 = candles[-3:]
+    recent5 = candles[-5:]
+    n3 = sum(c["color"] == wanted for c in recent3)
+    n5 = sum(c["color"] == wanted for c in recent5)
+    if n3 >= 2:
+        score += 1; reasons.append(f"{n3}/3 velas recientes a favor")
+    if n5 >= 3:
+        score += 1; reasons.append(f"{n5}/5 velas recientes a favor")
 
     if last["body_ratio"] > prev["body_ratio"] and last["body_ratio"] >= 0.55:
-        score += 1; reasons.append("fuerza corporal supera la vela anterior")
+        score += 1; reasons.append("cuerpo mas dominante que la vela anterior")
 
-    # Maximo 9 puntos. Se excluye cualquier intento de usar S/R o indicadores.
     return min(score, 9), reasons
 
 
 def analyze_market(df: Optional[pd.DataFrame] = None, **_: Any) -> Dict[str, Any]:
     candles = last_10_closed(df if df is not None else pd.DataFrame())
+    window = summarize_window(df if df is not None else pd.DataFrame())
     base = {
         "signal": None, "score": 0, "blocked": True,
-        "reason": "historial insuficiente", "window": summarize_window(df if df is not None else pd.DataFrame()),
-        "analysis_timeframe": "M1", "entry_timeframe": "M1", "target_expiration_minutes": 1,
+        "reason": "historial insuficiente", "window": window,
+        "analysis_timeframe": "M1", "entry_timeframe": "M1",
+        "target_expiration_minutes": 1,
     }
     if len(candles) < WINDOW:
         return base
 
-    call_score, call_reasons = _score_direction(candles, "CALL")
-    put_score, put_reasons = _score_direction(candles, "PUT")
+    call_score, call_reasons = _score(candles, "CALL")
+    put_score, put_reasons = _score(candles, "PUT")
 
     if call_score >= MIN_SCORE and call_score > put_score:
-        signal, score, reasons = "CALL", call_score, call_reasons
-    elif put_score >= MIN_SCORE and put_score > call_score:
-        signal, score, reasons = "PUT", put_score, put_reasons
-    else:
-        signal, score, reasons = None, max(call_score, put_score), ["sin confluencia suficiente"]
+        return {**base, "signal": "CALL", "score": call_score, "blocked": False,
+                "reason": " | ".join(call_reasons)}
+    if put_score >= MIN_SCORE and put_score > call_score:
+        return {**base, "signal": "PUT", "score": put_score, "blocked": False,
+                "reason": " | ".join(put_reasons)}
 
-    return {
-        **base,
-        "signal": signal,
-        "score": score,
-        "blocked": signal is None,
-        "reason": " | ".join(reasons),
-        "call_score": call_score,
-        "put_score": put_score,
-        "window": {**summarize_window(df if df is not None else pd.DataFrame()), "candles": candles},
-    }
+    return {**base, "reason": f"sin señal: CALL={call_score}/9, PUT={put_score}/9"}
 
 
-def compare_window_to_next(previous_10: list[dict], next_candle: dict) -> Dict[str, Any]:
+# Compatibilidad con versiones anteriores.
+def compare_window_to_next(previous_10: list[dict[str, Any]], next_candle: dict[str, Any]) -> Dict[str, Any]:
     if len(previous_10) != WINDOW:
         return {"ready": False}
     return {
         "ready": True,
-        "sequence": " ".join("V" if c["color"] == "VERDE" else "R" if c["color"] == "ROJA" else "D" for c in previous_10),
+        "sequence": " ".join("V" if c.get("color") == "VERDE" else "R" if c.get("color") == "ROJA" else "D" for c in previous_10),
         "next_color": next_candle.get("color"),
         "next_open": next_candle.get("open"),
         "next_close": next_candle.get("close"),
-        "next_body_ratio": next_candle.get("body_ratio"),
+        "next_high": next_candle.get("high"),
+        "next_low": next_candle.get("low"),
     }
 
 
-# Compatibilidad con versiones anteriores.
-def get_signal(df: pd.DataFrame):
+def get_signal(df: pd.DataFrame) -> Optional[str]:
     return analyze_market(df).get("signal")
 
 
-def signal(df: pd.DataFrame):
+def signal(df: pd.DataFrame) -> Optional[str]:
     return get_signal(df)
