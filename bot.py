@@ -9,7 +9,7 @@ bot.py - Recolector + reconocedor M1 para IQ Option.
 - Sin indicadores, S/R ni rechazo.
 - OPERACIONES REALES DESACTIVADAS.
 - Captura snapshots intraminuto.
-- Conserva las ultimas 10 velas cerradas.
+- Conserva todas las velas cerradas de la sesión.
 - En cada cierre ejecuta strategy.analyze_market().
 - La estrategia reconoce estados y decide:
     CALL / PUT / NO SIGNAL
@@ -853,6 +853,22 @@ def format_window(
     return "\n".join(lines)
 
 
+def send_full_context(candles: list[dict[str, Any]]) -> None:
+    """Envía el historial completo en bloques manejables para Telegram."""
+    block_size = 25
+    total = len(candles)
+    for start in range(0, total, block_size):
+        end = min(start + block_size, total)
+        block = format_window(candles[start:end])
+        # Etiqueta el rango real dentro del historial de la sesión.
+        block = block.replace(
+            "📊 CONTEXTO RECIENTE M1",
+            f"📊 HISTORIAL M1 | Velas {start + 1}-{end} de {total}",
+            1,
+        )
+        tg(block)
+
+
 def format_analysis(
     result: dict[str, Any],
 ) -> str:
@@ -1218,10 +1234,10 @@ def process_closed_candle(
         format_candle_message(candle)
     )
 
-    # Desde que hay suficientes datos, mostrar contexto reciente y analizar.
-    # format_window limita solo lo enviado a Telegram; CLOSED permanece completo.
+    # Mostrar todo el historial acumulado, no solo la ventana de 10 velas.
+    # Se divide en bloques para respetar el limite de longitud de Telegram.
     if len(CLOSED) >= WINDOW:
-        tg(format_window(CLOSED[-WINDOW:]))
+        send_full_context(CLOSED)
         analyze_and_message()
 
 
