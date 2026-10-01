@@ -3,7 +3,7 @@ from __future__ import annotations
 """
 bot.py - Recolector + reconocedor M1 para IQ Option.
 
-- Un solo par solicitado por ANALYSIS_PAIR (por defecto ARBUSD-OTC).
+- Un solo par: EURUSD (mercado no OTC).
 - Solo M1.
 - Solo precio/anatomia/contexto.
 - Sin indicadores, S/R ni rechazo.
@@ -49,15 +49,11 @@ IQ_PASSWORD = os.getenv("IQ_PASSWORD")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-PAIR_REQUESTED = (
-    os.getenv("ANALYSIS_PAIR", "ARBUSD-OTC").strip()
-    or "ARBUSD-OTC"
-)
+# Fijado para evitar que variables antiguas seleccionen un par OTC.
+PAIR_REQUESTED = "EURUSD"
 
-AUTO_SELECT_OTC = (
-    os.getenv("AUTO_SELECT_OTC", "1").strip().lower()
-    in {"1", "true", "yes", "on"}
-)
+
+AUTO_SELECT_OTC = False  # No buscar ni sustituir por pares OTC.
 
 CATALOG_REFRESH_SECONDS = float(
     os.getenv("CATALOG_REFRESH_SECONDS", "60")
@@ -76,10 +72,10 @@ POLL_SECONDS = max(
 # DEMO: solo se habilita con ENABLE_DEMO_TRADING=1.
 # REAL queda bloqueado de forma permanente en este archivo.
 DEMO_TRADING_ENABLED = (
-    os.getenv("ENABLE_DEMO_TRADING", "0").strip().lower()
+    os.getenv("ENABLE_DEMO_TRADING", "1").strip().lower()
     in {"1", "true", "yes", "on"}
 )
-DEMO_AMOUNT = float(os.getenv("AMOUNT", "100"))
+DEMO_AMOUNT = float(os.getenv("AMOUNT", "1"))
 DEMO_EXPIRATION = 1
 MAX_DEMO_TRADES = 1
 DEMO_TRADES_EXECUTED = 0
@@ -464,36 +460,25 @@ def connect() -> bool:
 
     logger.info("Conectado a IQ Option")
 
-    selected = choose_otc_pair()
-
-    if selected is None:
-        available = discover_otc_pairs()
-
-        preview = (
-            ", ".join(available[:12])
-            if available
-            else "ninguno"
-        )
-
-        tg(
-            "❌ PAR OTC NO DISPONIBLE\n\n"
-            f"Solicitado: {PAIR_REQUESTED}\n"
-            f"OTC detectados: {preview}\n\n"
-            "El bot reintentara."
-        )
-
+    # EURUSD sin OTC: no hay selección alternativa ni fallback a OTC.
+    if PAIR_REQUESTED != "EURUSD":
+        tg("❌ Configuración inválida: solo se permite EURUSD no OTC.")
         return False
 
-    ACTIVE_PAIR = selected
-
-    if ACTIVE_PAIR != PAIR_REQUESTED:
+    active_id = resolve_active("EURUSD")
+    if active_id is None:
+        available = sorted(_catalog_active_names().keys())
+        matches = [name for name in available if name.upper() == "EURUSD"]
         tg(
-            "ℹ️ PAR SOLICITADO NO DISPONIBLE\n\n"
-            f"Solicitado: {PAIR_REQUESTED}\n"
-            f"Seleccionado: {ACTIVE_PAIR}\n\n"
-            "Solo se analizara este par."
+            "❌ EURUSD NO DISPONIBLE EN EL CATÁLOGO\n\n"
+            "No se seleccionará ningún par OTC como sustituto.\n"
+            f"Coincidencias exactas: {matches or 'ninguna'}\n\n"
+            "El bot reintentará al reiniciar."
         )
+        return False
 
+    ACTIVE_PAIR = "EURUSD"
+    logger.info("Par fijado: EURUSD (no OTC), activo=%s", active_id)
     return True
 
 
@@ -552,9 +537,9 @@ def start_stream() -> bool:
 
         tg(
             "🟢 STREAM M1 INICIADO\n\n"
-            f"Par: {ACTIVE_PAIR}\n"
-            "Modo: RECONOCIMIENTO + SIMULACION\n"
-            "Operaciones reales: DESACTIVADAS\n\n"
+            f"Par: {ACTIVE_PAIR} (no OTC)\n"
+            f"Cuenta: {'PRACTICE DEMO' if DEMO_TRADING_ENABLED else 'solo análisis'}\n"
+            "Operaciones con dinero real: BLOQUEADAS\n\n"
             "Esperando cierres..."
         )
 
@@ -860,8 +845,9 @@ def format_window(
 
     lines += [
         "",
-        "Las 10 velas se conservan para el reconocimiento.",
-        "🚫 Operaciones DESACTIVADAS.",
+        f"Historial acumulado: {len(CLOSED)} velas.",
+        "Par: EURUSD no OTC.",
+        "Cuenta real: bloqueada.",
     ]
 
     return "\n".join(lines)
@@ -963,9 +949,9 @@ def format_analysis(
         f"{pred_text}\n"
         f"Calidad prediccion: {pred_quality}\n"
         f"Razon: {reason}\n\n"
-        "Entrada teorica: apertura siguiente M1\n"
-        "Expiracion teorica: 1 minuto\n"
-        "🚫 Ninguna orden real sera enviada."
+        "Entrada prevista: apertura siguiente M1\n"
+        "Expiración: 1 minuto\n"
+        "Cuenta real bloqueada; solo PRACTICE si está habilitado."
     )
 
 
@@ -1349,11 +1335,11 @@ def main() -> None:
         return
 
     tg(
-        "🤖 BOT M1 RECONOCEDOR INICIANDO\n\n"
-        f"Par solicitado: {PAIR_REQUESTED}\n"
-        "Modo: reconocimiento + DEMO opcional\n"
-        "Operaciones reales: BLOQUEADAS\n"
-        f"Demo: {'ACTIVADA' if DEMO_TRADING_ENABLED else 'DESACTIVADA'}\n\n"
+        "🤖 BOT M1 EURUSD INICIANDO\n\n"
+        "Par: EURUSD (mercado no OTC)\n"
+        "Cuenta: PRACTICE únicamente\n"
+        "Operaciones con dinero real: BLOQUEADAS\n"
+        f"Ejecución DEMO: {'ACTIVADA' if DEMO_TRADING_ENABLED else 'DESACTIVADA'}\n\n"
         "La estrategia reconoce estado, "
         "contexto, confirmacion y espera "
         "cuando no existe evidencia suficiente."
