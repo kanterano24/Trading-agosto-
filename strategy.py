@@ -424,6 +424,58 @@ def _classify_state(candles: List[Dict[str, Any]]) -> Dict[str, Any]:
             ],
         }
 
+    # Confirmacion posterior a una pausa/transicion:
+    # si la vela anterior fue una pausa y la vela actual reanuda
+    # la direccion de la secuencia dominante, se considera continuation
+    # confirmada aunque el Body/R no sea extremo.
+    prev_was_pause = prev_body <= VERY_SMALL_BODY
+    prior_red = sum(
+        1 for x in candles[-4:-1] if x["color"] == "ROJA"
+    )
+    prior_green = sum(
+        1 for x in candles[-4:-1] if x["color"] == "VERDE"
+    )
+
+    if (
+        prev_was_pause
+        and d == -1
+        and prior_red >= 2
+        and body >= MEDIUM_BODY * 0.90
+        and close_pos <= 0.55
+    ):
+        return {
+            "state": "CONTINUACION_BAJISTA_CONFIRMADA",
+            "direction": "BAJISTA",
+            "quality": "ALTA",
+            "score": 3,
+            "evidence": [
+                "pausa/transicion inmediatamente anterior",
+                "reanuda la direccion bajista dominante",
+                f"Body/R {body * 100:.2f}%",
+                "cierre en zona inferior del rango",
+            ],
+        }
+
+    if (
+        prev_was_pause
+        and d == 1
+        and prior_green >= 2
+        and body >= MEDIUM_BODY * 0.90
+        and close_pos >= 0.45
+    ):
+        return {
+            "state": "CONTINUACION_ALCISTA_CONFIRMADA",
+            "direction": "ALCISTA",
+            "quality": "ALTA",
+            "score": 3,
+            "evidence": [
+                "pausa/transicion inmediatamente anterior",
+                "reanuda la direccion alcista dominante",
+                f"Body/R {body * 100:.2f}%",
+                "cierre en zona superior del rango",
+            ],
+        }
+
     # Desaceleracion: misma dirección pero cuerpo/rango cae claramente.
     if (
         d != 0
@@ -506,11 +558,13 @@ def _prediction_from_state(
 
     if name in {
         "CONTINUACION_ALCISTA_FUERTE",
+        "CONTINUACION_ALCISTA_CONFIRMADA",
         "IMPULSO_ALCISTA",
     }:
         prediction = "CALL"
     elif name in {
         "CONTINUACION_BAJISTA_FUERTE",
+        "CONTINUACION_BAJISTA_CONFIRMADA",
         "IMPULSO_BAJISTA",
     }:
         prediction = "PUT"
