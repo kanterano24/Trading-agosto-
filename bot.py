@@ -73,14 +73,19 @@ POLL_SECONDS = max(
     float(os.getenv("POLL_SECONDS", "0.20"))
 )
 
-# BLOQUEO ABSOLUTO DE OPERACIONES REALES.
-REAL_TRADING_ENABLED = os.getenv("ENABLE_REAL_TRADING", "0").strip().lower() in {"1", "true", "yes", "on"}
-TRADE_AMOUNT = float(os.getenv("AMOUNT", "100"))
-TRADE_EXPIRATION = 1
-MAX_REAL_TRADES = 1
-REAL_TRADES_EXECUTED = 0
-PENDING_REAL_TRADE: Optional[dict[str, Any]] = None
-LAST_EXECUTED_CANDLE: Optional[int] = None
+# DEMO: solo se habilita con ENABLE_DEMO_TRADING=1.
+# REAL queda bloqueado de forma permanente en este archivo.
+DEMO_TRADING_ENABLED = (
+    os.getenv("ENABLE_DEMO_TRADING", "0").strip().lower()
+    in {"1", "true", "yes", "on"}
+)
+DEMO_AMOUNT = float(os.getenv("AMOUNT", "100"))
+DEMO_EXPIRATION = 1
+MAX_DEMO_TRADES = 1
+DEMO_TRADES_EXECUTED = 0
+DEMO_ORDER_ID = None
+DEMO_PENDING_SIGNAL = None
+REAL_TRADING_ENABLED = False
 
 
 # ---------------------------------------------------------------------------
@@ -837,11 +842,7 @@ def format_window(
     lines += [
         "",
         "Las 10 velas se conservan para el reconocimiento.",
-        (
-            "🚨 Primera entrada real: HABILITADA."
-            if REAL_TRADING_ENABLED
-            else "🚫 Operaciones reales DESACTIVADAS."
-        ),
+        "🚫 Operaciones DESACTIVADAS.",
     ]
 
     return "\n".join(lines)
@@ -950,119 +951,182 @@ def format_analysis(
 
 
 # ---------------------------------------------------------------------------
+# EJECUCION DEMO
+# ---------------------------------------------------------------------------
+
+def configure_demo_account() -> bool:
+    if not DEMO_TRADING_ENABLED:
+        return False
+    if IQ is None:
+        return False
+    try:
+        IQ.change_balance("PRACTICE")
+        mode_fn = getattr(IQ, "get_balance_mode", None)
+        if callable(mode_fn):
+            mode = mode_fn()
+            if mode and str(mode).upper() != "PRACTICE":
+                raise RuntimeError(
+                    f"La cuenta activa no es PRACTICE: {mode}"
+                )
+        tg(
+            "🟢 DEMO HABILITADO\n\n"
+            "Cuenta: PRACTICE\n"
+            f"Importe: {DEMO_AMOUNT:.2f}\n"
+            "Expiracion: 1 minuto\n"
+            "Limite: 1 entrada"
+        )
+        return True
+    except Exception as exc:
+        logger.exception("Configurar PRACTICE: %s", exc)
+        tg(
+            "❌ DEMO NO HABILITADO\n\n"
+            f"{type(exc).__name__}: {exc}\n\n"
+            "No se enviara ninguna orden."
+        )
+        return False
+
+
+def execute_demo_entry() -> None:
+    global DEMO_TRADES_EXECUTED, DEMO_ORDER_ID
+    global DEMO_PENDING_SIGNAL
+
+    if not DEMO_TRADING_ENABLED:
+        return
+    if DEMO_TRADES_EXECUTED >= MAX_DEMO_TRADES:
+        return
+    if DEMO_PENDING_SIGNAL not in {"CALL", "PUT"}:
+        return
+    if IQ is None:
+        return
+
+    action = DEMO_PENDING_SIGNAL.lower()
+    signal = DEMO_PENDING_SIGNAL
+
+    try:
+        # Ultimo seguro: cambiar nuevamente a PRACTICE justo antes de comprar.
+        IQ.change_balance("PRACTICE")
+        mode_fn = getattr(IQ, "get_balance_mode", None)
+        if callable(mode_fn):
+            mode = mode_fn()
+            if mode and str(mode).upper() != "PRACTICE":
+                raise RuntimeError(
+                    f"Bloqueo de seguridad: cuenta activa {mode}"
+                )
+
+        ok, order_id = IQ.buy(
+            DEMO_AMOUNT,
+            ACTIVE_PAIR,
+            action,
+            DEMO_EXPIRATION,
+        )
+
+        if not ok:
+            tg(
+                "❌ ORDEN DEMO RECHAZADA\n\n"
+                f"Par: {ACTIVE_PAIR}\n"
+                f"Direccion: {signal}\n"
+                f"Importe: {DEMO_AMOUNT:.2f}\n"
+                f"Respuesta: {order_id}\n\n"
+                "No se contara como entrada ejecutada."
+            )
+            return
+
+        DEMO_ORDER_ID = order_id
+        DEMO_TRADES_EXECUTED += 1
+
+        tg(
+            "🚨 DEMO ENTRY EJECUTADA\n\n"
+            f"Par: {ACTIVE_PAIR}\n"
+            f"Direccion: {signal}\n"
+            f"Importe: {DEMO_AMOUNT:.2f}\n"
+            "Expiracion: 1 minuto\n"
+            f"ID: {order_id}\n\n"
+            "Cuenta: PRACTICE\n"
+            "Entradas demo ejecutadas: "
+            f"{DEMO_TRADES_EXECUTED}/{MAX_DEMO_TRADES}"
+        )
+    except Exception as exc:
+        logger.exception("Orden DEMO: %s", exc)
+        tg(
+            "❌ ERROR ORDEN DEMO\n\n"
+            f"{type(exc).__name__}: {exc}\n\n"
+            "No se contara como ejecutada."
+        )
+    finally:
+        DEMO_PENDING_SIGNAL = None
+
+
+def check_demo_result() -> None:
+    if not DEMO_TRADING_ENABLED or DEMO_ORDER_ID is None:
+        return
+    try:
+        result = IQ.check_win_v3(DEMO_ORDER_ID)
+        tg(
+            "🏁 RESULTADO ORDEN DEMO\n\n"
+            f"ID: {DEMO_ORDER_ID}\n"
+            f"Resultado API: {result}"
+        )
+    except Exception as exc:
+        logger.warning("Resultado DEMO: %s", exc)
+
+
+# ---------------------------------------------------------------------------
 # SIMULACION / VALIDACION
 # ---------------------------------------------------------------------------
 
-def execute_first_real_trade(direction: str, candle_start: int) -> bool:
-    global REAL_TRADES_EXECUTED, LAST_EXECUTED_CANDLE
-
-    if not REAL_TRADING_ENABLED:
-        return False
-    if REAL_TRADES_EXECUTED >= MAX_REAL_TRADES:
-        return False
-    if IQ is None or not ensure_connection():
-        tg("❌ ENTRADA NO EJECUTADA\n\nNo hay conexión activa con IQ Option.")
-        return False
-    if LAST_EXECUTED_CANDLE == candle_start:
-        return False
-
-    action = direction.lower()
-    if action not in {"call", "put"}:
-        return False
-
-    # La entrada solo se permite muy cerca del inicio de la nueva M1.
-    now = server_ts()
-    seconds_from_open = now - candle_start
-    if seconds_from_open < -0.5 or seconds_from_open > 5.0:
-        logger.warning("Entrada fuera de ventana de apertura: %.2fs", seconds_from_open)
-        return False
-
-    if TRADE_AMOUNT <= 0:
-        tg("❌ ENTRADA NO EJECUTADA\n\nAMOUNT debe ser mayor que 0.")
-        return False
-
-    try:
-        ok, order_id = IQ.buy(TRADE_AMOUNT, ACTIVE_PAIR, action, TRADE_EXPIRATION)
-    except Exception as exc:
-        logger.exception("Error enviando orden: %s", exc)
-        tg(
-            "❌ ERROR AL ENVIAR ORDEN\n\n"
-            f"Par: {ACTIVE_PAIR}\n"
-            f"Dirección: {direction}\n"
-            f"Error: {type(exc).__name__}: {exc}"
-        )
-        return False
-
-    if not ok:
-        tg(
-            "❌ IQ OPTION RECHAZÓ LA ENTRADA\n\n"
-            f"Par: {ACTIVE_PAIR}\n"
-            f"Dirección: {direction}\n"
-            f"Monto: {TRADE_AMOUNT:.2f}\n"
-            f"Expiración: {TRADE_EXPIRATION} minuto"
-        )
-        return False
-
-    REAL_TRADES_EXECUTED += 1
-    LAST_EXECUTED_CANDLE = candle_start
-
-    tg(
-        "🚨 PRIMERA ENTRADA REAL EJECUTADA\n\n"
-        f"Par: {ACTIVE_PAIR}\n"
-        f"Dirección: {direction}\n"
-        f"Monto: {TRADE_AMOUNT:.2f}\n"
-        f"Expiración: {TRADE_EXPIRATION} minuto\n"
-        f"ID: {order_id}\n"
-        f"Retraso desde apertura: {seconds_from_open:.2f}s\n\n"
-        "No se abrirán más operaciones en esta ejecución."
-    )
-    return True
-
-
 def analyze_and_message() -> None:
-    global PENDING_SIM, PENDING_REAL_TRADE
+    global PENDING_SIM
 
     if len(CLOSED) < WINDOW:
         return
 
+    # No sustituimos una prediccion pendiente hasta resolverla.
     if PENDING_SIM is not None:
         return
 
-    result = analyze_market(df=candle_to_df(CLOSED))
-    tg(format_analysis(result))
+    result = analyze_market(
+        df=candle_to_df(CLOSED)
+    )
 
-    prediction = result.get("prediction", "NO SIGNAL")
+    tg(
+        format_analysis(result)
+    )
+
+    prediction = result.get(
+        "prediction",
+        "NO SIGNAL",
+    )
 
     if prediction not in {"CALL", "PUT"}:
         STATS["no_signal"] += 1
         return
 
-    # Se registra ANTES de recibir la siguiente vela.
     PENDING_SIM = {
         "signal": prediction,
         "state": result.get("state"),
-        "quality": result.get("prediction_quality", "BAJA"),
-        "score": result.get("score", 0),
-        "reason": result.get("prediction_reason", ""),
-        "signal_timestamp": CLOSED[-1]["timestamp"],
+        "quality": result.get(
+            "prediction_quality",
+            "BAJA",
+        ),
+        "score": result.get(
+            "score",
+            0,
+        ),
+        "reason": result.get(
+            "prediction_reason",
+            "",
+        ),
+        "signal_timestamp": CLOSED[-1][
+            "timestamp"
+        ],
     }
+
     STATS["predictions"] += 1
 
-    if REAL_TRADING_ENABLED and REAL_TRADES_EXECUTED < MAX_REAL_TRADES:
-        PENDING_REAL_TRADE = {
-            "signal": prediction,
-            "source_timestamp": CLOSED[-1]["timestamp"],
-            "reason": result.get("prediction_reason", ""),
-        }
-        tg(
-            "⏳ ENTRADA REAL ARMADA\n\n"
-            f"Par: {ACTIVE_PAIR}\n"
-            f"Dirección: {prediction}\n"
-            "Momento: apertura de la siguiente M1\n"
-            f"Monto: {TRADE_AMOUNT:.2f}\n"
-            "Expiración: 1 minuto\n\n"
-            "Esperando apertura."
-        )
+    # La orden DEMO se ejecuta en la apertura detectada de la siguiente M1.
+    global DEMO_PENDING_SIGNAL
+    if DEMO_TRADING_ENABLED and DEMO_TRADES_EXECUTED < MAX_DEMO_TRADES:
+        DEMO_PENDING_SIGNAL = prediction
 
 
 def evaluate_pending(
@@ -1168,7 +1232,6 @@ def process_stream_once() -> None:
     global CURRENT_START
     global CURRENT_SAMPLES
     global LAST_CLOSED_START
-    global PENDING_REAL_TRADE
 
     candles = get_stream_candles()
 
@@ -1231,20 +1294,13 @@ def process_stream_once() -> None:
                 previous
             )
 
+            # Ya cambio la M1: este es el punto de entrada de la siguiente vela.
+            execute_demo_entry()
+
             LAST_CLOSED_START = CURRENT_START
 
         CURRENT_START = current["from"]
         CURRENT_SAMPLES = []
-
-        # Si hubo una predicción para la siguiente M1, esta es la ventana
-        # de entrada. Se intenta una sola vez al detectar la nueva vela.
-        if PENDING_REAL_TRADE is not None:
-            trade = PENDING_REAL_TRADE
-            PENDING_REAL_TRADE = None
-            execute_first_real_trade(
-                trade["signal"],
-                CURRENT_START,
-            )
 
     # Snapshot intraminuto.
     CURRENT_SAMPLES.append(
@@ -1277,14 +1333,12 @@ def main() -> None:
         )
         return
 
-    trading_status = "ACTIVADAS" if REAL_TRADING_ENABLED else "DESACTIVADAS"
-
     tg(
         "🤖 BOT M1 RECONOCEDOR INICIANDO\n\n"
         f"Par solicitado: {PAIR_REQUESTED}\n"
-        "Modo: reconocimiento + primera entrada controlada\n"
-        f"Operaciones reales: {trading_status}\n"
-        f"Monto: {TRADE_AMOUNT:.2f} | Expiración: 1 minuto\n\n"
+        "Modo: reconocimiento + DEMO opcional\n"
+        "Operaciones reales: BLOQUEADAS\n"
+        f"Demo: {'ACTIVADA' if DEMO_TRADING_ENABLED else 'DESACTIVADA'}\n\n"
         "La estrategia reconoce estado, "
         "contexto, confirmacion y espera "
         "cuando no existe evidencia suficiente."
@@ -1292,6 +1346,9 @@ def main() -> None:
 
     try:
         if not connect():
+            return
+
+        if DEMO_TRADING_ENABLED and not configure_demo_account():
             return
 
     except Exception as exc:
