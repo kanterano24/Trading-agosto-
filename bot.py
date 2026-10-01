@@ -75,7 +75,7 @@ POLL_SECONDS = max(
 
 # BLOQUEO ABSOLUTO DE OPERACIONES REALES.
 REAL_TRADING_ENABLED = os.getenv("ENABLE_REAL_TRADING", "0").strip().lower() in {"1", "true", "yes", "on"}
-TRADE_AMOUNT = float(os.getenv("AMOUNT", "1"))
+TRADE_AMOUNT = float(os.getenv("AMOUNT", "100"))
 TRADE_EXPIRATION = 1
 MAX_REAL_TRADES = 1
 REAL_TRADES_EXECUTED = 0
