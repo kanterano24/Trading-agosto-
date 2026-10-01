@@ -1,179 +1,523 @@
 from __future__ import annotations
-"""Recolector M1 de UN SOLO PAR OTC. No opera y no usa indicadores/SR/rechazo."""
-import logging,os,threading,time
-from typing import Optional
-import pandas as pd,requests
+
+import os
+import time
+import threading
+from datetime import datetime, timezone
+from typing import Any, Dict, Optional
+
+import requests
 from iqoptionapi.stable_api import IQ_Option
-import iqoptionapi.constants as OP_code
-from strategy import M1,WINDOW,normalize,candle_data,compare_window_to_next
 
-IQ_EMAIL=os.getenv('IQ_EMAIL'); IQ_PASSWORD=os.getenv('IQ_PASSWORD'); TELEGRAM_TOKEN=os.getenv('TELEGRAM_TOKEN'); TELEGRAM_CHAT_ID=os.getenv('TELEGRAM_CHAT_ID')
-ANALYSIS_PAIR=os.getenv('ANALYSIS_PAIR','').strip().upper()
-CANDLE_COUNT_M1=int(os.getenv('CANDLE_COUNT_M1','120')); LOOP_SLEEP=float(os.getenv('LOOP_SLEEP','0.05')); PAIR_REFRESH_SECONDS=float(os.getenv('PAIR_REFRESH_SECONDS','600'))
-IQ:Optional[IQ_Option]=None; PAIR:Optional[str]=None; STREAM_STARTED=False; STREAM_CACHE=pd.DataFrame(); LAST_REPORTED_CANDLE=0; PREVIOUS_10=[]; BOT_RUNNING=True
-logging.basicConfig(level=logging.INFO,format='%(asctime)s | %(levelname)s | %(message)s'); logger=logging.getLogger(__name__)
+from strategy import M1, WINDOW
 
-def _binary_only_digital_underlying(self):return {'underlying':[]}
-def _disabled_digital_open(self,*args,**kwargs):return None
-setattr(IQ_Option,'get_digital_underlying_list_data',_binary_only_digital_underlying)
-for n in ('_IQ_Option__get_digital_open','__get_digital_open','_get_digital_open'):
-    if hasattr(IQ_Option,n):setattr(IQ_Option,n,_disabled_digital_open)
+# ============================================================
+# CONFIGURACION
+# ============================================================
+IQ_EMAIL = os.getenv("IQ_EMAIL", "").strip()
+IQ_PASSWORD = os.getenv("IQ_PASSWORD", "").strip()
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
-def tg(msg):
-    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:logger.info('TELEGRAM:\n%s',msg);return
-    try:requests.post(f'https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage',data={'chat_id':TELEGRAM_CHAT_ID,'text':msg},timeout=5)
-    except Exception as e:logger.warning('Telegram: %s',e)
+# Unico par solicitado para esta etapa.
+PAIR = os.getenv("ANALYSIS_PAIR", "ARBUSD-OTC").strip() or "ARBUSD-OTC"
+CANDLE_COUNT_M1 = int(os.getenv("CANDLE_COUNT_M1", "30"))
+LOOP_SLEEP = float(os.getenv("LOOP_SLEEP", "0.10"))
+TELEGRAM_TIMEOUT = float(os.getenv("TELEGRAM_TIMEOUT", "10"))
 
-def telegram_loop():
-    global BOT_RUNNING
-    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:return
-    offset=None; url=f'https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates'
-    while True:
-        try:
-            p={'timeout':1};
-            if offset is not None:p['offset']=offset+1
-            data=requests.get(url,params=p,timeout=3).json()
-            for u in data.get('result',[]):
-                offset=u.get('update_id',offset); m=u.get('message') or {}; chat=str((m.get('chat') or {}).get('id',''))
-                if chat!=str(TELEGRAM_CHAT_ID):continue
-                cmd=str(m.get('text','')).strip().lower()
-                if cmd=='/start':BOT_RUNNING=True;tg(f'🟢 RECOLECTOR ACTIVADO\n\nPar: {PAIR}\nM1 | 10 velas\nSin indicadores\nSin S/R\nSin rechazo\nOperaciones DESACTIVADAS')
-                elif cmd=='/stop':BOT_RUNNING=False;tg('🔴 RECOLECTOR DETENIDO')
-                elif cmd=='/status':tg(f"📊 ESTADO\n\n{'🟢 ACTIVO' if BOT_RUNNING else '🔴 DETENIDO'}\nPar: {PAIR}\nM1 | ventana 10\nOperaciones DESACTIVADAS")
-        except Exception:time.sleep(1)
+# ============================================================
+# IQ OPTION - DIGITAL DESACTIVADO
+# ============================================================
+try:
+    IQ_Option.get_digital_underlying_list_data = lambda self: {"underlying": []}
+except Exception:
+    pass
 
-def is_otc(n):
-    n=str(n).upper();return n.endswith('-OTC') or n.endswith('_OTC') or 'OTC' in n
+# ============================================================
+# ESTADO
+# ============================================================
+IQ: Optional[IQ_Option] = None
+RUNNING = True
+STREAM_STARTED = False
+STATE_LOCK = threading.Lock()
 
-def discover_otc_pairs():
-    if IQ is None:return []
+# Vela M1 que estamos observando en tiempo real.
+CURRENT_CANDLE: Optional[Dict[str, Any]] = None
+LAST_CLOSED_TIMESTAMP: Optional[int] = None
+LAST_10: list[Dict[str, Any]] = []
+
+# ============================================================
+# TELEGRAM
+# ============================================================
+def telegram_url(method: str = "sendMessage") -> str:
+    return f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/{method}"
+
+
+def send_telegram(text: str) -> bool:
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        print(text)
+        return False
     try:
-        x=IQ.get_all_init_v2(); b=x.get('binary',{}) if isinstance(x,dict) else {}; a=b.get('actives',{}) if isinstance(b,dict) else {}
-    except Exception as e:logger.warning('Catalogo OTC: %s',e);return []
-    found=[]
-    for aid,info in a.items():
-        if not isinstance(info,dict):continue
-        name=info.get('name');
-        if not isinstance(name,str):continue
-        name=name.split('.',1)[-1].strip()
-        if not is_otc(name) or info.get('enabled',True) is False or info.get('is_suspended',info.get('suspended',False)):continue
-        try:OP_code.ACTIVES[name]=int(aid);found.append(name)
-        except Exception:pass
-    return sorted(set(found))
+        response = requests.post(
+            telegram_url(),
+            data={"chat_id": TELEGRAM_CHAT_ID, "text": text},
+            timeout=TELEGRAM_TIMEOUT,
+        )
+        if not response.ok:
+            print(f"Telegram HTTP {response.status_code}: {response.text[:300]}")
+        return bool(response.ok)
+    except Exception as exc:
+        print(f"Telegram error: {exc}")
+        return False
 
-def select_pair():
-    global PAIR
-    otc=discover_otc_pairs()
-    if not otc:return None
-    if ANALYSIS_PAIR:
-        if ANALYSIS_PAIR in otc:PAIR=ANALYSIS_PAIR;return PAIR
-        logger.warning('ANALYSIS_PAIR=%s no disponible. OTC: %s',ANALYSIS_PAIR,', '.join(otc[:20]));return None
-    PAIR=otc[0];return PAIR
 
-def server_ts():
-    try:return float(IQ.get_server_timestamp()) if IQ else time.time()
-    except Exception:return time.time()
-def floor_m1(ts):return int(ts//M1)*M1
+def fmt(value: float, digits: int = 8) -> str:
+    return f"{float(value):.{digits}f}"
 
-def normalize_stream(raw):
-    if not isinstance(raw,dict) or not raw:return pd.DataFrame()
-    rows=[]
-    for k,v in raw.items():
-        if not isinstance(v,dict):continue
-        x=dict(v)
-        try:x['from']=int(float(x.get('from',k)))
-        except Exception:continue
-        rows.append(x)
-    return normalize(pd.DataFrame(rows)) if rows else pd.DataFrame()
 
-def update_stream_cache():
-    global STREAM_CACHE
-    if IQ is None or not PAIR:return STREAM_CACHE
+def pct(value: float) -> str:
+    return f"{float(value):.2f}%"
+
+
+def fmt_time(ts: Optional[int]) -> str:
+    if ts is None:
+        return "N/D"
+    return datetime.fromtimestamp(int(ts), tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+
+# ============================================================
+# VELA INTRAMINUTO
+# ============================================================
+def new_candle(bucket: int, opening: float) -> Dict[str, Any]:
+    opening = float(opening)
+    return {
+        "timestamp": int(bucket),
+        "open": opening,
+        "high": opening,
+        "low": opening,
+        "close": opening,
+        "first_price": opening,
+        "last_price": opening,
+        "tick_count": 0,
+        "max_time": None,
+        "min_time": None,
+        "max_price": opening,
+        "min_price": opening,
+        "path_distance": 0.0,
+        "up_moves": 0,
+        "down_moves": 0,
+        "flat_moves": 0,
+        "up_distance": 0.0,
+        "down_distance": 0.0,
+        "quarter_prices": {},
+        "last_update_ts": int(bucket),
+    }
+
+
+def update_candle(candle: Dict[str, Any], ts: int, price: float) -> None:
+    """Acumula cada snapshot disponible del stream durante la M1."""
+    price = float(price)
+    ts = int(ts)
+    previous = float(candle["last_price"])
+
+    candle["tick_count"] += 1
+    candle["last_price"] = price
+    candle["close"] = price
+    candle["high"] = max(float(candle["high"]), price)
+    candle["low"] = min(float(candle["low"]), price)
+
+    delta = price - previous
+    candle["path_distance"] += abs(delta)
+    if delta > 0:
+        candle["up_moves"] += 1
+        candle["up_distance"] += delta
+    elif delta < 0:
+        candle["down_moves"] += 1
+        candle["down_distance"] += abs(delta)
+    else:
+        candle["flat_moves"] += 1
+
+    if price >= float(candle["max_price"]):
+        candle["max_price"] = price
+        candle["max_time"] = ts
+    if price <= float(candle["min_price"]):
+        candle["min_price"] = price
+        candle["min_time"] = ts
+
+    candle["last_update_ts"] = ts
+
+    # Aproximaciones de 25%, 50% y 75% del minuto basadas en timestamp.
+    start = int(candle["timestamp"])
+    elapsed = max(0, min(M1 - 1, ts - start))
+    quarter = 25 if elapsed >= 45 else 50 if elapsed >= 30 else 25 if elapsed >= 15 else 0
+    if quarter:
+        candle["quarter_prices"][quarter] = price
+
+
+def finalize_candle(candle: Dict[str, Any]) -> Dict[str, Any]:
+    o = float(candle["open"])
+    h = float(candle["high"])
+    l = float(candle["low"])
+    close = float(candle["close"])
+
+    # Aseguramos que OHLC incluya cualquier max/min que haya entregado el stream.
+    h = max(h, float(candle.get("max_price", h)))
+    l = min(l, float(candle.get("min_price", l)))
+
+    body = abs(close - o)
+    total = max(h - l, 0.0)
+    upper = max(0.0, h - max(o, close))
+    lower = max(0.0, min(o, close) - l)
+    color = "VERDE" if close > o else "ROJA" if close < o else "DOJI"
+
+    return {
+        **candle,
+        "high": h,
+        "low": l,
+        "close": close,
+        "body": body,
+        "range": total,
+        "upper_wick": upper,
+        "lower_wick": lower,
+        "color": color,
+        "body_pct": body / total * 100 if total else 0.0,
+        "upper_wick_pct": upper / total * 100 if total else 0.0,
+        "lower_wick_pct": lower / total * 100 if total else 0.0,
+        "max_from_open": h - o,
+        "min_from_open": o - l,
+        "close_vs_open": close - o,
+        "close_vs_high": close - h,
+        "close_vs_low": close - l,
+    }
+
+# ============================================================
+# DATOS DEL STREAM
+# ============================================================
+def server_timestamp() -> int:
     try:
-        d=normalize_stream(IQ.get_realtime_candles(PAIR,M1))
-        if not d.empty:STREAM_CACHE=d
-    except Exception as e:logger.warning('Stream %s: %s',PAIR,e)
-    return STREAM_CACHE
+        return int(IQ.get_server_timestamp())
+    except Exception:
+        return int(time.time())
 
-def ensure_stream():
+
+def start_stream() -> None:
     global STREAM_STARTED
-    if IQ is None or not PAIR:return False
-    if STREAM_STARTED:return True
-    try:IQ.start_candles_stream(PAIR,M1,CANDLE_COUNT_M1);STREAM_STARTED=True;logger.info('Stream M1 iniciado: %s',PAIR);return True
-    except Exception as e:logger.warning('No se pudo iniciar stream %s: %s',PAIR,e);return False
-
-def fmt_candle(c):
-    return (f"🕯️ VELA M1 CERRADA\n\nPar: {PAIR}\nTimestamp: {c['timestamp']}\nColor: {c['color']}\n\nApertura: {c['open']:.8f}\nMecha inferior: {c['lower_wick']:.8f}\nCierre: {c['close']:.8f}\nMecha superior: {c['upper_wick']:.8f}\n\nSolo precio. Sin indicadores, S/R ni rechazo.\nOperaciones DESACTIVADAS.")
-
-def fmt_window(w):
-    seq=' '.join('G' if c['color']=='VERDE' else 'R' if c['color']=='ROJA' else 'D' for c in w)
-    s=[f'📊 ULTIMAS 10 VELAS\n\nPar: {PAIR}\nSecuencia: {seq}\n']
-    for i,c in enumerate(w,1):s.append(f"{i:02d} {c['color'][0]} | O={c['open']:.8f} | MI={c['lower_wick']:.8f} | C={c['close']:.8f} | MS={c['upper_wick']:.8f}")
-    return '\n'.join(s)
-
-def fmt_next(r):
-    return (f"🔎 VENTANA 10 → SIGUIENTE VELA\n\nPar: {PAIR}\n10 velas: {r['sequence']}\nSiguiente color real: {r['next_color']}\n\nApertura: {r['next_open']:.8f}\nMecha inferior: {r['next_lower_wick']:.8f}\nCierre: {r['next_close']:.8f}\nMecha superior: {r['next_upper_wick']:.8f}\n\nDato observado; todavia no se usa para operar.")
-
-def process_closed_candles():
-    global LAST_REPORTED_CANDLE,PREVIOUS_10
-    if not BOT_RUNNING or STREAM_CACHE.empty:return
-    latest=floor_m1(server_ts())-M1
-    closed=STREAM_CACHE[STREAM_CACHE['from'].astype(int)<=latest].drop_duplicates('from').sort_values('from').reset_index(drop=True)
-    if closed.empty:return
-    if LAST_REPORTED_CANDLE==0:
-        LAST_REPORTED_CANDLE=int(closed.iloc[-1]['from'])
-        h=closed.tail(WINDOW)
-        if len(h)==WINDOW:PREVIOUS_10=[candle_data(r) for _,r in h.iterrows()]
+    if STREAM_STARTED:
         return
-    pending=closed[closed['from'].astype(int)>LAST_REPORTED_CANDLE]
-    for _,row in pending.iterrows():
-        c=candle_data(row)
-        if len(PREVIOUS_10)==WINDOW:
-            r=compare_window_to_next(PREVIOUS_10,c)
-            if r.get('ready'):tg(fmt_next(r))
-        tg(fmt_candle(c))
-        h=closed[closed['from'].astype(int)<=c['timestamp']].tail(WINDOW)
-        w=[candle_data(r) for _,r in h.iterrows()]
-        if len(w)==WINDOW:PREVIOUS_10=w;tg(fmt_window(w))
-        LAST_REPORTED_CANDLE=c['timestamp']
-        logger.info('Cierre %s | %s | O=%.8f MI=%.8f C=%.8f MS=%.8f',PAIR,c['color'],c['open'],c['lower_wick'],c['close'],c['upper_wick'])
+    IQ.start_candles_stream(PAIR, M1, CANDLE_COUNT_M1)
+    STREAM_STARTED = True
+    print(f"Stream M1 iniciado: {PAIR}")
 
-def connect():
+
+def stop_stream() -> None:
+    global STREAM_STARTED
+    if not STREAM_STARTED:
+        return
+    try:
+        IQ.stop_candles_stream(PAIR, M1)
+    except Exception:
+        pass
+    STREAM_STARTED = False
+
+
+def candle_timestamp(data: Dict[str, Any], fallback: int) -> Optional[int]:
+    try:
+        return int(data.get("from", fallback))
+    except Exception:
+        return None
+
+
+def candle_bucket(ts: int) -> int:
+    return int(ts) - (int(ts) % M1)
+
+
+def extract_price(data: Dict[str, Any]) -> Optional[float]:
+    # En realtime_candles, close suele ser el precio actualizado de la vela.
+    for key in ("close", "price", "ask", "bid"):
+        value = data.get(key)
+        if value is not None:
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                continue
+    return None
+
+
+def extract_open(data: Dict[str, Any], fallback: float) -> float:
+    for key in ("open", "open_price"):
+        value = data.get(key)
+        if value is not None:
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                pass
+    return float(fallback)
+
+
+def add_closed_candle(closed: Dict[str, Any]) -> None:
+    global LAST_CLOSED_TIMESTAMP, LAST_10
+
+    ts = int(closed["timestamp"])
+    if LAST_CLOSED_TIMESTAMP == ts:
+        return
+
+    LAST_CLOSED_TIMESTAMP = ts
+    LAST_10.append(closed)
+    if len(LAST_10) > WINDOW:
+        LAST_10 = LAST_10[-WINDOW:]
+
+    # Un mensaje completo de la vela cerrada.
+    send_telegram(candle_report(closed))
+
+    # Las últimas 10 velas se envían cuando ya existe una ventana completa.
+    if len(LAST_10) == WINDOW:
+        send_telegram(window_report(LAST_10))
+
+# ============================================================
+# REPORTES TELEGRAM
+# ============================================================
+def candle_report(c: Dict[str, Any]) -> str:
+    tick_total = max(int(c.get("tick_count", 0)), 1)
+    up_pct = c["up_moves"] / tick_total * 100
+    down_pct = c["down_moves"] / tick_total * 100
+    direction = (
+        "ALCISTA"
+        if c["up_distance"] > c["down_distance"]
+        else "BAJISTA"
+        if c["down_distance"] > c["up_distance"]
+        else "MIXTO"
+    )
+
+    return (
+        "🕯️ VELA M1 CERRADA\n\n"
+        f"Par: {PAIR}\n"
+        f"Timestamp: {int(c['timestamp'])}\n"
+        f"Inicio: {fmt_time(int(c['timestamp']))}\n"
+        f"Color: {c['color']}\n\n"
+        "💰 OHLC + ANATOMÍA\n"
+        f"Apertura: {fmt(c['open'])}\n"
+        f"Máximo: {fmt(c['high'])}\n"
+        f"Mínimo: {fmt(c['low'])}\n"
+        f"Cierre: {fmt(c['close'])}\n"
+        f"Cuerpo: {fmt(c['body'])}\n"
+        f"Mecha inferior: {fmt(c['lower_wick'])}\n"
+        f"Mecha superior: {fmt(c['upper_wick'])}\n"
+        f"Rango total: {fmt(c['range'])}\n\n"
+        "📐 PROPORCIONES\n"
+        f"Cuerpo/Rango: {pct(c['body_pct'])}\n"
+        f"MI/Rango: {pct(c['lower_wick_pct'])}\n"
+        f"MS/Rango: {pct(c['upper_wick_pct'])}\n\n"
+        "📈 MOVIMIENTO DURANTE EL MINUTO\n"
+        f"Máximo desde apertura: +{fmt(c['max_from_open'])}\n"
+        f"Mínimo desde apertura: -{fmt(c['min_from_open'])}\n"
+        f"Recorrido acumulado: {fmt(c['path_distance'])}\n"
+        f"Distancia alcista: {fmt(c['up_distance'])}\n"
+        f"Distancia bajista: {fmt(c['down_distance'])}\n"
+        f"Balance del recorrido: {fmt(c['up_distance'] - c['down_distance'])}\n"
+        f"Dirección por recorrido: {direction}\n\n"
+        "🔢 ACTUALIZACIONES DEL STREAM\n"
+        f"Actualizaciones recibidas: {c['tick_count']}\n"
+        f"Movimientos ↑: {c['up_moves']} ({up_pct:.1f}%)\n"
+        f"Movimientos ↓: {c['down_moves']} ({down_pct:.1f}%)\n"
+        f"Movimientos =: {c['flat_moves']}\n\n"
+        "⏱️ EXTREMOS\n"
+        f"Hora máximo: {fmt_time(c.get('max_time'))}\n"
+        f"Hora mínimo: {fmt_time(c.get('min_time'))}\n"
+        f"Cierre vs apertura: {fmt(c['close_vs_open'])}\n"
+        f"Cierre debajo del máximo: {fmt(abs(c['close_vs_high']))}\n"
+        f"Cierre encima del mínimo: {fmt(abs(c['close_vs_low']))}\n\n"
+        "Solo precio. Sin indicadores, S/R ni rechazo.\n"
+        "Operaciones DESACTIVADAS."
+    )
+
+
+def window_report(window: list[Dict[str, Any]]) -> str:
+    seq = " ".join(
+        "V" if x["color"] == "VERDE" else "R" if x["color"] == "ROJA" else "D"
+        for x in window
+    )
+    lines = [
+        f"📊 ÚLTIMAS {len(window)} VELAS M1",
+        "",
+        f"Par: {PAIR}",
+        f"Secuencia: {seq}",
+        "",
+    ]
+    for i, c in enumerate(window, 1):
+        lines.append(
+            f"{i:02d} {'V' if c['color']=='VERDE' else 'R' if c['color']=='ROJA' else 'D'} | "
+            f"O={fmt(c['open'])} | H={fmt(c['high'])} | L={fmt(c['low'])} | "
+            f"C={fmt(c['close'])} | MI={fmt(c['lower_wick'])} | MS={fmt(c['upper_wick'])} | "
+            f"Body={fmt(c['body'])} | R={fmt(c['range'])} | Body/R={pct(c['body_pct'])}"
+        )
+    lines.extend([
+        "",
+        "Estas 10 velas se conservan para estudiar qué características preceden a la siguiente vela.",
+        "Operaciones DESACTIVADAS.",
+    ])
+    return "\n".join(lines)
+
+# ============================================================
+# PROCESAMIENTO ROBUSTO DEL STREAM
+# ============================================================
+def process_stream() -> None:
+    global CURRENT_CANDLE
+
+    raw = IQ.get_realtime_candles(PAIR, M1) or {}
+    if not raw:
+        return
+
+    # Elegimos solamente la vela más reciente del stream.
+    candidates: list[tuple[int, Dict[str, Any]]] = []
+    for key, value in raw.items():
+        if not isinstance(value, dict):
+            continue
+        ts = candle_timestamp(value, int(key) if str(key).isdigit() else 0)
+        if ts is None:
+            continue
+        candidates.append((candle_bucket(ts), value))
+
+    if not candidates:
+        return
+
+    bucket, data = max(candidates, key=lambda x: x[0])
+    price = extract_price(data)
+    if price is None:
+        return
+
+    opening = extract_open(data, price)
+    now_bucket = candle_bucket(server_timestamp())
+
+    # En el arranque, NO enviamos historial. Solo comenzamos a observar la M1 actual.
+    if CURRENT_CANDLE is None:
+        if bucket < now_bucket:
+            return
+        CURRENT_CANDLE = new_candle(bucket, opening)
+        # Incorporamos el OHLC disponible del stream sin inventar recorrido.
+        CURRENT_CANDLE["high"] = max(float(CURRENT_CANDLE["high"]), float(data.get("max", data.get("high", price))))
+        CURRENT_CANDLE["low"] = min(float(CURRENT_CANDLE["low"]), float(data.get("min", data.get("low", price))))
+        update_candle(CURRENT_CANDLE, bucket, price)
+        return
+
+    # Si llegamos a una M1 posterior, cerramos exactamente la que estábamos siguiendo.
+    if bucket > int(CURRENT_CANDLE["timestamp"]):
+        closed = finalize_candle(CURRENT_CANDLE)
+        add_closed_candle(closed)
+
+        CURRENT_CANDLE = new_candle(bucket, opening)
+        CURRENT_CANDLE["high"] = max(float(CURRENT_CANDLE["high"]), float(data.get("max", data.get("high", price))))
+        CURRENT_CANDLE["low"] = min(float(CURRENT_CANDLE["low"]), float(data.get("min", data.get("low", price))))
+        update_candle(CURRENT_CANDLE, bucket, price)
+        return
+
+    # Datos atrasados del stream: no retrocedemos de vela.
+    if bucket < int(CURRENT_CANDLE["timestamp"]):
+        return
+
+    # Misma M1: acumulamos el nuevo snapshot.
+    update_candle(CURRENT_CANDLE, bucket, price)
+
+# ============================================================
+# LOGIN
+# ============================================================
+def connect_iq() -> None:
     global IQ
-    IQ=IQ_Option(IQ_EMAIL,IQ_PASSWORD);ok,reason=IQ.connect()
-    if not ok:raise ConnectionError(reason)
-    if not select_pair():raise RuntimeError('No se pudo seleccionar el par OTC.')
-    tg(f'🟢 RECOLECTOR CONECTADO\n\nPar unico: {PAIR}\nM1 | ventana 10\nSin indicadores\nSin S/R\nSin rechazo\nOperaciones DESACTIVADAS\n\nSe enviara cada vela cerrada con apertura, mecha inferior, cierre y mecha superior.')
+    if not IQ_EMAIL or not IQ_PASSWORD:
+        raise RuntimeError("Faltan IQ_EMAIL o IQ_PASSWORD en las variables de entorno.")
 
-def ensure_connection():
-    global STREAM_STARTED,STREAM_CACHE
-    if IQ is None:return False
-    try:
-        if IQ.check_connect():return True
-    except Exception:pass
-    try:
-        ok=bool(IQ.connect()[0])
-        if ok:STREAM_STARTED=False;STREAM_CACHE=pd.DataFrame()
-        return ok
-    except Exception:return False
+    IQ = IQ_Option(IQ_EMAIL, IQ_PASSWORD)
+    ok, reason = IQ.connect()
+    if not ok:
+        raise RuntimeError(f"No se pudo conectar a IQ Option: {reason}")
 
-def main():
-    global PAIR,STREAM_STARTED,STREAM_CACHE
-    if not IQ_EMAIL or not IQ_PASSWORD:raise RuntimeError('Faltan IQ_EMAIL / IQ_PASSWORD.')
-    connect()
-    if TELEGRAM_TOKEN and TELEGRAM_CHAT_ID:threading.Thread(target=telegram_loop,daemon=True).start()
-    last_refresh=time.time()
+    try:
+        IQ.change_balance("PRACTICE")
+    except Exception:
+        pass
+
+    print("Conectado a IQ Option.")
+    print(f"Par configurado: {PAIR}")
+
+# ============================================================
+# TELEGRAM COMMANDS
+# ============================================================
+def telegram_get_updates(offset: Optional[int] = None):
+    if not TELEGRAM_TOKEN:
+        return []
+    try:
+        params: Dict[str, Any] = {"timeout": 1}
+        if offset is not None:
+            params["offset"] = offset
+        response = requests.get(
+            telegram_url("getUpdates"),
+            params=params,
+            timeout=TELEGRAM_TIMEOUT,
+        )
+        return response.json().get("result", []) if response.ok else []
+    except Exception:
+        return []
+
+
+def telegram_commands_loop() -> None:
+    global RUNNING
+    offset: Optional[int] = None
+
     while True:
-        try:
-            if not ensure_connection():time.sleep(2);continue
-            if PAIR is None or time.time()-last_refresh>=PAIR_REFRESH_SECONDS:
-                old=PAIR;new=select_pair()
-                if new!=old:STREAM_STARTED=False;STREAM_CACHE=pd.DataFrame()
-                last_refresh=time.time()
-            if not PAIR:time.sleep(2);continue
-            if not ensure_stream():time.sleep(1);continue
-            update_stream_cache();process_closed_candles();time.sleep(LOOP_SLEEP)
-        except KeyboardInterrupt:break
-        except Exception:logger.exception('Error en ciclo principal');time.sleep(1)
+        for update in telegram_get_updates(offset):
+            try:
+                offset = int(update["update_id"]) + 1
+            except Exception:
+                continue
 
-if __name__=='__main__':main()
+            message = update.get("message", {})
+            text = str(message.get("text", "")).strip().lower()
+
+            if text == "/start":
+                RUNNING = True
+                send_telegram("▶️ Recolección M1 ACTIVADA. Operaciones siguen DESACTIVADAS.")
+            elif text == "/stop":
+                RUNNING = False
+                send_telegram("⏸️ Recolección M1 PAUSADA. Operaciones siguen DESACTIVADAS.")
+            elif text == "/status":
+                send_telegram(
+                    f"📊 STATUS\nPar: {PAIR}\n"
+                    f"Recolección: {'ACTIVA' if RUNNING else 'PAUSADA'}\n"
+                    f"Velas almacenadas: {len(LAST_10)}/{WINDOW}\n"
+                    "Operaciones: DESACTIVADAS"
+                )
+
+        time.sleep(0.5)
+
+# ============================================================
+# MAIN
+# ============================================================
+def main() -> None:
+    connect_iq()
+    start_stream()
+
+    if TELEGRAM_TOKEN:
+        threading.Thread(target=telegram_commands_loop, daemon=True).start()
+        send_telegram(
+            "🟢 QUANT MODE INICIADO\n\n"
+            f"Par: {PAIR}\n"
+            "Timeframe: M1\n"
+            "Modo: RECOLECCIÓN DE DATOS\n\n"
+            "Se registrará el movimiento disponible de cada vela durante todo el minuto.\n"
+            "Operaciones: DESACTIVADAS."
+        )
+
+    try:
+        while True:
+            if RUNNING:
+                try:
+                    process_stream()
+                except Exception as exc:
+                    print(f"Stream error: {exc}")
+            time.sleep(LOOP_SLEEP)
+    except KeyboardInterrupt:
+        print("Detenido por usuario.")
+    finally:
+        stop_stream()
+
+
+if __name__ == "__main__":
+    main()
