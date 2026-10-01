@@ -373,21 +373,43 @@ def simulate_and_message() -> None:
     global PENDING_SIM
     if len(CLOSED) < WINDOW or PENDING_SIM is not None:
         return
+
     result = analyze_market(df=candle_to_df(CLOSED))
+    state = result.get("state", "RUIDO")
+    quality = result.get("quality", "LOW")
+    decision = result.get("decision", "NO SIGNAL")
+    direction = result.get("direction") or "-"
+
+    # Siempre reportamos el estado reconocido, incluso cuando no hay entrada.
     if result.get("signal") not in ("CALL", "PUT"):
+        tg(
+            "🧠 RECONOCIMIENTO M1\n\n"
+            f"Par: {ACTIVE_PAIR}\nEstado: {state}\nDireccion: {direction}\n"
+            f"Calidad: {quality}\nConfluencia: {result.get('score', 0)}/10\n"
+            f"Decision: {decision}\n\n"
+            f"Evidencia: {result.get('reason', '-') }\n\n"
+            "Solo precio. Sin indicadores, S/R ni rechazo.\n"
+            "🚫 Operaciones reales DESACTIVADAS."
+        )
         return
+
     PENDING_SIM = {
         "signal": result["signal"],
         "score": int(result["score"]),
         "reason": result["reason"],
+        "state": state,
+        "quality": quality,
         "signal_timestamp": CLOSED[-1]["timestamp"],
     }
     STATS["signals"] += 1
     tg(
-        "🧪 SEÑAL HIPOTETICA\n\n"
-        f"Par: {ACTIVE_PAIR}\nDireccion: {result['signal']}\nScore: {result['score']}/9\n"
-        "Entrada: apertura de la SIGUIENTE M1\nExpiracion teorica: 1 minuto\n\n"
-        f"Motivos: {result['reason']}\n\n⚠️ No se envia ninguna orden real."
+        "🧪 SEÑAL HIPOTETICA M1\n\n"
+        f"Par: {ACTIVE_PAIR}\nEstado: {state}\nDireccion: {result['signal']}\n"
+        f"Calidad: {quality}\nConfluencia: {result['score']}/10\n"
+        "Entrada teorica: apertura de la SIGUIENTE M1\n"
+        "Expiracion teorica: 1 minuto\n\n"
+        f"Evidencia: {result['reason']}\n\n"
+        "⚠️ No se envia ninguna orden real."
     )
 
 
