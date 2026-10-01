@@ -26,6 +26,9 @@ IQ_PASSWORD = os.getenv("IQ_PASSWORD")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 PAIR_REQUESTED = os.getenv("ANALYSIS_PAIR", "ARBUSD-OTC").strip() or "ARBUSD-OTC"
+AUTO_SELECT_OTC = os.getenv("AUTO_SELECT_OTC", "1").strip().lower() in {"1", "true", "yes", "on"}
+CATALOG_REFRESH_SECONDS = float(os.getenv("CATALOG_REFRESH_SECONDS", "60"))
+LAST_CATALOG_CHECK = 0.0
 CANDLE_COUNT_M1 = int(os.getenv("CANDLE_COUNT_M1", "120"))
 POLL_SECONDS = float(os.getenv("POLL_SECONDS", "0.20"))
 REAL_TRADING_ENABLED = False
@@ -34,6 +37,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(
 logger = logging.getLogger(__name__)
 
 IQ: Optional[IQ_Option] = None
+ACTIVE_PAIR = PAIR_REQUESTED
 RUNNING = True
 STREAM_STARTED = False
 CLOSED: list[dict[str, Any]] = []
@@ -110,50 +114,131 @@ def normalize_candle(c: Any, fallback_ts: Any = None) -> Optional[dict[str, Any]
         return None
 
 
-def resolve_active(pair: str) -> Optional[int]:
-    """Resuelve active_id y lo registra antes de iniciar el stream."""
+def _catalog_active_names() -> dict[str, int]:
+    """Obtiene nombres/IDs actuales del catálogo sin depender de constants.py."""
+    found: dict[str, int] = {}
     if IQ is None:
-        return None
+        return found
+
+    # Fuente principal: init_v2, que contiene los activos binary/turbo de la sesión.
     try:
         data = IQ.get_all_init_v2()
         if isinstance(data, dict):
-            binary = data.get("binary", {})
-            actives = binary.get("actives", {}) if isinstance(binary, dict) else {}
-            for active_id, info in actives.items():
-                if not isinstance(info, dict):
-                    continue
-                name = str(info.get("name", "")).strip()
-                variants = {name, name.replace("_OTC", "-OTC"), name.replace("-OTC", "_OTC")}
-                if pair in variants:
-                    aid = int(active_id)
-                    OP_code.ACTIVES[pair] = aid
-                    OP_code.ACTIVES[name] = aid
-                    logger.info("Activo resuelto: %s -> %s", pair, aid)
-                    return aid
+            for market in ("binary", "turbo"):
+                section = data.get(market, {})
+                actives = section.get("actives", {}) if isinstance(section, dict) else {}
+                if isinstance(actives, dict):
+                    for active_id, info in actives.items():
+                        if not isinstance(info, dict):
+                            continue
+                        name = str(info.get("name", "")).strip()
+                        if not name:
+                            continue
+                        try:
+                            aid = int(active_id)
+                        except (TypeError, ValueError):
+                            continue
+                        variants = {
+                            name,
+                            name.replace("_OTC", "-OTC"),
+                            name.replace("-OTC", "_OTC"),
+                            name.split(".", 1)[-1],
+                        }
+                        for variant in variants:
+                            if variant:
+                                found[variant] = aid
     except Exception as exc:
-        logger.warning("Catalogo binary: %s", exc)
+        logger.warning("Catalogo init_v2: %s", exc)
 
+    # Fuente secundaria: constants, solo como respaldo.
     try:
-        aid = OP_code.ACTIVES.get(pair)
-        if aid is not None:
-            logger.info("Activo encontrado en constants: %s -> %s", pair, aid)
-            return int(aid)
+        for name, aid in OP_code.ACTIVES.items():
+            try:
+                found.setdefault(str(name), int(aid))
+            except (TypeError, ValueError):
+                pass
+    except Exception:
+        pass
+
+    return found
+
+
+def discover_otc_pairs() -> list[str]:
+    """Devuelve pares OTC del catálogo actual, sin inventar nombres."""
+    names = _catalog_active_names()
+    pairs = set()
+    for name in names:
+        upper = name.upper()
+        if upper.endswith("-OTC") or upper.endswith("_OTC"):
+            canonical = name.replace("_OTC", "-OTC")
+            pairs.add(canonical)
+    return sorted(pairs)
+
+
+def resolve_active(pair: str) -> Optional[int]:
+    """Resuelve active_id dinámicamente; no depende de constants.py desactualizado."""
+    global LAST_CATALOG_CHECK
+    if IQ is None:
+        return None
+    try:
+        names = _catalog_active_names()
+        LAST_CATALOG_CHECK = time.time()
+        # Coincidencia exacta primero.
+        for candidate in (pair, pair.replace("-OTC", "_OTC"), pair.replace("_OTC", "-OTC")):
+            if candidate in names:
+                aid = int(names[candidate])
+                OP_code.ACTIVES[pair] = aid
+                OP_code.ACTIVES[candidate] = aid
+                logger.info("Activo resuelto: %s -> %s", pair, aid)
+                return aid
+
+        # La API puede devolver el nombre con prefijo/tipo. Comparación por sufijo.
+        target = pair.upper().replace("_OTC", "-OTC")
+        for name, aid in names.items():
+            canonical = name.upper().replace("_OTC", "-OTC")
+            if canonical.endswith(target):
+                OP_code.ACTIVES[pair] = int(aid)
+                logger.info("Activo resuelto por coincidencia: %s -> %s (%s)", pair, aid, name)
+                return int(aid)
     except Exception as exc:
-        logger.warning("Constants: %s", exc)
+        logger.warning("Resolucion de activo: %s", exc)
+
+    logger.warning("Activo no encontrado: %s", pair)
     return None
 
 
+def choose_otc_pair() -> Optional[str]:
+    """Conserva el par solicitado si existe; opcionalmente elige un OTC disponible."""
+    if resolve_active(PAIR_REQUESTED) is not None:
+        return PAIR_REQUESTED
+    if not AUTO_SELECT_OTC:
+        return None
+    pairs = discover_otc_pairs()
+    if not pairs:
+        return None
+    # Preferir el solicitado por coincidencia parcial antes del primer OTC.
+    requested_base = PAIR_REQUESTED.upper().replace("-OTC", "").replace("_OTC", "")
+    preferred = [p for p in pairs if p.upper().replace("-OTC", "").replace("_OTC", "") == requested_base]
+    selected = preferred[0] if preferred else pairs[0]
+    logger.warning("%s no esta disponible; se seleccionara OTC disponible: %s", PAIR_REQUESTED, selected)
+    return selected
+
 def connect() -> bool:
-    global IQ
+    global IQ, ACTIVE_PAIR
     IQ = IQ_Option(IQ_EMAIL, IQ_PASSWORD)
     ok, reason = IQ.connect()
     if not ok:
         raise ConnectionError(reason)
     logger.info("Conectado a IQ Option")
-    aid = resolve_active(PAIR_REQUESTED)
-    if aid is None:
-        tg(f"❌ No se encontro {PAIR_REQUESTED} en el catalogo de IQ Option.")
+    selected = choose_otc_pair()
+    if selected is None:
+        available = discover_otc_pairs()
+        preview = ", ".join(available[:12]) if available else "ninguno"
+        tg(f"❌ {PAIR_REQUESTED} no esta disponible en el catalogo actual.\n\nOTC detectados: {preview}\n\nEl bot reintentara automaticamente.")
         return False
+    ACTIVE_PAIR = selected
+    if ACTIVE_PAIR != PAIR_REQUESTED:
+        tg(f"ℹ️ {PAIR_REQUESTED} no esta disponible ahora.\n\nSe selecciono 1 OTC disponible: {ACTIVE_PAIR}\n\nSolo se analizara este par.")
     return True
 
 
@@ -177,13 +262,13 @@ def start_stream() -> bool:
     global STREAM_STARTED
     if not ensure_connection():
         return False
-    if resolve_active(PAIR_REQUESTED) is None:
+    if resolve_active(ACTIVE_PAIR) is None:
         return False
     try:
-        IQ.start_candles_stream(PAIR_REQUESTED, M1, CANDLE_COUNT_M1)
+        IQ.start_candles_stream(ACTIVE_PAIR, M1, CANDLE_COUNT_M1)
         STREAM_STARTED = True
-        logger.info("Stream iniciado: %s M1", PAIR_REQUESTED)
-        tg("🟢 STREAM M1 INICIADO\n\nPar: " + PAIR_REQUESTED + "\nModo: SIMULACION\nOperaciones reales: DESACTIVADAS\nEsperando cierres...")
+        logger.info("Stream iniciado: %s M1", ACTIVE_PAIR)
+        tg("🟢 STREAM M1 INICIADO\n\nPar: " + ACTIVE_PAIR + "\nModo: SIMULACION\nOperaciones reales: DESACTIVADAS\nEsperando cierres...")
         return True
     except Exception as exc:
         STREAM_STARTED = False
@@ -197,7 +282,7 @@ def stop_stream() -> None:
     if not STREAM_STARTED or IQ is None:
         return
     try:
-        IQ.stop_candles_stream(PAIR_REQUESTED, M1)
+        IQ.stop_candles_stream(ACTIVE_PAIR, M1)
     except Exception:
         pass
     STREAM_STARTED = False
@@ -207,7 +292,7 @@ def get_stream_candles() -> list[dict[str, Any]]:
     if IQ is None or not STREAM_STARTED:
         return []
     try:
-        raw = IQ.get_realtime_candles(PAIR_REQUESTED, M1)
+        raw = IQ.get_realtime_candles(ACTIVE_PAIR, M1)
     except Exception as exc:
         logger.warning("Realtime candles: %s", exc)
         return []
@@ -258,7 +343,7 @@ def finalize_candle(row: dict[str, Any], samples: list[dict[str, Any]]) -> dict[
 def format_candle_message(c: dict[str, Any]) -> str:
     return (
         "🕯️ VELA M1 CERRADA\n\n"
-        f"Par: {PAIR_REQUESTED}\nTimestamp: {c['timestamp']}\nColor: {c['color']}\n\n"
+        f"Par: {ACTIVE_PAIR}\nTimestamp: {c['timestamp']}\nColor: {c['color']}\n\n"
         f"Apertura: {fmt(c['open'])}\nMaximo: {fmt(c['high'])}\nMinimo: {fmt(c['low'])}\nCierre: {fmt(c['close'])}\n\n"
         f"Mecha inferior: {fmt(c['lower_wick'])}\nMecha superior: {fmt(c['upper_wick'])}\n"
         f"Body: {fmt(c['body'])}\nRango: {fmt(c['range'])}\nBody/R: {c['body_ratio']*100:.2f}%\n\n"
@@ -272,7 +357,7 @@ def format_candle_message(c: dict[str, Any]) -> str:
 
 def format_window(candles: list[dict[str, Any]]) -> str:
     seq = " ".join("V" if c["color"] == "VERDE" else "R" if c["color"] == "ROJA" else "D" for c in candles)
-    lines = ["📊 ULTIMAS 10 VELAS M1", "", f"Par: {PAIR_REQUESTED}", f"Secuencia: {seq}", ""]
+    lines = ["📊 ULTIMAS 10 VELAS M1", "", f"Par: {ACTIVE_PAIR}", f"Secuencia: {seq}", ""]
     for i, c in enumerate(candles, 1):
         lines.append(
             f"{i:02d} {'V' if c['color']=='VERDE' else 'R' if c['color']=='ROJA' else 'D'} "
@@ -300,7 +385,7 @@ def simulate_and_message() -> None:
     STATS["signals"] += 1
     tg(
         "🧪 SEÑAL HIPOTETICA\n\n"
-        f"Par: {PAIR_REQUESTED}\nDireccion: {result['signal']}\nScore: {result['score']}/9\n"
+        f"Par: {ACTIVE_PAIR}\nDireccion: {result['signal']}\nScore: {result['score']}/9\n"
         "Entrada: apertura de la SIGUIENTE M1\nExpiracion teorica: 1 minuto\n\n"
         f"Motivos: {result['reason']}\n\n⚠️ No se envia ninguna orden real."
     )
@@ -371,7 +456,7 @@ def main() -> None:
     if not all((IQ_EMAIL, IQ_PASSWORD, TELEGRAM_TOKEN, TELEGRAM_CHAT_ID)):
         logger.error("Faltan IQ_EMAIL/IQ_PASSWORD/TELEGRAM_TOKEN/TELEGRAM_CHAT_ID")
         return
-    tg("🤖 BOT M1 SIMULACION INICIANDO\n\nPar: " + PAIR_REQUESTED + "\nOperaciones reales: DESACTIVADAS")
+    tg("🤖 BOT M1 SIMULACION INICIANDO\n\nPar solicitado: " + PAIR_REQUESTED + "\nOperaciones reales: DESACTIVADAS")
     try:
         if not connect():
             return
@@ -385,7 +470,7 @@ def main() -> None:
                 time.sleep(2); continue
             if not STREAM_STARTED:
                 if not start_stream():
-                    time.sleep(5); continue
+                    time.sleep(10); continue
             process_stream_once()
             time.sleep(POLL_SECONDS)
         except KeyboardInterrupt:
