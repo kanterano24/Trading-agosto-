@@ -79,7 +79,7 @@ DEMO_TRADING_ENABLED = (
     os.getenv("ENABLE_DEMO_TRADING", "0").strip().lower()
     in {"1", "true", "yes", "on"}
 )
-DEMO_AMOUNT = float(os.getenv("AMOUNT", "100"))
+DEMO_AMOUNT = float(os.getenv("AMOUNT", "150"))
 DEMO_EXPIRATION = 1
 MAX_DEMO_TRADES = 1
 DEMO_TRADES_EXECUTED = 0
@@ -218,9 +218,24 @@ def candle_to_df(
             ]
         )
 
+    # finalize_candle guarda el tiempo como "timestamp"; la estrategia
+    # consume la columna "from". Normalizamos ambos formatos antes de ordenar.
+    frame = pd.DataFrame(candles).copy()
+    if "from" not in frame.columns and "timestamp" in frame.columns:
+        frame["from"] = frame["timestamp"]
+    elif "from" in frame.columns and "timestamp" in frame.columns:
+        frame["from"] = frame["from"].fillna(frame["timestamp"])
+
+    required = ["from", "open", "high", "low", "close"]
+    missing = [column for column in required if column not in frame.columns]
+    if missing:
+        logger.warning("Velas incompletas para analisis; faltan: %s", missing)
+        return pd.DataFrame(columns=required)
+
+    frame["from"] = pd.to_numeric(frame["from"], errors="coerce")
+    frame = frame.dropna(subset=required)
     return (
-        pd.DataFrame(candles)
-        .drop_duplicates("from")
+        frame.drop_duplicates("from")
         .sort_values("from")
         .reset_index(drop=True)
     )
