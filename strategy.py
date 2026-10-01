@@ -1,8 +1,8 @@
 from __future__ import annotations
-"""Funciones de analisis M1 para QUANT MODE.
+"""QUANT MODE - analisis descriptivo de velas M1.
 
-Esta version NO genera operaciones. Solo describe la anatomia de las velas y
-mantiene compatibilidad con las funciones que el bot pueda importar.
+Esta etapa es SOLO recoleccion de datos.
+No hay indicadores, S/R, rechazo ni ejecucion de operaciones.
 """
 from typing import Any, Dict, List, Optional
 import pandas as pd
@@ -20,10 +20,12 @@ def candle_color(open_: float, close: float) -> str:
 
 
 def candle_data(row: pd.Series) -> Dict[str, Any]:
-    """Convierte una fila OHLC en datos de anatomia de vela."""
-    o, h, l, c = map(float, (row["open"], row["high"], row["low"], row["close"]))
+    o = float(row["open"])
+    h = float(row["high"])
+    l = float(row["low"])
+    c = float(row["close"])
     body = abs(c - o)
-    total = max(h - l, 0.0)
+    rng = max(h - l, 0.0)
     upper = max(0.0, h - max(o, c))
     lower = max(0.0, min(o, c) - l)
     return {
@@ -34,24 +36,27 @@ def candle_data(row: pd.Series) -> Dict[str, Any]:
         "close": c,
         "color": candle_color(o, c),
         "body": body,
-        "range": total,
+        "range": rng,
         "upper_wick": upper,
         "lower_wick": lower,
-        "body_pct": (body / total * 100.0) if total else 0.0,
-        "upper_wick_pct": (upper / total * 100.0) if total else 0.0,
-        "lower_wick_pct": (lower / total * 100.0) if total else 0.0,
+        "body_pct": body / rng * 100.0 if rng else 0.0,
+        "upper_wick_pct": upper / rng * 100.0 if rng else 0.0,
+        "lower_wick_pct": lower / rng * 100.0 if rng else 0.0,
     }
 
 
 def normalize(df: Optional[pd.DataFrame]) -> pd.DataFrame:
     if df is None or not isinstance(df, pd.DataFrame) or df.empty:
         return pd.DataFrame()
+
     d = df.copy().rename(columns={"max": "high", "min": "low"})
     required = ["from", "open", "high", "low", "close"]
-    if any(c not in d.columns for c in required):
+    if any(col not in d.columns for col in required):
         return pd.DataFrame()
-    for c in required:
-        d[c] = pd.to_numeric(d[c], errors="coerce")
+
+    for col in required:
+        d[col] = pd.to_numeric(d[col], errors="coerce")
+
     return (
         d.dropna(subset=required)
         .drop_duplicates("from")
@@ -81,13 +86,10 @@ def summarize_window(df: pd.DataFrame) -> Dict[str, Any]:
 
 
 def compare_window_to_next(
-    previous_10: List[Dict[str, Any]], next_candle: Dict[str, Any]
+    previous_10: List[Dict[str, Any]],
+    next_candle: Dict[str, Any],
 ) -> Dict[str, Any]:
-    """Compara las 10 velas anteriores con la siguiente vela real.
-
-    Se conserva para compatibilidad con versiones anteriores del bot.
-    No genera CALL/PUT.
-    """
+    """Compara una ventana anterior con la siguiente vela real."""
     if len(previous_10) != WINDOW:
         return {"ready": False}
 
