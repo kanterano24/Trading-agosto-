@@ -1,300 +1,694 @@
 from __future__ import annotations
-"""Motor de reconocimiento M1 por precio puro.
 
-- Solo velas M1 cerradas.
-- Sin indicadores, S/R ni rechazo.
-- No usa informacion futura.
-- Reconoce anatomia, contexto, impulsos, respuestas y estados.
-- Devuelve CALL/PUT solo cuando existe confluencia suficiente; de lo
-  contrario devuelve None y conserva el estado reconocido.
 """
-from typing import Any, Dict, Optional
+strategy.py - Reconocedor M1 por precio y anatomia.
+
+Objetivo:
+- Unicamente velas M1 cerradas.
+- Sin indicadores.
+- Sin soporte/resistencia.
+- Sin rechazo.
+- Sin datos futuros para generar la prediccion.
+- Reconoce estados de mercado a partir de anatomia y contexto.
+- Devuelve estado, direccion, calidad, evidencia y prediccion para la
+  SIGUIENTE vela M1.
+- Compatible con el bot actual: M1, WINDOW, analyze_market, get_signal,
+  signal y candle_metrics.
+
+IMPORTANTE:
+Esta estrategia es un reconocedor experimental de patrones de precio.
+Las etiquetas no representan una garantia de direccion futura.
+"""
+
+from typing import Any, Dict, List, Optional
+import math
 import pandas as pd
+
 
 M1 = 60
 WINDOW = 10
-MIN_CONFLUENCE = 7
 
-STATE_NAMES = {
-    "IMPULSO_ALCISTA": "IMPULSO_ALCISTA",
-    "IMPULSO_BAJISTA": "IMPULSO_BAJISTA",
-    "IMPULSO_ALCISTA_EXTREMO": "IMPULSO_ALCISTA_EXTREMO",
-    "IMPULSO_BAJISTA_EXTREMO": "IMPULSO_BAJISTA_EXTREMO",
-    "CONTINUACION_ALCISTA": "CONTINUACION_ALCISTA",
-    "CONTINUACION_BAJISTA": "CONTINUACION_BAJISTA",
-    "RECUPERACION_ALCISTA": "RECUPERACION_ALCISTA",
-    "RECUPERACION_BAJISTA": "RECUPERACION_BAJISTA",
-    "DESACELERACION_ALCISTA": "DESACELERACION_ALCISTA",
-    "DESACELERACION_BAJISTA": "DESACELERACION_BAJISTA",
-    "PAUSA": "PAUSA",
-    "TRANSICION": "TRANSICION",
-    "RUIDO": "RUIDO",
-}
+# Umbrales de anatomia. Se usan como reglas de reconocimiento, no como
+# indicadores de mercado.
+STRONG_BODY = 0.70
+MEDIUM_BODY = 0.55
+SMALL_BODY = 0.25
+VERY_SMALL_BODY = 0.18
+
+# Un impulso extremo tiene cuerpo muy dominante y cierre muy cerca del extremo.
+EXTREME_BODY = 0.85
+EXTREME_CLOSE = 0.88
+
+# Intraminuto: por debajo de esto se considera muestra pobre.
+MIN_INTRABAR_SAMPLES = 120
+GOOD_INTRABAR_SAMPLES = 240
+
+
+def candle_color(open_: float, close: float) -> str:
+    if close > open_:
+        return "VERDE"
+    if close < open_:
+        return "ROJA"
+    return "DOJI"
+
+
+def candle_metrics(row: pd.Series) -> Dict[str, Any]:
+    """Calcula la anatomia de una vela sin usar indicadores."""
+    o = float(row["open"])
+    h = float(row["high"])
+    l = float(row["low"])
+    c = float(row["close"])
+
+    rng = max(h - l, 1e-12)
+    body = abs(c - o)
+    upper = max(0.0, h - max(o, c))
+    lower = max(0.0, min(o, c) - l)
+
+    return {
+        "timestamp": (
+            int(row["from"])
+            if "from" in row and pd.notna(row["from"])
+            else None
+        ),
+        "open": o,
+        "high": h,
+        "low": l,
+        "close": c,
+        "body": body,
+        "range": rng,
+        "upper_wick": upper,
+        "lower_wick": lower,
+        "body_ratio": body / rng,
+        "upper_ratio": upper / rng,
+        "lower_ratio": lower / rng,
+        "close_pos": (c - l) / rng,
+        "color": candle_color(o, c),
+    }
 
 
 def normalize(df: Optional[pd.DataFrame]) -> pd.DataFrame:
     if df is None or not isinstance(df, pd.DataFrame) or df.empty:
         return pd.DataFrame()
+
     d = df.copy().rename(columns={"max": "high", "min": "low"})
+
     required = ["open", "high", "low", "close"]
     if any(c not in d.columns for c in required):
         return pd.DataFrame()
+
     for c in required:
         d[c] = pd.to_numeric(d[c], errors="coerce")
+
     if "from" in d.columns:
         d["from"] = pd.to_numeric(d["from"], errors="coerce")
-        d = d.dropna(subset=["from"]).sort_values("from").drop_duplicates("from")
+        d = d.dropna(subset=["from"])
+        d = d.sort_values("from").drop_duplicates("from")
     else:
         d = d.drop_duplicates()
+
     return d.dropna(subset=required).reset_index(drop=True)
 
 
-def candle_metrics(row: pd.Series) -> Dict[str, Any]:
-    o = float(row["open"]); h = float(row["high"])
-    l = float(row["low"]); c = float(row["close"])
-    rng = max(h - l, 1e-12)
-    body = abs(c - o)
-    upper = max(0.0, h - max(o, c))
-    lower = max(0.0, min(o, c) - l)
-    color = "VERDE" if c > o else "ROJA" if c < o else "DOJI"
-    return {
-        "timestamp": int(row["from"]) if "from" in row and pd.notna(row["from"]) else None,
-        "open": o, "high": h, "low": l, "close": c,
-        "body": body, "range": rng,
-        "upper_wick": upper, "lower_wick": lower,
-        "body_ratio": body / rng,
-        "upper_ratio": upper / rng,
-        "lower_ratio": lower / rng,
-        "close_pos": (c - l) / rng,
-        "color": color,
-        "up_move": float(row.get("up_move", 0.0) or 0.0),
-        "down_move": float(row.get("down_move", 0.0) or 0.0),
-        "traveled": float(row.get("traveled", 0.0) or 0.0),
-        "sample_count": int(row.get("sample_count", 0) or 0),
-        "up_steps": int(row.get("up_steps", 0) or 0),
-        "down_steps": int(row.get("down_steps", 0) or 0),
-    }
+def _enrich(c: Dict[str, Any]) -> Dict[str, Any]:
+    """Añade medidas derivadas sin modificar el significado de la vela."""
+    out = dict(c)
+    rng = max(float(out["range"]), 1e-12)
+    body = float(out["body"])
+
+    out["body_ratio"] = body / rng
+    out["wick_ratio"] = (
+        float(out["upper_wick"]) + float(out["lower_wick"])
+    ) / rng
+
+    # Posicion del cierre: 1 = maximo, 0 = minimo.
+    out["close_pos"] = (
+        float(out["close"]) - float(out["low"])
+    ) / rng
+
+    # Resultado del cierre frente a la apertura.
+    out["signed_body"] = (
+        float(out["close"]) - float(out["open"])
+    )
+
+    return out
 
 
-def last_10_closed(df: pd.DataFrame) -> list[Dict[str, Any]]:
+def candle_data(row: pd.Series) -> Dict[str, Any]:
+    return _enrich(candle_metrics(row))
+
+
+def last_10_closed(df: pd.DataFrame) -> List[Dict[str, Any]]:
     d = normalize(df)
     if len(d) < WINDOW:
         return []
-    return [candle_metrics(r) for _, r in d.iloc[-WINDOW:].iterrows()]
+    return [candle_data(r) for _, r in d.iloc[-WINDOW:].iterrows()]
 
 
 def summarize_window(df: pd.DataFrame) -> Dict[str, Any]:
     candles = last_10_closed(df)
-    seq = " ".join("V" if c["color"] == "VERDE" else "R" if c["color"] == "ROJA" else "D" for c in candles)
-    return {"ready": len(candles) == WINDOW, "count": len(candles), "candles": candles, "sequence": seq}
+    seq = " ".join(
+        "V" if c["color"] == "VERDE"
+        else "R" if c["color"] == "ROJA"
+        else "D"
+        for c in candles
+    )
+
+    return {
+        "ready": len(candles) == WINDOW,
+        "count": len(candles),
+        "candles": candles,
+        "sequence": seq,
+    }
 
 
 def _direction(c: Dict[str, Any]) -> int:
-    if c["color"] == "VERDE": return 1
-    if c["color"] == "ROJA": return -1
+    if c["color"] == "VERDE":
+        return 1
+    if c["color"] == "ROJA":
+        return -1
     return 0
 
 
-def _strength(c: Dict[str, Any]) -> float:
-    """Fuerza de una vela usando cuerpo + cierre + mechas, sin indicadores."""
-    br = c["body_ratio"]
-    close_edge = max(c["close_pos"], 1.0 - c["close_pos"])
-    wick_penalty = min(c["upper_ratio"] + c["lower_ratio"], 1.0)
-    return max(0.0, min(1.0, 0.55 * br + 0.30 * close_edge + 0.15 * (1.0 - wick_penalty)))
+def _body_strength(c: Dict[str, Any]) -> str:
+    r = c["body_ratio"]
+    if r >= EXTREME_BODY:
+        return "EXTREMO"
+    if r >= STRONG_BODY:
+        return "FUERTE"
+    if r >= MEDIUM_BODY:
+        return "MEDIO"
+    if r >= SMALL_BODY:
+        return "DEBIL"
+    return "MUY_DEBIL"
 
 
-def _dominant_direction(candles: list[Dict[str, Any]], n: int = 5) -> int:
-    recent = candles[-n:]
-    weighted = 0.0
-    total = 0.0
-    for i, c in enumerate(recent, 1):
-        w = float(i) * (0.5 + c["body_ratio"])
-        weighted += _direction(c) * w
-        total += w
-    if not total or abs(weighted) < total * 0.12:
-        return 0
-    return 1 if weighted > 0 else -1
+def _relative_range(last: Dict[str, Any], previous: List[Dict[str, Any]]) -> float:
+    ranges = [float(x["range"]) for x in previous if float(x["range"]) > 0]
+    if not ranges:
+        return 1.0
+    baseline = sum(ranges) / len(ranges)
+    return float(last["range"]) / max(baseline, 1e-12)
 
 
-def _intrabar_ok(c: Dict[str, Any], direction: int) -> bool:
-    # El stream intraminuto es confirmacion secundaria. Con pocas muestras no pesa.
-    if c.get("sample_count", 0) < 120:
-        return True
-    up = c.get("up_steps", 0); down = c.get("down_steps", 0)
-    if up + down < 10:
-        return True
-    return up >= down if direction > 0 else down >= up
-
-
-def _recognize_state(candles: list[Dict[str, Any]]) -> tuple[str, int, list[str]]:
+def _context(candles: List[Dict[str, Any]]) -> Dict[str, Any]:
     last = candles[-1]
-    prev = candles[-2]
-    prev2 = candles[-3]
-    d = _direction(last)
-    pd = _direction(prev)
-    p2d = _direction(prev2)
-    br = last["body_ratio"]
-    strength = _strength(last)
-    evidence: list[str] = []
 
-    # Extremos: no son entradas por si mismos. Son eventos que exigen observar respuesta.
-    if d != 0 and br >= 0.85 and last["close_pos"] >= 0.88 and d == 1:
-        return "IMPULSO_ALCISTA_EXTREMO", d, ["Body/R extremo", "cierre en maximos"]
-    if d != 0 and br >= 0.85 and last["close_pos"] <= 0.12 and d == -1:
-        return "IMPULSO_BAJISTA_EXTREMO", d, ["Body/R extremo", "cierre en minimos"]
+    def count_color(items: List[Dict[str, Any]], color: str) -> int:
+        return sum(x["color"] == color for x in items)
+
+    last3 = candles[-3:]
+    last5 = candles[-5:]
+    last10 = candles[-10:]
+
+    green3 = count_color(last3, "VERDE")
+    red3 = count_color(last3, "ROJA")
+    green5 = count_color(last5, "VERDE")
+    red5 = count_color(last5, "ROJA")
+    green10 = count_color(last10, "VERDE")
+    red10 = count_color(last10, "ROJA")
+
+    # Cambios de cierre y cuerpo.
+    close_changes = [
+        float(candles[i]["close"]) - float(candles[i - 1]["close"])
+        for i in range(1, len(candles))
+    ]
+
+    net_change = (
+        float(candles[-1]["close"]) - float(candles[0]["open"])
+    )
+
+    avg_range = sum(float(x["range"]) for x in last5) / 5.0
+    avg_body = sum(float(x["body"]) for x in last5) / 5.0
+
+    # Dominio de la secuencia reciente.
+    recent_direction = 0
+    if green3 >= 2 and green3 > red3:
+        recent_direction = 1
+    elif red3 >= 2 and red3 > green3:
+        recent_direction = -1
+    elif green5 > red5:
+        recent_direction = 1
+    elif red5 > green5:
+        recent_direction = -1
+
+    return {
+        "last": last,
+        "last3": last3,
+        "last5": last5,
+        "last10": last10,
+        "green3": green3,
+        "red3": red3,
+        "green5": green5,
+        "red5": red5,
+        "green10": green10,
+        "red10": red10,
+        "close_changes": close_changes,
+        "net_change": net_change,
+        "avg_range_5": avg_range,
+        "avg_body_5": avg_body,
+        "recent_direction": recent_direction,
+        "range_ratio": _relative_range(last, candles[-6:-1]),
+    }
+
+
+def _intrabar_quality(last: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    El bot actual añade estas claves al cerrar la vela.
+    Si no existen, no se inventan.
+    """
+    samples = int(last.get("sample_count", 0) or 0)
+    up = int(last.get("up_steps", 0) or 0)
+    down = int(last.get("down_steps", 0) or 0)
+    total = up + down
+
+    if samples >= GOOD_INTRABAR_SAMPLES:
+        quality = "BUENA"
+    elif samples >= MIN_INTRABAR_SAMPLES:
+        quality = "MEDIA"
+    elif samples > 0:
+        quality = "BAJA"
+    else:
+        quality = "NO_DISPONIBLE"
+
+    if total:
+        balance = abs(up - down) / total
+    else:
+        balance = 0.0
+
+    if total and balance >= 0.20:
+        intradir = "ALCISTA" if up > down else "BAJISTA"
+    else:
+        intradir = "NEUTRAL"
+
+    return {
+        "samples": samples,
+        "quality": quality,
+        "direction": intradir,
+        "balance": balance,
+    }
+
+
+def _classify_state(candles: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """
+    Reconoce el estado de la vela actual dentro del contexto reciente.
+
+    Orden de prioridad:
+    1. PAUSA / TRANSICION
+    2. IMPULSO EXTREMO
+    3. CONTINUACION FUERTE
+    4. RESPUESTA / RECUPERACION
+    5. DESACELERACION
+    6. IMPULSO normal
+    7. RUIDO
+    """
+    ctx = _context(candles)
+    last = ctx["last"]
+    prev = candles[-2]
+
+    d = _direction(last)
+    pdirection = _direction(prev)
+
+    body = float(last["body_ratio"])
+    close_pos = float(last["close_pos"])
+    range_ratio = float(ctx["range_ratio"])
+
+    prev_body = float(prev["body_ratio"])
+    prev_range = float(prev["range"])
+
+    # Cambio del cuerpo y del rango respecto a la vela anterior.
+    body_change = body - prev_body
+    range_change = float(last["range"]) - prev_range
+
+    # Vela de indecision: cuerpo pequeño con rango no trivial.
+    if body <= VERY_SMALL_BODY:
+        if (
+            ctx["green3"] == 1
+            and ctx["red3"] == 1
+        ) or abs(ctx["net_change"]) <= ctx["avg_range_5"] * 0.35:
+            return {
+                "state": "PAUSA_TRANSICION",
+                "direction": "NEUTRAL",
+                "quality": "BAJA",
+                "score": 0,
+                "evidence": [
+                    "cuerpo muy pequeño",
+                    "rango sin dirección limpia",
+                    "cierre sin dominio claro",
+                ],
+            }
+
+    # Impulso extremo: cuerpo dominante + cierre cerca del extremo.
+    if (
+        body >= EXTREME_BODY
+        and (
+            (d == 1 and close_pos >= EXTREME_CLOSE)
+            or (d == -1 and close_pos <= 1.0 - EXTREME_CLOSE)
+        )
+    ):
+        direction = "ALCISTA" if d == 1 else "BAJISTA"
+        return {
+            "state": f"IMPULSO_{direction}_EXTREMO",
+            "direction": direction,
+            "quality": "ALTA",
+            "score": 3,
+            "evidence": [
+                f"Body/R {body * 100:.2f}%",
+                "cierre muy cerca del extremo",
+                "cuerpo dominante",
+            ],
+        }
+
+    # Continuacion fuerte: la vela actual mantiene la dirección reciente
+    # después de una vela previa con dirección similar.
+    same_recent = (
+        (d == 1 and ctx["green3"] >= 2)
+        or (d == -1 and ctx["red3"] >= 2)
+    )
+
+    if (
+        d != 0
+        and same_recent
+        and body >= STRONG_BODY
+        and body >= prev_body * 0.85
+        and range_ratio >= 0.90
+    ):
+        direction = "ALCISTA" if d == 1 else "BAJISTA"
+        return {
+            "state": f"CONTINUACION_{direction}_FUERTE",
+            "direction": direction,
+            "quality": "ALTA",
+            "score": 3,
+            "evidence": [
+                "dirección repetida en 3 velas",
+                f"Body/R {body * 100:.2f}%",
+                "rango mantiene expansión",
+            ],
+        }
+
+    # Recuperacion: cambio de color contra la vela anterior pero cierre
+    # suficientemente dominante en la nueva dirección.
+    reversal = d != 0 and pdirection != 0 and d != pdirection
+
+    if reversal and body >= MEDIUM_BODY:
+        direction = "ALCISTA" if d == 1 else "BAJISTA"
+
+        if (
+            (d == 1 and close_pos >= 0.68)
+            or (d == -1 and close_pos <= 0.32)
+        ):
+            return {
+                "state": f"RECUPERACION_{direction}",
+                "direction": direction,
+                "quality": "MEDIA",
+                "score": 2,
+                "evidence": [
+                    "cambio de dirección respecto a la vela anterior",
+                    f"Body/R {body * 100:.2f}%",
+                    "cierre acompaña la nueva dirección",
+                ],
+            }
+
+    # Respuesta fuerte: la vela actual responde a una vela anterior fuerte
+    # en sentido contrario. Es diferente de una continuación.
+    if reversal and prev_body >= STRONG_BODY and body >= MEDIUM_BODY:
+        direction = "ALCISTA" if d == 1 else "BAJISTA"
+        return {
+            "state": f"RESPUESTA_{direction}_FUERTE",
+            "direction": direction,
+            "quality": "MEDIA",
+            "score": 2,
+            "evidence": [
+                "vela anterior fuerte en sentido contrario",
+                "respuesta de color opuesto",
+                f"Body/R actual {body * 100:.2f}%",
+            ],
+        }
+
+    # Desaceleracion: misma dirección pero cuerpo/rango cae claramente.
+    if (
+        d != 0
+        and pdirection == d
+        and body <= SMALL_BODY
+        and prev_body >= MEDIUM_BODY
+    ):
+        direction = "ALCISTA" if d == 1 else "BAJISTA"
+        return {
+            "state": f"DESACELERACION_{direction}",
+            "direction": direction,
+            "quality": "BAJA",
+            "score": 1,
+            "evidence": [
+                "misma dirección que la vela anterior",
+                "cuerpo reducido",
+                "pérdida de dominancia",
+            ],
+        }
 
     # Impulso normal.
-    if d == 1 and br >= 0.70 and last["close_pos"] >= 0.75:
-        if pd == 1 and prev["body_ratio"] >= 0.55:
-            return "CONTINUACION_ALCISTA", 1, ["dos cierres alcistas", "cuerpo dominante", "cierre alto"]
-        return "IMPULSO_ALCISTA", 1, ["cuerpo dominante", "cierre alto"]
-    if d == -1 and br >= 0.70 and last["close_pos"] <= 0.25:
-        if pd == -1 and prev["body_ratio"] >= 0.55:
-            return "CONTINUACION_BAJISTA", -1, ["dos cierres bajistas", "cuerpo dominante", "cierre bajo"]
-        return "IMPULSO_BAJISTA", -1, ["cuerpo dominante", "cierre bajo"]
+    if d != 0 and body >= MEDIUM_BODY:
+        direction = "ALCISTA" if d == 1 else "BAJISTA"
+        return {
+            "state": f"IMPULSO_{direction}",
+            "direction": direction,
+            "quality": "MEDIA",
+            "score": 2,
+            "evidence": [
+                f"Body/R {body * 100:.2f}%",
+                "dirección clara",
+            ],
+        }
 
-    # Recuperacion: la vela actual retoma direccion despues de una vela contraria/pausa.
-    if d == 1 and pd <= 0 and br >= 0.45 and last["close"] > prev["close"]:
-        return "RECUPERACION_ALCISTA", 1, ["retoma alcista", "cierre supera vela previa"]
-    if d == -1 and pd >= 0 and br >= 0.45 and last["close"] < prev["close"]:
-        return "RECUPERACION_BAJISTA", -1, ["retoma bajista", "cierre pierde vela previa"]
+    # Si el rango es pequeño y no hay estructura clara, es ruido.
+    if range_ratio < 0.70 and body < MEDIUM_BODY:
+        return {
+            "state": "RUIDO",
+            "direction": "NEUTRAL",
+            "quality": "BAJA",
+            "score": 0,
+            "evidence": [
+                "rango reducido frente al contexto",
+                "cuerpo sin dominancia",
+            ],
+        }
 
-    # Desaceleracion: misma direccion, pero perdida clara de eficiencia.
-    if d == pd and d != 0 and br < prev["body_ratio"] * 0.60 and br < 0.45:
-        return ("DESACELERACION_ALCISTA" if d == 1 else "DESACELERACION_BAJISTA"), d, ["misma direccion", "caida fuerte de Body/R"]
-
-    # Pausa: cuerpo pequeno o indecision despues de movimiento.
-    if br < 0.25 or strength < 0.42:
-        return "PAUSA", d, ["cuerpo reducido", "movimiento poco eficiente"]
-
-    # Transicion: direcciones recientes enfrentadas con energia suficiente.
-    if d != pd and d != 0 and pd != 0 and br >= 0.30:
-        if p2d == pd:
-            return "TRANSICION", d, ["cambio de direccion", "estructura reciente enfrentada"]
-
-    if _dominant_direction(candles, 5) == d and d != 0:
-        return ("CONTINUACION_ALCISTA" if d == 1 else "CONTINUACION_BAJISTA"), d, ["direccion dominante", "precio mantiene sentido"]
-
-    return "RUIDO", 0, ["sin estructura dominante suficiente"]
-
-
-def _confluence(candles: list[Dict[str, Any]], state: str, direction: int) -> tuple[int, list[str]]:
-    last, prev = candles[-1], candles[-2]
-    score = 0
-    evidence: list[str] = []
-    if direction == 0:
-        return 0, ["sin direccion"]
-
-    wanted = "VERDE" if direction > 0 else "ROJA"
-    if last["color"] == wanted:
-        score += 2; evidence.append("vela a favor")
-    if last["body_ratio"] >= 0.70:
-        score += 2; evidence.append("Body/R >= 70%")
-    elif last["body_ratio"] >= 0.50:
-        score += 1; evidence.append("Body/R >= 50%")
-
-    close_good = last["close_pos"] >= 0.80 if direction > 0 else last["close_pos"] <= 0.20
-    if close_good:
-        score += 2; evidence.append("cierre eficiente")
-
-    if last["close"] > prev["close"] if direction > 0 else last["close"] < prev["close"]:
-        score += 1; evidence.append("cierre supera direccion previa")
-
-    recent3 = sum(_direction(c) == direction for c in candles[-3:])
-    recent5 = sum(_direction(c) == direction for c in candles[-5:])
-    if recent3 >= 2:
-        score += 1; evidence.append(f"{recent3}/3 a favor")
-    if recent5 >= 3:
-        score += 1; evidence.append(f"{recent5}/5 a favor")
-
-    if _intrabar_ok(last, direction):
-        score += 1; evidence.append("intraminuto compatible/neutral")
-
-    # Impulso extremo y doble continuacion: reconocer, pero no perseguir.
-    if state in {"IMPULSO_ALCISTA_EXTREMO", "IMPULSO_BAJISTA_EXTREMO"}:
-        score = min(score, MIN_CONFLUENCE - 1)
-        evidence.append("bloqueo por impulso extremo: esperar respuesta")
-    elif state in {"CONTINUACION_ALCISTA", "CONTINUACION_BAJISTA"} and prev["body_ratio"] >= 0.70:
-        score = min(score, MIN_CONFLUENCE - 1)
-        evidence.append("continuacion tras expansion: evitar persecucion")
-
-    return min(score, 10), evidence
+    return {
+        "state": "TRANSICION",
+        "direction": "NEUTRAL",
+        "quality": "BAJA",
+        "score": 0,
+        "evidence": [
+            "estructura sin dominio suficiente",
+            "no existe continuidad clara",
+        ],
+    }
 
 
-def analyze_market(df: Optional[pd.DataFrame] = None, **_: Any) -> Dict[str, Any]:
-    d = normalize(df if df is not None else pd.DataFrame())
-    candles = last_10_closed(d)
+def _prediction_from_state(
+    state: Dict[str, Any],
+    candles: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """
+    Genera la predicción de la SIGUIENTE M1 usando solamente las velas
+    disponibles hasta el cierre actual.
+
+    Regla conservadora:
+    - estados fuertes de continuación -> misma dirección
+    - impulso extremo -> esperar; no perseguir automáticamente
+    - recuperación fuerte -> esperar confirmación
+    - desaceleración/pausa/transición/ruido -> NO SIGNAL
+    """
+    name = state["state"]
+    direction = state["direction"]
+
+    prediction = "NO SIGNAL"
+    quality = state["quality"]
+    reasons = list(state["evidence"])
+
+    if name in {
+        "CONTINUACION_ALCISTA_FUERTE",
+        "IMPULSO_ALCISTA",
+    }:
+        prediction = "CALL"
+    elif name in {
+        "CONTINUACION_BAJISTA_FUERTE",
+        "IMPULSO_BAJISTA",
+    }:
+        prediction = "PUT"
+    elif name in {
+        "RECUPERACION_ALCISTA",
+        "RESPUESTA_ALCISTA_FUERTE",
+    }:
+        # Recuperaciones aisladas no se persiguen.
+        prediction = "NO SIGNAL"
+        reasons.append("recuperación requiere confirmación")
+    elif name in {
+        "RECUPERACION_BAJISTA",
+        "RESPUESTA_BAJISTA_FUERTE",
+    }:
+        prediction = "NO SIGNAL"
+        reasons.append("respuesta bajista requiere confirmación")
+    elif "EXTREMO" in name:
+        prediction = "NO SIGNAL"
+        reasons.append("impulso extremo: evitar persecución inmediata")
+    else:
+        prediction = "NO SIGNAL"
+
+    # La intraminuto es confirmación secundaria. Nunca crea por sí sola una
+    # señal cuando la anatomía principal no la respalda.
+    intrabar = _intrabar_quality(candles[-1])
+
+    if prediction == "CALL" and intrabar["quality"] in {"BUENA", "MEDIA"}:
+        if intrabar["direction"] == "BAJISTA":
+            prediction = "NO SIGNAL"
+            reasons.append("intraminuto contradice CALL")
+    elif prediction == "PUT" and intrabar["quality"] in {"BUENA", "MEDIA"}:
+        if intrabar["direction"] == "ALCISTA":
+            prediction = "NO SIGNAL"
+            reasons.append("intraminuto contradice PUT")
+
+    # Calidad final.
+    if prediction == "NO SIGNAL":
+        final_quality = "BAJA"
+    elif state["quality"] == "ALTA":
+        final_quality = "ALTA"
+    else:
+        final_quality = "MEDIA"
+
+    return {
+        "prediction": prediction,
+        "prediction_quality": final_quality,
+        "prediction_direction": (
+            "ALCISTA" if prediction == "CALL"
+            else "BAJISTA" if prediction == "PUT"
+            else "NEUTRAL"
+        ),
+        "prediction_reason": " | ".join(reasons),
+        "intrabar": intrabar,
+    }
+
+
+def analyze_market(
+    df: Optional[pd.DataFrame] = None,
+    **_: Any,
+) -> Dict[str, Any]:
+    """
+    Punto principal usado por bot.py.
+
+    Importante: la predicción corresponde a la siguiente M1 y se calcula
+    antes de recibir esa vela.
+    """
+    data = df if df is not None else pd.DataFrame()
+    candles = last_10_closed(data)
+    window = summarize_window(data)
+
     base: Dict[str, Any] = {
         "signal": None,
-        "score": 0,
         "blocked": True,
-        "decision": "NO SIGNAL",
-        "state": "RUIDO",
-        "direction": None,
-        "quality": "LOW",
+        "score": 0,
         "reason": "historial insuficiente",
+        "state": "SIN_HISTORIAL",
+        "state_direction": "NEUTRAL",
+        "state_quality": "BAJA",
         "evidence": [],
-        "window": summarize_window(d),
+        "prediction": "NO SIGNAL",
+        "prediction_quality": "BAJA",
+        "prediction_direction": "NEUTRAL",
+        "prediction_reason": "faltan velas cerradas",
         "analysis_timeframe": "M1",
         "entry_timeframe": "M1",
         "target_expiration_minutes": 1,
+        "window": window,
     }
+
     if len(candles) < WINDOW:
         return base
 
-    state, direction, state_evidence = _recognize_state(candles)
-    score, evidence = _confluence(candles, state, direction)
-    all_evidence = state_evidence + evidence
+    state = _classify_state(candles)
+    pred = _prediction_from_state(state, candles)
 
-    quality = "HIGH" if score >= 8 else "MEDIUM" if score >= 6 else "LOW"
-    signal: Optional[str] = None
+    signal = pred["prediction"]
+    is_signal = signal in {"CALL", "PUT"}
 
-    # Regla conservadora: estados extremos no entran. Las continuaciones tras
-    # expansion inmediata tampoco. Se exige confluencia en estados confirmados.
-    eligible = {
-        "CONTINUACION_ALCISTA": 1,
-        "CONTINUACION_BAJISTA": -1,
-        "RECUPERACION_ALCISTA": 1,
-        "RECUPERACION_BAJISTA": -1,
-    }
-    if state in eligible and eligible[state] == direction and score >= MIN_CONFLUENCE:
-        signal = "CALL" if direction > 0 else "PUT"
-
-    if signal:
-        reason = " | ".join(all_evidence)
-        decision = "SIGNAL"
-    else:
-        reason = " | ".join(all_evidence) if all_evidence else "sin confluencia suficiente"
-        decision = "NO SIGNAL"
-
-    return {
+    result = {
         **base,
-        "signal": signal,
-        "score": score,
-        "blocked": signal is None,
-        "decision": decision,
-        "state": state,
-        "direction": "ALCISTA" if direction > 0 else "BAJISTA" if direction < 0 else None,
-        "quality": quality,
-        "reason": reason,
-        "evidence": all_evidence,
-        "window": {**summarize_window(d), "candles": candles},
-        "call_score": score if direction > 0 else 0,
-        "put_score": score if direction < 0 else 0,
+        "signal": signal if is_signal else None,
+        "blocked": not is_signal,
+        "score": int(state["score"]),
+        "reason": pred["prediction_reason"],
+        "state": state["state"],
+        "state_direction": state["direction"],
+        "state_quality": state["quality"],
+        "evidence": state["evidence"],
+        "prediction": signal,
+        "prediction_quality": pred["prediction_quality"],
+        "prediction_direction": pred["prediction_direction"],
+        "prediction_reason": pred["prediction_reason"],
+        "intrabar": pred["intrabar"],
+        "window": window,
+        "current_candle": candles[-1],
     }
 
+    return result
 
-def compare_window_to_next(previous_10: list[dict[str, Any]], next_candle: dict[str, Any]) -> Dict[str, Any]:
+
+def compare_window_to_next(
+    previous_10: List[Dict[str, Any]],
+    next_candle: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Utilidad de compatibilidad para comparar prediccion y resultado."""
     if len(previous_10) != WINDOW:
         return {"ready": False}
+
+    signal = None
+    if previous_10:
+        # No se recalcula con next_candle: solo sirve como comparador.
+        dummy = pd.DataFrame(
+            [
+                {
+                    "from": c.get("timestamp", i),
+                    "open": c["open"],
+                    "high": c["high"],
+                    "low": c["low"],
+                    "close": c["close"],
+                }
+                for i, c in enumerate(previous_10)
+            ]
+        )
+        signal = analyze_market(dummy).get("prediction")
+
+    entry = float(next_candle.get("open", 0.0))
+    close = float(next_candle.get("close", 0.0))
+
+    if signal == "CALL":
+        outcome = (
+            "FAVORABLE" if close > entry
+            else "DOJI" if close == entry
+            else "CONTRARIA"
+        )
+    elif signal == "PUT":
+        outcome = (
+            "FAVORABLE" if close < entry
+            else "DOJI" if close == entry
+            else "CONTRARIA"
+        )
+    else:
+        outcome = "NO_SIGNAL"
+
     return {
         "ready": True,
-        "sequence": " ".join("V" if c.get("color") == "VERDE" else "R" if c.get("color") == "ROJA" else "D" for c in previous_10),
+        "sequence": " ".join(
+            "V" if c.get("color") == "VERDE"
+            else "R" if c.get("color") == "ROJA"
+            else "D"
+            for c in previous_10
+        ),
+        "prediction": signal or "NO SIGNAL",
         "next_color": next_candle.get("color"),
         "next_open": next_candle.get("open"),
         "next_close": next_candle.get("close"),
         "next_high": next_candle.get("high"),
         "next_low": next_candle.get("low"),
+        "outcome": outcome,
     }
 
 
