@@ -483,127 +483,60 @@ def _classify_state(candles: List[Dict[str, Any]]) -> Dict[str, Any]:
     }
 
 
-def _previous_state(candles: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """Clasifica la vela anterior sin mirar la vela actual/futura."""
-    if len(candles) < 3:
-        return {"state": "SIN_HISTORIAL", "direction": "NEUTRAL", "quality": "BAJA", "score": 0, "evidence": []}
-    return _classify_state(candles[:-1])
-
-
-def _confirmed_continuation(candles: List[Dict[str, Any]], state: Dict[str, Any]) -> bool:
-    """Confirma una continuación antes de permitir CALL/PUT.
-
-    La regla deliberadamente exige dos etapas: una continuación previa y otra
-    vela actual que la confirme. Un impulso aislado, una recuperación, una
-    respuesta o una vela extrema nunca generan señal por sí solos.
+def _prediction_from_state(state: Dict[str, Any], candles: List[Dict[str, Any]]) -> Dict[str, Any]:
     """
-    if len(candles) < 10:
-        return False
+    Predicción deliberadamente conservadora para la SIGUIENTE M1.
 
-    current = candles[-1]
-    previous = candles[-2]
-    current_dir = _direction(current)
-    previous_dir = _direction(previous)
-
-    if current_dir == 0 or current_dir != previous_dir:
-        return False
-
-    if state["state"] not in {
-        "CONTINUACION_ALCISTA_FUERTE",
-        "CONTINUACION_BAJISTA_FUERTE",
-    }:
-        return False
-
-    prev_state = _previous_state(candles)
-    expected = (
-        "CONTINUACION_ALCISTA_FUERTE"
-        if current_dir == 1
-        else "CONTINUACION_BAJISTA_FUERTE"
-    )
-    if prev_state["state"] != expected:
-        return False
-
-    body = float(current["body_ratio"])
-    close_pos = float(current["close_pos"])
-    prev_body = float(previous["body_ratio"])
-
-    # Confirmación anatómica: dos velas fuertes consecutivas y cierre
-    # suficientemente cercano al extremo de la dirección.
-    if body < STRONG_BODY or prev_body < MEDIUM_BODY:
-        return False
-
-    if current_dir == 1 and close_pos < 0.72:
-        return False
-    if current_dir == -1 and close_pos > 0.28:
-        return False
-
-    # Evita disparar después de una vela extrema: queremos continuación,
-    # no persecución de un movimiento vertical.
-    if prev_body >= EXTREME_BODY or body >= EXTREME_BODY:
-        return False
-
-    return True
-
-
-def _prediction_from_state(
-    state: Dict[str, Any],
-    candles: List[Dict[str, Any]],
-) -> Dict[str, Any]:
-    """Genera la predicción de la SIGUIENTE M1 de forma deliberadamente conservadora.
-
-    Principio central del modelo manual:
-    - impulso -> esperar
-    - extremo -> esperar
-    - recuperación -> esperar
-    - respuesta -> esperar
-    - transición/pausa/ruido/desaceleración -> esperar
-    - una continuación aislada -> esperar
-    - solo una continuación fuerte que además confirma una continuación fuerte
-      previa puede producir CALL/PUT.
-
-    La predicción se calcula exclusivamente con velas cerradas disponibles.
+    Un impulso, una recuperación, una respuesta, una pausa o una transición
+    NO son entradas. Para una entrada se exige una continuación posterior a
+    una respuesta/recuperación clara, sin contradicción intraminuto.
     """
     name = state["state"]
-    direction = state["direction"]
-    reasons = list(state["evidence"])
     prediction = "NO SIGNAL"
+    reasons = list(state["evidence"])
 
-    if "EXTREMO" in name:
-        reasons.append("impulso extremo: esperar respuesta/confirmación")
-    elif name.startswith("RECUPERACION_"):
-        reasons.append("recuperación: esperar confirmación")
-    elif name.startswith("RESPUESTA_"):
-        reasons.append("respuesta: esperar confirmación")
-    elif name.startswith("IMPULSO_"):
-        reasons.append("impulso: no perseguir la vela actual")
-    elif name.startswith("CONTINUACION_"):
-        if _confirmed_continuation(candles, state):
-            prediction = "CALL" if direction == "ALCISTA" else "PUT"
-            reasons.append("continuación confirmada por la vela anterior")
+    # Nunca perseguimos el impulso actual.
+    if "IMPULSO" in name:
+        reasons.append("impulso actual: esperar respuesta")
+    elif "EXTREMO" in name:
+        reasons.append("impulso extremo: esperar respuesta y confirmación")
+    elif "RECUPERACION" in name or "RESPUESTA" in name:
+        reasons.append("respuesta/recuperación: falta confirmación")
+    elif "DESACELERACION" in name or name in {"PAUSA_TRANSICION", "TRANSICION", "RUIDO"}:
+        reasons.append("estructura todavía no confirmada")
+    elif "CONTINUACION" in name:
+        # Confirmación secuencial: la vela anterior debe ser una respuesta o
+        # recuperación en la misma dirección y la actual debe mantenerla.
+        prev = candles[-2]
+        prev_color = prev["color"]
+        curr_dir = state["direction"]
+        same_dir = (curr_dir == "ALCISTA" and prev_color == "VERDE") or (curr_dir == "BAJISTA" and prev_color == "ROJA")
+
+        # Exigimos que haya habido un cambio de dirección en las 3 velas
+        # previas, evitando llamar continuación a una simple racha de color.
+        recent = candles[-4:-1]
+        opposite = "ROJA" if curr_dir == "ALCISTA" else "VERDE"
+        had_opposite = any(c["color"] == opposite for c in recent)
+        body = float(candles[-1]["body_ratio"])
+
+        if same_dir and had_opposite and body >= MEDIUM_BODY:
+            prediction = "CALL" if curr_dir == "ALCISTA" else "PUT"
+            reasons.append("continuación confirmada después de respuesta")
         else:
-            reasons.append("continuación todavía no suficientemente confirmada")
+            reasons.append("continuación aislada: falta confirmación secuencial")
     else:
-        reasons.append("estructura sin confirmación direccional suficiente")
+        reasons.append("estado sin confirmación operativa")
 
-    # El intraminuto solo puede confirmar o cancelar una señal ya existente;
-    # jamás puede crear una señal.
     intrabar = _intrabar_quality(candles[-1])
 
-    if prediction == "CALL" and intrabar["quality"] in {"BUENA", "MEDIA"}:
-        if intrabar["direction"] == "BAJISTA":
-            prediction = "NO SIGNAL"
-            reasons.append("intraminuto contradice CALL")
-    elif prediction == "PUT" and intrabar["quality"] in {"BUENA", "MEDIA"}:
-        if intrabar["direction"] == "ALCISTA":
-            prediction = "NO SIGNAL"
-            reasons.append("intraminuto contradice PUT")
+    if prediction == "CALL" and intrabar["quality"] in {"BUENA", "MEDIA"} and intrabar["direction"] == "BAJISTA":
+        prediction = "NO SIGNAL"
+        reasons.append("intraminuto contradice CALL")
+    elif prediction == "PUT" and intrabar["quality"] in {"BUENA", "MEDIA"} and intrabar["direction"] == "ALCISTA":
+        prediction = "NO SIGNAL"
+        reasons.append("intraminuto contradice PUT")
 
-    if prediction == "NO SIGNAL":
-        final_quality = "BAJA"
-    elif state["quality"] == "ALTA" and intrabar["quality"] in {"BUENA", "MEDIA", "NO_DISPONIBLE"}:
-        final_quality = "ALTA"
-    else:
-        final_quality = "MEDIA"
+    final_quality = "BAJA" if prediction == "NO SIGNAL" else ("ALTA" if state["quality"] == "ALTA" else "MEDIA")
 
     return {
         "prediction": prediction,
