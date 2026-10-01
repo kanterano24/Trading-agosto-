@@ -79,7 +79,7 @@ DEMO_TRADING_ENABLED = (
     os.getenv("ENABLE_DEMO_TRADING", "0").strip().lower()
     in {"1", "true", "yes", "on"}
 )
-DEMO_AMOUNT = float(os.getenv("AMOUNT", "150"))
+DEMO_AMOUNT = float(os.getenv("AMOUNT", "333"))
 DEMO_EXPIRATION = 1
 MAX_DEMO_TRADES = 1
 DEMO_TRADES_EXECUTED = 0
@@ -207,38 +207,40 @@ def normalize_candle(
 def candle_to_df(
     candles: list[dict[str, Any]],
 ) -> pd.DataFrame:
-    if not candles:
-        return pd.DataFrame(
-            columns=[
-                "from",
-                "open",
-                "high",
-                "low",
-                "close",
-            ]
-        )
+    """Construye un DataFrame M1 con esquema fijo y tiempo normalizado.
 
-    # finalize_candle guarda el tiempo como "timestamp"; la estrategia
-    # consume la columna "from". Normalizamos ambos formatos antes de ordenar.
-    frame = pd.DataFrame(candles).copy()
-    if "from" not in frame.columns and "timestamp" in frame.columns:
-        frame["from"] = frame["timestamp"]
-    elif "from" in frame.columns and "timestamp" in frame.columns:
-        frame["from"] = frame["from"].fillna(frame["timestamp"])
+    No depende de que las velas originales compartan exactamente las mismas
+    claves y evita llamar drop_duplicates sobre columnas inexistentes.
+    """
+    columns = ["from", "open", "high", "low", "close"]
+    normalized: dict[int, dict[str, Any]] = {}
 
-    required = ["from", "open", "high", "low", "close"]
-    missing = [column for column in required if column not in frame.columns]
-    if missing:
-        logger.warning("Velas incompletas para analisis; faltan: %s", missing)
-        return pd.DataFrame(columns=required)
+    for candle in candles or []:
+        if not isinstance(candle, dict):
+            continue
 
-    frame["from"] = pd.to_numeric(frame["from"], errors="coerce")
-    frame = frame.dropna(subset=required)
-    return (
-        frame.drop_duplicates("from")
-        .sort_values("from")
-        .reset_index(drop=True)
+        # Compatibilidad con las distintas formas usadas por el recolector.
+        ts = candle.get("from")
+        if ts is None:
+            ts = candle.get("timestamp", candle.get("at"))
+
+        row = normalize_candle(candle, fallback_ts=ts)
+        if row is None:
+            continue
+
+        # Si llega más de una muestra de la misma vela, conservar la última.
+        normalized[row["from"]] = row
+
+    if not normalized:
+        return pd.DataFrame(columns=columns)
+
+    frame = pd.DataFrame(
+        [normalized[key] for key in sorted(normalized)],
+        columns=columns,
     )
+    for column in columns:
+        frame[column] = pd.to_numeric(frame[column], errors="coerce")
+    return frame.dropna(subset=columns).reset_index(drop=True)
 
 
 # ---------------------------------------------------------------------------
