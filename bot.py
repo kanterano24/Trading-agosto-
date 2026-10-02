@@ -6,19 +6,6 @@ import pandas as pd
 import requests
 from iqoptionapi.stable_api import IQ_Option
 import iqoptionapi.constants as OP_code
-
-# Esta versión de iqoptionapi puede iniciar un hilo digital que falla cuando
-# el servidor devuelve None. El bot solo usa binarias; anulamos esa ruta
-# ANTES de crear la instancia IQ_Option.
-def _safe_digital_underlying(self):
-    return {"underlying": []}
-
-def _disable_digital_open(self, *args, **kwargs):
-    return None
-
-IQ_Option.get_digital_underlying_list_data = _safe_digital_underlying
-IQ_Option._IQ_Option__get_digital_open = _disable_digital_open
-
 from strategy import M1, WINDOW, analyze_market
 
 IQ_EMAIL=os.getenv('IQ_EMAIL'); IQ_PASSWORD=os.getenv('IQ_PASSWORD')
