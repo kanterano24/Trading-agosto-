@@ -1,6 +1,6 @@
 from __future__ import annotations
 """IQ Option OTC M1 scanner. Demo only; real-money orders are blocked."""
-import logging, os, time
+import logging, os, time, threading
 from typing import Any, Optional
 import pandas as pd
 import requests
@@ -21,12 +21,78 @@ log=logging.getLogger('otc_m1')
 IQ: Optional[IQ_Option]=None
 PAIRS:list[str]=[]; excluded_until_refresh:set[str]=set(); last_refresh=0.0
 last_candle:dict[str,int]={}; last_signal_candle:dict[str,int]={}
+RUNNING=threading.Event()  # Arranca detenido; se activa desde Telegram.
+TG_OFFSET=0
+TG_LOCK=threading.Lock()
 
 
 def tg(msg:str)->None:
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID: return
     try: requests.post(f'https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage',data={'chat_id':str(TELEGRAM_CHAT_ID),'text':msg},timeout=6)
     except Exception as e: log.warning('Telegram: %s',e)
+
+def tg_control_panel(chat_id: str | int | None = None, message: str = "🎛️ Control del bot OTC M1") -> None:
+    """Send Telegram start/stop controls; only the configured chat is authorized."""
+    if not TELEGRAM_TOKEN or not (chat_id or TELEGRAM_CHAT_ID):
+        return
+    target = str(chat_id or TELEGRAM_CHAT_ID)
+    state = "🟢 EN MARCHA" if RUNNING.is_set() else "⏸️ DETENIDO"
+    keyboard = {"inline_keyboard": [[
+        {"text": "▶️ INICIAR", "callback_data": "bot_start"},
+        {"text": "⏹️ DETENER", "callback_data": "bot_stop"}
+    ], [{"text": "ℹ️ ESTADO", "callback_data": "bot_status"}]]}
+    try:
+        requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+                      json={"chat_id": target, "text": f"{message}\nEstado: {state}",
+                            "reply_markup": keyboard}, timeout=8)
+    except Exception as e:
+        log.warning("Telegram panel: %s", e)
+
+
+def telegram_control_loop() -> None:
+    """Long-poll Telegram updates and handle inline buttons plus /start, /stop, /status."""
+    global TG_OFFSET
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        log.warning("Telegram no configurado; control remoto deshabilitado.")
+        return
+    base=f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
+    while True:
+        try:
+            response=requests.get(f"{base}/getUpdates", params={"offset":TG_OFFSET,"timeout":25}, timeout=32)
+            response.raise_for_status()
+            payload=response.json()
+            if not payload.get("ok"):
+                time.sleep(3); continue
+            for update in payload.get("result",[]):
+                TG_OFFSET=max(TG_OFFSET,int(update.get("update_id",0))+1)
+                callback=update.get("callback_query")
+                msg=update.get("message") or (callback or {}).get("message") or {}
+                chat=msg.get("chat",{})
+                chat_id=str(chat.get("id",""))
+                if chat_id != str(TELEGRAM_CHAT_ID):
+                    if callback:
+                        requests.post(f"{base}/answerCallbackQuery",data={"callback_query_id":callback["id"],"text":"No autorizado"},timeout=5)
+                    continue
+                action=(callback or {}).get("data","")
+                command=(msg.get("text","").strip().split() or [""])[0].lower()
+                if action=="bot_start" or command=="/start":
+                    RUNNING.set(); reply="▶️ BOT INICIADO. Comienza el análisis M1 y las órdenes demo según las señales."
+                elif action=="bot_stop" or command=="/stop":
+                    RUNNING.clear(); reply="⏹️ BOT DETENIDO. Se pausa el análisis y no se envían nuevas órdenes."
+                elif action=="bot_status" or command=="/status":
+                    reply="🟢 EN MARCHA" if RUNNING.is_set() else "⏸️ DETENIDO"
+                    reply+=f"\nPares en catálogo: {len(PAIRS)}\nPares excluidos: {len(excluded_until_refresh)}"
+                else:
+                    continue
+                if callback:
+                    requests.post(f"{base}/answerCallbackQuery",data={"callback_query_id":callback["id"]},timeout=5)
+                    tg_control_panel(chat_id, reply)
+                else:
+                    tg_control_panel(chat_id, reply)
+                log.info("Control Telegram: %s",reply.replace("\n"," | "))
+        except Exception as e:
+            log.warning("Telegram polling: %s",e); time.sleep(3)
+
 
 def canonical(name:str)->str:
     return name.strip().upper().replace('_OTC','-OTC')
@@ -161,14 +227,17 @@ def main()->None:
         IQ=IQ_Option(IQ_EMAIL,IQ_PASSWORD); ok,reason=IQ.connect()
         if not ok:raise ConnectionError(reason)
         if not configure_demo():return
-        tg('🤖 BOT OTC M1 INICIADO\nSolo pares OTC abiertos en catálogo binario.\n'
-           f'Actualización: cada {REFRESH_SECONDS//60} minutos\nExpiración: 1 minuto\n'
-           f'Importe por operación: {AMOUNT:.2f} USD\nCuenta: PRACTICE\nOperaciones reales: BLOQUEADAS')
+        threading.Thread(target=telegram_control_loop,daemon=True,name='telegram-control').start()
+        tg_control_panel(message='🤖 BOT OTC M1 CONECTADO\nCuenta: PRACTICE\nOperaciones reales: BLOQUEADAS')
+        tg('⏸️ El bot inicia DETENIDO. Pulsa INICIAR en Telegram para comenzar.')
         refresh_pairs(force=True)
         while True:
+            if not RUNNING.wait(timeout=0.5):
+                continue
             if not ensure_connection():time.sleep(2);continue
             refresh_pairs()
             for pair in list(PAIRS):
+                if not RUNNING.is_set(): break
                 if pair in excluded_until_refresh:continue
                 analyze_pair(pair)
                 time.sleep(POLL)
