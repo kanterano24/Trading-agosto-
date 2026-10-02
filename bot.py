@@ -6,21 +6,6 @@ import pandas as pd
 import requests
 from iqoptionapi.stable_api import IQ_Option
 import iqoptionapi.constants as OP_code
-
-# Compatibilidad: este bot usa exclusivamente binarias. Algunas versiones de
-# iqoptionapi lanzan un hilo digital que intenta indexar una respuesta None.
-# Se desactiva la ruta digital y se devuelve siempre una estructura segura.
-def _binary_only_digital_underlying(self):
-    return {"underlying": []}
-
-def _disable_digital_open(self, *args, **kwargs):
-    return None
-
-setattr(IQ_Option, "get_digital_underlying_list_data", _binary_only_digital_underlying)
-for _method_name in ("_IQ_Option__get_digital_open", "__get_digital_open", "_get_digital_open"):
-    if hasattr(IQ_Option, _method_name):
-        setattr(IQ_Option, _method_name, _disable_digital_open)
-
 from strategy import M1, WINDOW, analyze_market
 
 IQ_EMAIL=os.getenv('IQ_EMAIL'); IQ_PASSWORD=os.getenv('IQ_PASSWORD')
@@ -167,7 +152,11 @@ def analyze_pair(pair:str)->None:
 def main()->None:
     global IQ
     if not all((IQ_EMAIL,IQ_PASSWORD)):
-        log.error('Configura IQ_EMAIL e IQ_PASSWORD'); return
+        log.error('FALTAN IQ_EMAIL e/o IQ_PASSWORD. Configura ambas variables en Railway > Variables; el proceso permanecerá activo para que el servicio no termine silenciosamente.')
+        while not (os.getenv('IQ_EMAIL') and os.getenv('IQ_PASSWORD')):
+            time.sleep(30)
+        log.error('Credenciales detectadas después del arranque. Reinicia el servicio para iniciar la conexión.')
+        return
     try:
         IQ=IQ_Option(IQ_EMAIL,IQ_PASSWORD); ok,reason=IQ.connect()
         if not ok:raise ConnectionError(reason)
