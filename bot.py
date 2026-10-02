@@ -8,12 +8,27 @@ from iqoptionapi.stable_api import IQ_Option
 import iqoptionapi.constants as OP_code
 from strategy import M1, WINDOW, analyze_market
 
-# Este bot utiliza únicamente Binary OTC. Sobrescribimos el método en una
-# subclase antes de conectar para que, si la biblioteca crea el hilo digital,
-# su función objetivo no consulte la respuesta Digital que puede llegar como None.
+# Este bot opera exclusivamente en Binary OTC.
+# Algunas versiones de iqoptionapi lanzan un hilo cuyo target es
+# _get_digital_open. Sobrescribir el método no siempre basta, porque la
+# biblioteca puede haber guardado el target antes de la conexión.
+# Por eso bloqueamos únicamente el inicio de ese hilo concreto.
+_original_thread_start = threading.Thread.start
+
+def _thread_start_without_digital(self, *args, **kwargs):
+    target = getattr(self, "_target", None)
+    target_name = getattr(target, "__name__", "")
+    thread_name = getattr(self, "name", "")
+    if target_name == "_get_digital_open" or thread_name == "_get_digital_open":
+        log.warning("Hilo interno Digital omitido: este bot solo utiliza Binary OTC.")
+        return None
+    return _original_thread_start(self, *args, **kwargs)
+
+threading.Thread.start = _thread_start_without_digital
+
 class OTCOnlyIQOption(IQ_Option):
     def _get_digital_open(self, *args, **kwargs):
-        log.info("Sondeo interno Digital desactivado: este bot solo usa Binary OTC.")
+        log.info("Consulta Digital desactivada; se utiliza únicamente Binary OTC.")
         return None
 
 IQ_EMAIL=os.getenv('IQ_EMAIL'); IQ_PASSWORD=os.getenv('IQ_PASSWORD')
