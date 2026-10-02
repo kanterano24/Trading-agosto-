@@ -1,659 +1,75 @@
 from __future__ import annotations
 
 """
-bot.py - Recolector + reconocedor M1 para IQ Option.
+strategy.py - Reconocedor M1 por precio y anatomia.
 
-- Un solo par: EURUSD (mercado no OTC).
-- Solo M1.
-- Solo precio/anatomia/contexto.
-- Sin indicadores, S/R ni rechazo.
-- OPERACIONES REALES DESACTIVADAS.
-- Captura snapshots intraminuto.
-- Conserva todas las velas cerradas de la sesión.
-- En cada cierre ejecuta strategy.analyze_market().
-- La estrategia reconoce estados y decide:
-    CALL / PUT / NO SIGNAL
-  para la SIGUIENTE M1.
-- No se envia ninguna orden a IQ Option.
+Objetivo:
+- Unicamente velas M1 cerradas.
+- Sin indicadores.
+- Sin soporte/resistencia.
+- Sin rechazo.
+- Sin datos futuros para generar la prediccion.
+- Reconoce estados de mercado a partir de anatomia y contexto.
+- Devuelve estado, direccion, calidad, evidencia y prediccion para la
+  SIGUIENTE vela M1.
+- Compatible con el bot actual: M1, WINDOW, analyze_market, get_signal,
+  signal y candle_metrics.
 
-Variables:
-IQ_EMAIL
-IQ_PASSWORD
-TELEGRAM_TOKEN
-TELEGRAM_CHAT_ID
-ANALYSIS_PAIR=ARBUSD-OTC
-AUTO_SELECT_OTC=1
-CANDLE_COUNT_M1=120
-POLL_SECONDS=0.20
+IMPORTANTE:
+Esta estrategia es un reconocedor experimental de patrones de precio.
+Las etiquetas no representan una garantia de direccion futura.
 """
 
-import logging
-import os
-import time
-from typing import Any, Optional
-
+from typing import Any, Dict, List, Optional
+import math
 import pandas as pd
-import requests
-from iqoptionapi.stable_api import IQ_Option
-import iqoptionapi.constants as OP_code
 
-from strategy import M1, WINDOW, analyze_market
 
+M1 = 60
+WINDOW = 10
 
-# ---------------------------------------------------------------------------
-# CONFIG
-# ---------------------------------------------------------------------------
+# Umbrales de anatomia. Se usan como reglas de reconocimiento, no como
+# indicadores de mercado.
+STRONG_BODY = 0.70
+MEDIUM_BODY = 0.55
+SMALL_BODY = 0.25
+VERY_SMALL_BODY = 0.18
 
-IQ_EMAIL = os.getenv("IQ_EMAIL")
-IQ_PASSWORD = os.getenv("IQ_PASSWORD")
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+# Un impulso extremo tiene cuerpo muy dominante y cierre muy cerca del extremo.
+EXTREME_BODY = 0.85
+EXTREME_CLOSE = 0.88
 
-# Fijado para evitar que variables antiguas seleccionen un par OTC.
-PAIR_REQUESTED = "EURUSD"
+# Intraminuto: por debajo de esto se considera muestra pobre.
+MIN_INTRABAR_SAMPLES = 120
+GOOD_INTRABAR_SAMPLES = 240
 
 
-AUTO_SELECT_OTC = False  # No buscar ni sustituir por pares OTC.
+def candle_color(open_: float, close: float) -> str:
+    if close > open_:
+        return "VERDE"
+    if close < open_:
+        return "ROJA"
+    return "DOJI"
 
-CATALOG_REFRESH_SECONDS = float(
-    os.getenv("CATALOG_REFRESH_SECONDS", "60")
-)
 
-CANDLE_COUNT_M1 = max(
-    WINDOW,
-    int(os.getenv("CANDLE_COUNT_M1", "120"))
-)
-
-POLL_SECONDS = max(
-    0.05,
-    float(os.getenv("POLL_SECONDS", "0.20"))
-)
-
-# DEMO: solo se habilita con ENABLE_DEMO_TRADING=1.
-# REAL queda bloqueado de forma permanente en este archivo.
-DEMO_TRADING_ENABLED = (
-    os.getenv("ENABLE_DEMO_TRADING", "1").strip().lower()
-    in {"1", "true", "yes", "on"}
-)
-DEMO_AMOUNT = float(os.getenv("AMOUNT", "1"))
-DEMO_EXPIRATION = 1
-MAX_DEMO_TRADES = 1
-DEMO_TRADES_EXECUTED = 0
-DEMO_ORDER_ID = None
-DEMO_PENDING_SIGNAL = None
-REAL_TRADING_ENABLED = False
-
-
-# ---------------------------------------------------------------------------
-# ESTADO
-# ---------------------------------------------------------------------------
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s",
-)
-logger = logging.getLogger("m1_reconocedor")
-
-IQ: Optional[IQ_Option] = None
-
-ACTIVE_PAIR = PAIR_REQUESTED
-RUNNING = True
-STREAM_STARTED = False
-
-CLOSED: list[dict[str, Any]] = []
-
-CURRENT_START: Optional[int] = None
-CURRENT_SAMPLES: list[dict[str, Any]] = []
-
-LAST_CLOSED_START: Optional[int] = None
-
-# Prediccion pendiente. Se resuelve al cierre de la siguiente M1.
-PENDING_SIM: Optional[dict[str, Any]] = None
-
-STATS = {
-    "predictions": 0,
-    "wins": 0,
-    "losses": 0,
-    "doji": 0,
-    "no_signal": 0,
-}
-
-LAST_CATALOG_CHECK = 0.0
-
-
-# ---------------------------------------------------------------------------
-# TELEGRAM
-# ---------------------------------------------------------------------------
-
-def tg(msg: str) -> None:
-    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        return
-
-    try:
-        requests.post(
-            "https://api.telegram.org/bot"
-            + str(TELEGRAM_TOKEN)
-            + "/sendMessage",
-            data={
-                "chat_id": str(TELEGRAM_CHAT_ID),
-                "text": msg,
-            },
-            timeout=5,
-        )
-    except Exception as exc:
-        logger.warning("Telegram: %s", exc)
-
-
-# ---------------------------------------------------------------------------
-# TIEMPO
-# ---------------------------------------------------------------------------
-
-def server_ts() -> float:
-    try:
-        return (
-            float(IQ.get_server_timestamp())
-            if IQ is not None
-            else time.time()
-        )
-    except Exception:
-        return time.time()
-
-
-def floor_m1(ts: float) -> int:
-    return int(ts // M1) * M1
-
-
-# ---------------------------------------------------------------------------
-# NORMALIZACION DE VELAS
-# ---------------------------------------------------------------------------
-
-def normalize_candle(
-    c: Any,
-    fallback_ts: Any = None,
-) -> Optional[dict[str, Any]]:
-    if not isinstance(c, dict):
-        return None
-
-    try:
-        raw_from = c.get("from", c.get("at", fallback_ts))
-
-        if raw_from is None:
-            return None
-
-        row = {
-            "from": int(float(raw_from)),
-            "open": float(c.get("open")),
-            "high": float(c.get("max", c.get("high"))),
-            "low": float(c.get("min", c.get("low"))),
-            "close": float(c.get("close")),
-        }
-
-        if row["from"] <= 0:
-            return None
-
-        if row["high"] < row["low"]:
-            return None
-
-        return row
-
-    except (TypeError, ValueError):
-        return None
-
-
-def candle_to_df(
-    candles: list[dict[str, Any]],
-) -> pd.DataFrame:
-    """Construye un DataFrame M1 con esquema fijo y tiempo normalizado.
-
-    No depende de que las velas originales compartan exactamente las mismas
-    claves y evita llamar drop_duplicates sobre columnas inexistentes.
-    """
-    columns = ["from", "open", "high", "low", "close"]
-    normalized: dict[int, dict[str, Any]] = {}
-
-    for candle in candles or []:
-        if not isinstance(candle, dict):
-            continue
-
-        # Compatibilidad con las distintas formas usadas por el recolector.
-        ts = candle.get("from")
-        if ts is None:
-            ts = candle.get("timestamp", candle.get("at"))
-
-        row = normalize_candle(candle, fallback_ts=ts)
-        if row is None:
-            continue
-
-        # Si llega más de una muestra de la misma vela, conservar la última.
-        normalized[row["from"]] = row
-
-    if not normalized:
-        return pd.DataFrame(columns=columns)
-
-    frame = pd.DataFrame(
-        [normalized[key] for key in sorted(normalized)],
-        columns=columns,
-    )
-    for column in columns:
-        frame[column] = pd.to_numeric(frame[column], errors="coerce")
-    return frame.dropna(subset=columns).reset_index(drop=True)
-
-
-# ---------------------------------------------------------------------------
-# CATALOGO IQ OPTION
-# ---------------------------------------------------------------------------
-
-def _catalog_active_names() -> dict[str, int]:
-    """
-    Obtiene activos de la sesion actual.
-
-    init_v2 es la fuente principal. constants.py queda solo como
-    respaldo porque puede estar desactualizado.
-    """
-    found: dict[str, int] = {}
-
-    if IQ is None:
-        return found
-
-    try:
-        data = IQ.get_all_init_v2()
-
-        if isinstance(data, dict):
-            for market in ("binary", "turbo"):
-                section = data.get(market, {})
-
-                if not isinstance(section, dict):
-                    continue
-
-                actives = section.get("actives", {})
-
-                if not isinstance(actives, dict):
-                    continue
-
-                for active_id, info in actives.items():
-                    if not isinstance(info, dict):
-                        continue
-
-                    name = str(
-                        info.get("name", "")
-                    ).strip()
-
-                    if not name:
-                        continue
-
-                    try:
-                        aid = int(active_id)
-                    except (TypeError, ValueError):
-                        continue
-
-                    variants = {
-                        name,
-                        name.replace("_OTC", "-OTC"),
-                        name.replace("-OTC", "_OTC"),
-                        name.split(".", 1)[-1],
-                    }
-
-                    for variant in variants:
-                        if variant:
-                            found[variant] = aid
-
-    except Exception as exc:
-        logger.warning(
-            "Catalogo init_v2: %s",
-            exc,
-        )
-
-    # Fallback estatico.
-    try:
-        for name, aid in OP_code.ACTIVES.items():
-            try:
-                found.setdefault(
-                    str(name),
-                    int(aid),
-                )
-            except (TypeError, ValueError):
-                pass
-    except Exception:
-        pass
-
-    return found
-
-
-def discover_otc_pairs() -> list[str]:
-    names = _catalog_active_names()
-
-    pairs: set[str] = set()
-
-    for name in names:
-        upper = name.upper()
-
-        if (
-            upper.endswith("-OTC")
-            or upper.endswith("_OTC")
-        ):
-            pairs.add(
-                name.replace("_OTC", "-OTC")
-            )
-
-    return sorted(pairs)
-
-
-def resolve_active(pair: str) -> Optional[int]:
-    global LAST_CATALOG_CHECK
-
-    if IQ is None:
-        return None
-
-    try:
-        names = _catalog_active_names()
-        LAST_CATALOG_CHECK = time.time()
-
-        variants = (
-            pair,
-            pair.replace("-OTC", "_OTC"),
-            pair.replace("_OTC", "-OTC"),
-        )
-
-        for candidate in variants:
-            if candidate in names:
-                aid = int(names[candidate])
-
-                OP_code.ACTIVES[pair] = aid
-                OP_code.ACTIVES[candidate] = aid
-
-                logger.info(
-                    "Activo resuelto: %s -> %s",
-                    pair,
-                    aid,
-                )
-
-                return aid
-
-        target = pair.upper().replace(
-            "_OTC",
-            "-OTC",
-        )
-
-        for name, aid in names.items():
-            canonical = name.upper().replace(
-                "_OTC",
-                "-OTC",
-            )
-
-            if canonical.endswith(target):
-                OP_code.ACTIVES[pair] = int(aid)
-
-                logger.info(
-                    "Activo resuelto por coincidencia: "
-                    "%s -> %s (%s)",
-                    pair,
-                    aid,
-                    name,
-                )
-
-                return int(aid)
-
-    except Exception as exc:
-        logger.warning(
-            "Resolucion de activo: %s",
-            exc,
-        )
-
-    logger.warning(
-        "Activo no encontrado: %s",
-        pair,
-    )
-
-    return None
-
-
-def choose_otc_pair() -> Optional[str]:
-    requested = PAIR_REQUESTED
-
-    if resolve_active(requested) is not None:
-        return requested
-
-    if not AUTO_SELECT_OTC:
-        return None
-
-    pairs = discover_otc_pairs()
-
-    if not pairs:
-        return None
-
-    requested_base = (
-        requested.upper()
-        .replace("-OTC", "")
-        .replace("_OTC", "")
-    )
-
-    preferred = [
-        p
-        for p in pairs
-        if (
-            p.upper()
-            .replace("-OTC", "")
-            .replace("_OTC", "")
-            == requested_base
-        )
-    ]
-
-    return preferred[0] if preferred else pairs[0]
-
-
-# ---------------------------------------------------------------------------
-# CONEXION
-# ---------------------------------------------------------------------------
-
-def connect() -> bool:
-    global IQ, ACTIVE_PAIR
-
-    IQ = IQ_Option(
-        IQ_EMAIL,
-        IQ_PASSWORD,
-    )
-
-    ok, reason = IQ.connect()
-
-    if not ok:
-        raise ConnectionError(reason)
-
-    logger.info("Conectado a IQ Option")
-
-    # EURUSD sin OTC: no hay selección alternativa ni fallback a OTC.
-    if PAIR_REQUESTED != "EURUSD":
-        tg("❌ Configuración inválida: solo se permite EURUSD no OTC.")
-        return False
-
-    active_id = resolve_active("EURUSD")
-    if active_id is None:
-        available = sorted(_catalog_active_names().keys())
-        matches = [name for name in available if name.upper() == "EURUSD"]
-        tg(
-            "❌ EURUSD NO DISPONIBLE EN EL CATÁLOGO\n\n"
-            "No se seleccionará ningún par OTC como sustituto.\n"
-            f"Coincidencias exactas: {matches or 'ninguna'}\n\n"
-            "El bot reintentará al reiniciar."
-        )
-        return False
-
-    ACTIVE_PAIR = "EURUSD"
-    logger.info("Par fijado: EURUSD (no OTC), activo=%s", active_id)
-    return True
-
-
-def ensure_connection() -> bool:
-    if IQ is None:
-        return False
-
-    try:
-        if IQ.check_connect():
-            return True
-    except Exception:
-        pass
-
-    try:
-        result = IQ.connect()
-
-        if isinstance(result, tuple):
-            return bool(result[0])
-
-        return bool(result)
-
-    except Exception as exc:
-        logger.warning(
-            "Reconectar: %s",
-            exc,
-        )
-        return False
-
-
-# ---------------------------------------------------------------------------
-# STREAM
-# ---------------------------------------------------------------------------
-
-def start_stream() -> bool:
-    global STREAM_STARTED
-
-    if not ensure_connection():
-        return False
-
-    if resolve_active(ACTIVE_PAIR) is None:
-        return False
-
-    try:
-        IQ.start_candles_stream(
-            ACTIVE_PAIR,
-            M1,
-            CANDLE_COUNT_M1,
-        )
-
-        STREAM_STARTED = True
-
-        logger.info(
-            "Stream iniciado: %s M1",
-            ACTIVE_PAIR,
-        )
-
-        tg(
-            "🟢 STREAM M1 INICIADO\n\n"
-            f"Par: {ACTIVE_PAIR} (no OTC)\n"
-            f"Cuenta: {'PRACTICE DEMO' if DEMO_TRADING_ENABLED else 'solo análisis'}\n"
-            "Operaciones con dinero real: BLOQUEADAS\n\n"
-            "Esperando cierres..."
-        )
-
-        return True
-
-    except Exception as exc:
-        STREAM_STARTED = False
-
-        logger.exception(
-            "No se pudo iniciar stream: %s",
-            exc,
-        )
-
-        tg(
-            "⚠️ FALLO STREAM M1\n\n"
-            f"{type(exc).__name__}: {exc}\n\n"
-            "Se reintentara."
-        )
-
-        return False
-
-
-def stop_stream() -> None:
-    global STREAM_STARTED
-
-    if not STREAM_STARTED or IQ is None:
-        return
-
-    try:
-        IQ.stop_candles_stream(
-            ACTIVE_PAIR,
-            M1,
-        )
-    except Exception:
-        pass
-
-    STREAM_STARTED = False
-
-
-def get_stream_candles() -> list[dict[str, Any]]:
-    if IQ is None or not STREAM_STARTED:
-        return []
-
-    try:
-        raw = IQ.get_realtime_candles(
-            ACTIVE_PAIR,
-            M1,
-        )
-    except Exception as exc:
-        logger.warning(
-            "Realtime candles: %s",
-            exc,
-        )
-        return []
-
-    if not isinstance(raw, dict):
-        return []
-
-    result: list[dict[str, Any]] = []
-
-    for key, value in raw.items():
-        candle = normalize_candle(
-            value,
-            key,
-        )
-
-        if candle is not None:
-            result.append(candle)
-
-    return sorted(
-        result,
-        key=lambda x: x["from"],
-    )
-
-
-# ---------------------------------------------------------------------------
-# ANATOMIA / INTRAMINUTO
-# ---------------------------------------------------------------------------
-
-def candle_metrics(
-    row: pd.Series,
-) -> dict[str, Any]:
+def candle_metrics(row: pd.Series) -> Dict[str, Any]:
+    """Calcula la anatomia de una vela sin usar indicadores."""
     o = float(row["open"])
     h = float(row["high"])
     l = float(row["low"])
     c = float(row["close"])
 
-    rng = max(
-        h - l,
-        1e-12,
-    )
-
+    rng = max(h - l, 1e-12)
     body = abs(c - o)
-
-    upper = max(
-        0.0,
-        h - max(o, c),
-    )
-
-    lower = max(
-        0.0,
-        min(o, c) - l,
-    )
-
-    color = (
-        "VERDE"
-        if c > o
-        else "ROJA"
-        if c < o
-        else "DOJI"
-    )
+    upper = max(0.0, h - max(o, c))
+    lower = max(0.0, min(o, c) - l)
 
     return {
-        "timestamp": int(row["from"]),
+        "timestamp": (
+            int(row["from"])
+            if "from" in row and pd.notna(row["from"])
+            else None
+        ),
         "open": o,
         "high": h,
         "low": l,
@@ -666,758 +82,673 @@ def candle_metrics(
         "upper_ratio": upper / rng,
         "lower_ratio": lower / rng,
         "close_pos": (c - l) / rng,
-        "color": color,
+        "color": candle_color(o, c),
     }
 
 
-def finalize_candle(
-    row: dict[str, Any],
-    samples: list[dict[str, Any]],
-) -> dict[str, Any]:
-    m = candle_metrics(
-        pd.Series(row)
-    )
+def normalize(df: Optional[pd.DataFrame]) -> pd.DataFrame:
+    if df is None or not isinstance(df, pd.DataFrame) or df.empty:
+        return pd.DataFrame()
 
-    prices = [
-        float(s["close"])
-        for s in samples
-        if "close" in s
-    ]
+    d = df.copy().rename(columns={"max": "high", "min": "low"})
 
-    if prices:
-        first = prices[0]
-        last = prices[-1]
+    required = ["open", "high", "low", "close"]
+    if any(c not in d.columns for c in required):
+        return pd.DataFrame()
+
+    for c in required:
+        d[c] = pd.to_numeric(d[c], errors="coerce")
+
+    if "from" in d.columns:
+        d["from"] = pd.to_numeric(d["from"], errors="coerce")
+        d = d.dropna(subset=["from"])
+        d = d.sort_values("from").drop_duplicates("from")
     else:
-        first = m["open"]
-        last = m["close"]
+        d = d.drop_duplicates()
 
-    up_move = max(
-        [
-            p - m["open"]
-            for p in prices
-        ]
-        + [m["high"] - m["open"], 0.0]
+    return d.dropna(subset=required).reset_index(drop=True)
+
+
+def _enrich(c: Dict[str, Any]) -> Dict[str, Any]:
+    """Añade medidas derivadas sin modificar el significado de la vela."""
+    out = dict(c)
+    rng = max(float(out["range"]), 1e-12)
+    body = float(out["body"])
+
+    out["body_ratio"] = body / rng
+    out["wick_ratio"] = (
+        float(out["upper_wick"]) + float(out["lower_wick"])
+    ) / rng
+
+    # Posicion del cierre: 1 = maximo, 0 = minimo.
+    out["close_pos"] = (
+        float(out["close"]) - float(out["low"])
+    ) / rng
+
+    # Resultado del cierre frente a la apertura.
+    out["signed_body"] = (
+        float(out["close"]) - float(out["open"])
     )
 
-    down_move = max(
-        [
-            m["open"] - p
-            for p in prices
-        ]
-        + [m["open"] - m["low"], 0.0]
-    )
-
-    traveled = sum(
-        abs(b - a)
-        for a, b in zip(
-            prices,
-            prices[1:],
-        )
-    )
-
-    up_steps = sum(
-        b > a
-        for a, b in zip(
-            prices,
-            prices[1:],
-        )
-    )
-
-    down_steps = sum(
-        b < a
-        for a, b in zip(
-            prices,
-            prices[1:],
-        )
-    )
-
-    flat_steps = sum(
-        b == a
-        for a, b in zip(
-            prices,
-            prices[1:],
-        )
-    )
-
-    return {
-        **m,
-        "sample_count": len(samples),
-        "up_move": up_move,
-        "down_move": down_move,
-        "traveled": traveled,
-        "up_steps": up_steps,
-        "down_steps": down_steps,
-        "flat_steps": flat_steps,
-        "first_sample": first,
-        "last_sample": last,
-    }
+    return out
 
 
-# ---------------------------------------------------------------------------
-# FORMATO TELEGRAM
-# ---------------------------------------------------------------------------
-
-def fmt(x: Any) -> str:
-    try:
-        return f"{float(x):.8f}"
-    except Exception:
-        return "-"
+def candle_data(row: pd.Series) -> Dict[str, Any]:
+    return _enrich(candle_metrics(row))
 
 
-def format_candle_message(
-    c: dict[str, Any],
-) -> str:
-    return (
-        "🕯️ VELA M1 CERRADA\n\n"
-        f"Par: {ACTIVE_PAIR}\n"
-        f"Timestamp: {c['timestamp']}\n"
-        f"Color: {c['color']}\n\n"
-        f"Apertura: {fmt(c['open'])}\n"
-        f"Maximo: {fmt(c['high'])}\n"
-        f"Minimo: {fmt(c['low'])}\n"
-        f"Cierre: {fmt(c['close'])}\n\n"
-        f"Mecha inferior: {fmt(c['lower_wick'])}\n"
-        f"Mecha superior: {fmt(c['upper_wick'])}\n"
-        f"Body: {fmt(c['body'])}\n"
-        f"Rango: {fmt(c['range'])}\n"
-        f"Body/R: {c['body_ratio'] * 100:.2f}%\n\n"
-        f"Movimiento desde apertura: "
-        f"+{fmt(c['up_move'])} / "
-        f"-{fmt(c['down_move'])}\n"
-        f"Recorrido acumulado observado: "
-        f"{fmt(c['traveled'])}\n"
-        f"Actualizaciones recibidas: "
-        f"{c['sample_count']}\n"
-        f"Movimientos: ↑ {c['up_steps']} | "
-        f"↓ {c['down_steps']} | "
-        f"= {c['flat_steps']}\n\n"
-        "Solo precio. Sin indicadores, S/R ni rechazo.\n"
-        "🚫 Operaciones reales DESACTIVADAS."
-    )
+def last_10_closed(df: pd.DataFrame) -> List[Dict[str, Any]]:
+    d = normalize(df)
+    if len(d) < WINDOW:
+        return []
+    return [candle_data(r) for _, r in d.iloc[-WINDOW:].iterrows()]
 
 
-def format_window(
-    candles: list[dict[str, Any]],
-) -> str:
+def summarize_window(df: pd.DataFrame) -> Dict[str, Any]:
+    candles = last_10_closed(df)
     seq = " ".join(
-        "V"
-        if c["color"] == "VERDE"
-        else "R"
-        if c["color"] == "ROJA"
+        "V" if c["color"] == "VERDE"
+        else "R" if c["color"] == "ROJA"
         else "D"
         for c in candles
     )
 
-    lines = [
-        "📊 CONTEXTO RECIENTE M1",
-        "",
-        f"Par: {ACTIVE_PAIR}",
-        f"Velas acumuladas en esta sesión: {len(CLOSED)}",
-        f"Mostrando las últimas {len(candles)} velas",
-        f"Secuencia reciente: {seq}",
-        "",
+    return {
+        "ready": len(candles) == WINDOW,
+        "count": len(candles),
+        "candles": candles,
+        "sequence": seq,
+    }
+
+
+def _direction(c: Dict[str, Any]) -> int:
+    if c["color"] == "VERDE":
+        return 1
+    if c["color"] == "ROJA":
+        return -1
+    return 0
+
+
+def _body_strength(c: Dict[str, Any]) -> str:
+    r = c["body_ratio"]
+    if r >= EXTREME_BODY:
+        return "EXTREMO"
+    if r >= STRONG_BODY:
+        return "FUERTE"
+    if r >= MEDIUM_BODY:
+        return "MEDIO"
+    if r >= SMALL_BODY:
+        return "DEBIL"
+    return "MUY_DEBIL"
+
+
+def _relative_range(last: Dict[str, Any], previous: List[Dict[str, Any]]) -> float:
+    ranges = [float(x["range"]) for x in previous if float(x["range"]) > 0]
+    if not ranges:
+        return 1.0
+    baseline = sum(ranges) / len(ranges)
+    return float(last["range"]) / max(baseline, 1e-12)
+
+
+def _context(candles: List[Dict[str, Any]]) -> Dict[str, Any]:
+    last = candles[-1]
+
+    def count_color(items: List[Dict[str, Any]], color: str) -> int:
+        return sum(x["color"] == color for x in items)
+
+    last3 = candles[-3:]
+    last5 = candles[-5:]
+    last10 = candles[-10:]
+
+    green3 = count_color(last3, "VERDE")
+    red3 = count_color(last3, "ROJA")
+    green5 = count_color(last5, "VERDE")
+    red5 = count_color(last5, "ROJA")
+    green10 = count_color(last10, "VERDE")
+    red10 = count_color(last10, "ROJA")
+
+    # Cambios de cierre y cuerpo.
+    close_changes = [
+        float(candles[i]["close"]) - float(candles[i - 1]["close"])
+        for i in range(1, len(candles))
     ]
 
-    for i, c in enumerate(
-        candles,
-        1,
-    ):
-        color = (
-            "V"
-            if c["color"] == "VERDE"
-            else "R"
-            if c["color"] == "ROJA"
-            else "D"
-        )
-
-        lines.append(
-            f"{i:02d} {color} | "
-            f"O={fmt(c['open'])} | "
-            f"H={fmt(c['high'])} | "
-            f"L={fmt(c['low'])} | "
-            f"C={fmt(c['close'])} | "
-            f"MI={fmt(c['lower_wick'])} | "
-            f"MS={fmt(c['upper_wick'])} | "
-            f"Body={fmt(c['body'])} | "
-            f"R={fmt(c['range'])} | "
-            f"Body/R={c['body_ratio'] * 100:.2f}%"
-        )
-
-    lines += [
-        "",
-        f"Historial acumulado: {len(CLOSED)} velas.",
-        "Par: EURUSD no OTC.",
-        "Cuenta real: bloqueada.",
-    ]
-
-    return "\n".join(lines)
-
-
-def send_full_context(candles: list[dict[str, Any]]) -> None:
-    """Envía el historial completo en bloques manejables para Telegram."""
-    block_size = 25
-    total = len(candles)
-    for start in range(0, total, block_size):
-        end = min(start + block_size, total)
-        block = format_window(candles[start:end])
-        # Etiqueta el rango real dentro del historial de la sesión.
-        block = block.replace(
-            "📊 CONTEXTO RECIENTE M1",
-            f"📊 HISTORIAL M1 | Velas {start + 1}-{end} de {total}",
-            1,
-        )
-        tg(block)
-
-
-def format_analysis(
-    result: dict[str, Any],
-) -> str:
-    prediction = result.get(
-        "prediction",
-        "NO SIGNAL",
+    net_change = (
+        float(candles[-1]["close"]) - float(candles[0]["open"])
     )
 
-    state = result.get(
-        "state",
-        "SIN_HISTORIAL",
-    )
+    avg_range = sum(float(x["range"]) for x in last5) / 5.0
+    avg_body = sum(float(x["body"]) for x in last5) / 5.0
 
-    direction = result.get(
-        "state_direction",
-        "NEUTRAL",
-    )
+    # Dominio de la secuencia reciente.
+    recent_direction = 0
+    if green3 >= 2 and green3 > red3:
+        recent_direction = 1
+    elif red3 >= 2 and red3 > green3:
+        recent_direction = -1
+    elif green5 > red5:
+        recent_direction = 1
+    elif red5 > green5:
+        recent_direction = -1
 
-    quality = result.get(
-        "state_quality",
-        "BAJA",
-    )
+    return {
+        "last": last,
+        "last3": last3,
+        "last5": last5,
+        "last10": last10,
+        "green3": green3,
+        "red3": red3,
+        "green5": green5,
+        "red5": red5,
+        "green10": green10,
+        "red10": red10,
+        "close_changes": close_changes,
+        "net_change": net_change,
+        "avg_range_5": avg_range,
+        "avg_body_5": avg_body,
+        "recent_direction": recent_direction,
+        "range_ratio": _relative_range(last, candles[-6:-1]),
+    }
 
-    pred_quality = result.get(
-        "prediction_quality",
-        "BAJA",
-    )
 
-    score = result.get(
-        "score",
-        0,
-    )
+def _intrabar_quality(last: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    El bot actual añade estas claves al cerrar la vela.
+    Si no existen, no se inventan.
+    """
+    samples = int(last.get("sample_count", 0) or 0)
+    up = int(last.get("up_steps", 0) or 0)
+    down = int(last.get("down_steps", 0) or 0)
+    total = up + down
 
-    evidence = result.get(
-        "evidence",
-        [],
-    )
-
-    intrabar = result.get(
-        "intrabar",
-        {},
-    )
-
-    intrabar_quality = intrabar.get(
-        "quality",
-        "NO_DISPONIBLE",
-    )
-
-    intrabar_direction = intrabar.get(
-        "direction",
-        "NEUTRAL",
-    )
-
-    samples = intrabar.get(
-        "samples",
-        0,
-    )
-
-    reason = result.get(
-        "prediction_reason",
-        result.get("reason", ""),
-    )
-
-    if prediction == "CALL":
-        pred_text = "🟢 CALL"
-    elif prediction == "PUT":
-        pred_text = "🔴 PUT"
+    if samples >= GOOD_INTRABAR_SAMPLES:
+        quality = "BUENA"
+    elif samples >= MIN_INTRABAR_SAMPLES:
+        quality = "MEDIA"
+    elif samples > 0:
+        quality = "BAJA"
     else:
-        pred_text = "⚪ NO SIGNAL"
+        quality = "NO_DISPONIBLE"
 
-    evidence_text = (
-        "\n".join(
-            f"• {item}"
-            for item in evidence
+    if total:
+        balance = abs(up - down) / total
+    else:
+        balance = 0.0
+
+    if total and balance >= 0.20:
+        intradir = "ALCISTA" if up > down else "BAJISTA"
+    else:
+        intradir = "NEUTRAL"
+
+    return {
+        "samples": samples,
+        "quality": quality,
+        "direction": intradir,
+        "balance": balance,
+    }
+
+
+def _classify_state(candles: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """
+    Reconoce el estado de la vela actual dentro del contexto reciente.
+
+    Orden de prioridad:
+    1. PAUSA / TRANSICION
+    2. IMPULSO EXTREMO
+    3. CONTINUACION FUERTE
+    4. RESPUESTA / RECUPERACION
+    5. DESACELERACION
+    6. IMPULSO normal
+    7. RUIDO
+    """
+    ctx = _context(candles)
+    last = ctx["last"]
+    prev = candles[-2]
+
+    d = _direction(last)
+    pdirection = _direction(prev)
+
+    body = float(last["body_ratio"])
+    close_pos = float(last["close_pos"])
+    range_ratio = float(ctx["range_ratio"])
+
+    prev_body = float(prev["body_ratio"])
+    prev_range = float(prev["range"])
+
+    # Cambio del cuerpo y del rango respecto a la vela anterior.
+    body_change = body - prev_body
+    range_change = float(last["range"]) - prev_range
+
+    # Vela de indecision: cuerpo pequeño con rango no trivial.
+    if body <= VERY_SMALL_BODY:
+        if (
+            ctx["green3"] == 1
+            and ctx["red3"] == 1
+        ) or abs(ctx["net_change"]) <= ctx["avg_range_5"] * 0.35:
+            return {
+                "state": "PAUSA_TRANSICION",
+                "direction": "NEUTRAL",
+                "quality": "BAJA",
+                "score": 0,
+                "evidence": [
+                    "cuerpo muy pequeño",
+                    "rango sin dirección limpia",
+                    "cierre sin dominio claro",
+                ],
+            }
+
+    # Impulso extremo: cuerpo dominante + cierre cerca del extremo.
+    if (
+        body >= EXTREME_BODY
+        and (
+            (d == 1 and close_pos >= EXTREME_CLOSE)
+            or (d == -1 and close_pos <= 1.0 - EXTREME_CLOSE)
         )
-        if evidence
-        else "• Sin evidencia suficiente"
+    ):
+        direction = "ALCISTA" if d == 1 else "BAJISTA"
+        return {
+            "state": f"IMPULSO_{direction}_EXTREMO",
+            "direction": direction,
+            "quality": "ALTA",
+            "score": 3,
+            "evidence": [
+                f"Body/R {body * 100:.2f}%",
+                "cierre muy cerca del extremo",
+                "cuerpo dominante",
+            ],
+        }
+
+    # Continuacion fuerte: la vela actual mantiene la dirección reciente
+    # después de una vela previa con dirección similar.
+    same_recent = (
+        (d == 1 and ctx["green3"] >= 2)
+        or (d == -1 and ctx["red3"] >= 2)
     )
 
-    return (
-        "🧠 RECONOCIMIENTO M1\n\n"
-        f"Par: {ACTIVE_PAIR}\n"
-        f"Estado: {state}\n"
-        f"Direccion del estado: {direction}\n"
-        f"Calidad del estado: {quality}\n"
-        f"Score estructural: {score}/3\n\n"
-        "Evidencia:\n"
-        f"{evidence_text}\n\n"
-        "INTRAMINUTO\n"
-        f"Calidad: {intrabar_quality}\n"
-        f"Direccion: {intrabar_direction}\n"
-        f"Actualizaciones: {samples}\n\n"
-        "PREDICCION SIGUIENTE M1\n"
-        f"{pred_text}\n"
-        f"Calidad prediccion: {pred_quality}\n"
-        f"Razon: {reason}\n\n"
-        "Entrada prevista: apertura siguiente M1\n"
-        "Expiración: 1 minuto\n"
-        "Cuenta real bloqueada; solo PRACTICE si está habilitado."
+    if (
+        d != 0
+        and same_recent
+        and body >= STRONG_BODY
+        and body >= prev_body * 0.85
+        and range_ratio >= 0.90
+    ):
+        direction = "ALCISTA" if d == 1 else "BAJISTA"
+        return {
+            "state": f"CONTINUACION_{direction}_FUERTE",
+            "direction": direction,
+            "quality": "ALTA",
+            "score": 3,
+            "evidence": [
+                "dirección repetida en 3 velas",
+                f"Body/R {body * 100:.2f}%",
+                "rango mantiene expansión",
+            ],
+        }
+
+    # Recuperacion: cambio de color contra la vela anterior pero cierre
+    # suficientemente dominante en la nueva dirección.
+    reversal = d != 0 and pdirection != 0 and d != pdirection
+
+    if reversal and body >= MEDIUM_BODY:
+        direction = "ALCISTA" if d == 1 else "BAJISTA"
+
+        if (
+            (d == 1 and close_pos >= 0.68)
+            or (d == -1 and close_pos <= 0.32)
+        ):
+            return {
+                "state": f"RECUPERACION_{direction}",
+                "direction": direction,
+                "quality": "MEDIA",
+                "score": 2,
+                "evidence": [
+                    "cambio de dirección respecto a la vela anterior",
+                    f"Body/R {body * 100:.2f}%",
+                    "cierre acompaña la nueva dirección",
+                ],
+            }
+
+    # Respuesta fuerte: la vela actual responde a una vela anterior fuerte
+    # en sentido contrario. Es diferente de una continuación.
+    if reversal and prev_body >= STRONG_BODY and body >= MEDIUM_BODY:
+        direction = "ALCISTA" if d == 1 else "BAJISTA"
+        return {
+            "state": f"RESPUESTA_{direction}_FUERTE",
+            "direction": direction,
+            "quality": "MEDIA",
+            "score": 2,
+            "evidence": [
+                "vela anterior fuerte en sentido contrario",
+                "respuesta de color opuesto",
+                f"Body/R actual {body * 100:.2f}%",
+            ],
+        }
+
+    # Confirmacion posterior a una pausa/transicion:
+    # si la vela anterior fue una pausa y la vela actual reanuda
+    # la direccion de la secuencia dominante, se considera continuation
+    # confirmada aunque el Body/R no sea extremo.
+    prev_was_pause = prev_body <= VERY_SMALL_BODY
+    prior_red = sum(
+        1 for x in candles[-4:-1] if x["color"] == "ROJA"
+    )
+    prior_green = sum(
+        1 for x in candles[-4:-1] if x["color"] == "VERDE"
     )
 
+    if (
+        prev_was_pause
+        and d == -1
+        and prior_red >= 2
+        and body >= MEDIUM_BODY * 0.90
+        and close_pos <= 0.55
+    ):
+        return {
+            "state": "CONTINUACION_BAJISTA_CONFIRMADA",
+            "direction": "BAJISTA",
+            "quality": "ALTA",
+            "score": 3,
+            "evidence": [
+                "pausa/transicion inmediatamente anterior",
+                "reanuda la direccion bajista dominante",
+                f"Body/R {body * 100:.2f}%",
+                "cierre en zona inferior del rango",
+            ],
+        }
 
-# ---------------------------------------------------------------------------
-# EJECUCION DEMO
-# ---------------------------------------------------------------------------
+    if (
+        prev_was_pause
+        and d == 1
+        and prior_green >= 2
+        and body >= MEDIUM_BODY * 0.90
+        and close_pos >= 0.45
+    ):
+        return {
+            "state": "CONTINUACION_ALCISTA_CONFIRMADA",
+            "direction": "ALCISTA",
+            "quality": "ALTA",
+            "score": 3,
+            "evidence": [
+                "pausa/transicion inmediatamente anterior",
+                "reanuda la direccion alcista dominante",
+                f"Body/R {body * 100:.2f}%",
+                "cierre en zona superior del rango",
+            ],
+        }
 
-def configure_demo_account() -> bool:
-    if not DEMO_TRADING_ENABLED:
-        return False
-    if IQ is None:
-        return False
-    try:
-        IQ.change_balance("PRACTICE")
-        mode_fn = getattr(IQ, "get_balance_mode", None)
-        if callable(mode_fn):
-            mode = mode_fn()
-            if mode and str(mode).upper() != "PRACTICE":
-                raise RuntimeError(
-                    f"La cuenta activa no es PRACTICE: {mode}"
-                )
-        tg(
-            "🟢 DEMO HABILITADO\n\n"
-            "Cuenta: PRACTICE\n"
-            f"Importe: {DEMO_AMOUNT:.2f}\n"
-            "Expiracion: 1 minuto\n"
-            "Limite: 1 entrada"
-        )
-        return True
-    except Exception as exc:
-        logger.exception("Configurar PRACTICE: %s", exc)
-        tg(
-            "❌ DEMO NO HABILITADO\n\n"
-            f"{type(exc).__name__}: {exc}\n\n"
-            "No se enviara ninguna orden."
-        )
-        return False
+    # Desaceleracion: misma dirección pero cuerpo/rango cae claramente.
+    if (
+        d != 0
+        and pdirection == d
+        and body <= SMALL_BODY
+        and prev_body >= MEDIUM_BODY
+    ):
+        direction = "ALCISTA" if d == 1 else "BAJISTA"
+        return {
+            "state": f"DESACELERACION_{direction}",
+            "direction": direction,
+            "quality": "BAJA",
+            "score": 1,
+            "evidence": [
+                "misma dirección que la vela anterior",
+                "cuerpo reducido",
+                "pérdida de dominancia",
+            ],
+        }
 
+    # Impulso normal.
+    if d != 0 and body >= MEDIUM_BODY:
+        direction = "ALCISTA" if d == 1 else "BAJISTA"
+        return {
+            "state": f"IMPULSO_{direction}",
+            "direction": direction,
+            "quality": "MEDIA",
+            "score": 2,
+            "evidence": [
+                f"Body/R {body * 100:.2f}%",
+                "dirección clara",
+            ],
+        }
 
-def execute_demo_entry() -> None:
-    global DEMO_TRADES_EXECUTED, DEMO_ORDER_ID
-    global DEMO_PENDING_SIGNAL
+    # Si el rango es pequeño y no hay estructura clara, es ruido.
+    if range_ratio < 0.70 and body < MEDIUM_BODY:
+        return {
+            "state": "RUIDO",
+            "direction": "NEUTRAL",
+            "quality": "BAJA",
+            "score": 0,
+            "evidence": [
+                "rango reducido frente al contexto",
+                "cuerpo sin dominancia",
+            ],
+        }
 
-    if not DEMO_TRADING_ENABLED:
-        return
-    if DEMO_TRADES_EXECUTED >= MAX_DEMO_TRADES:
-        return
-    if DEMO_PENDING_SIGNAL not in {"CALL", "PUT"}:
-        return
-    if IQ is None:
-        return
-
-    action = DEMO_PENDING_SIGNAL.lower()
-    signal = DEMO_PENDING_SIGNAL
-
-    try:
-        # Ultimo seguro: cambiar nuevamente a PRACTICE justo antes de comprar.
-        IQ.change_balance("PRACTICE")
-        mode_fn = getattr(IQ, "get_balance_mode", None)
-        if callable(mode_fn):
-            mode = mode_fn()
-            if mode and str(mode).upper() != "PRACTICE":
-                raise RuntimeError(
-                    f"Bloqueo de seguridad: cuenta activa {mode}"
-                )
-
-        ok, order_id = IQ.buy(
-            DEMO_AMOUNT,
-            ACTIVE_PAIR,
-            action,
-            DEMO_EXPIRATION,
-        )
-
-        if not ok:
-            tg(
-                "❌ ORDEN DEMO RECHAZADA\n\n"
-                f"Par: {ACTIVE_PAIR}\n"
-                f"Direccion: {signal}\n"
-                f"Importe: {DEMO_AMOUNT:.2f}\n"
-                f"Respuesta: {order_id}\n\n"
-                "No se contara como entrada ejecutada."
-            )
-            return
-
-        DEMO_ORDER_ID = order_id
-        DEMO_TRADES_EXECUTED += 1
-
-        tg(
-            "🚨 DEMO ENTRY EJECUTADA\n\n"
-            f"Par: {ACTIVE_PAIR}\n"
-            f"Direccion: {signal}\n"
-            f"Importe: {DEMO_AMOUNT:.2f}\n"
-            "Expiracion: 1 minuto\n"
-            f"ID: {order_id}\n\n"
-            "Cuenta: PRACTICE\n"
-            "Entradas demo ejecutadas: "
-            f"{DEMO_TRADES_EXECUTED}/{MAX_DEMO_TRADES}"
-        )
-    except Exception as exc:
-        logger.exception("Orden DEMO: %s", exc)
-        tg(
-            "❌ ERROR ORDEN DEMO\n\n"
-            f"{type(exc).__name__}: {exc}\n\n"
-            "No se contara como ejecutada."
-        )
-    finally:
-        DEMO_PENDING_SIGNAL = None
-
-
-def check_demo_result() -> None:
-    if not DEMO_TRADING_ENABLED or DEMO_ORDER_ID is None:
-        return
-    try:
-        result = IQ.check_win_v3(DEMO_ORDER_ID)
-        tg(
-            "🏁 RESULTADO ORDEN DEMO\n\n"
-            f"ID: {DEMO_ORDER_ID}\n"
-            f"Resultado API: {result}"
-        )
-    except Exception as exc:
-        logger.warning("Resultado DEMO: %s", exc)
-
-
-# ---------------------------------------------------------------------------
-# SIMULACION / VALIDACION
-# ---------------------------------------------------------------------------
-
-def analyze_and_message() -> None:
-    global PENDING_SIM
-
-    if len(CLOSED) < WINDOW:
-        return
-
-    # No sustituimos una prediccion pendiente hasta resolverla.
-    if PENDING_SIM is not None:
-        return
-
-    result = analyze_market(
-        df=candle_to_df(CLOSED)
-    )
-
-    tg(
-        format_analysis(result)
-    )
-
-    prediction = result.get(
-        "prediction",
-        "NO SIGNAL",
-    )
-
-    if prediction not in {"CALL", "PUT"}:
-        STATS["no_signal"] += 1
-        return
-
-    PENDING_SIM = {
-        "signal": prediction,
-        "state": result.get("state"),
-        "quality": result.get(
-            "prediction_quality",
-            "BAJA",
-        ),
-        "score": result.get(
-            "score",
-            0,
-        ),
-        "reason": result.get(
-            "prediction_reason",
-            "",
-        ),
-        "signal_timestamp": CLOSED[-1][
-            "timestamp"
+    return {
+        "state": "TRANSICION",
+        "direction": "NEUTRAL",
+        "quality": "BAJA",
+        "score": 0,
+        "evidence": [
+            "estructura sin dominio suficiente",
+            "no existe continuidad clara",
         ],
     }
 
-    STATS["predictions"] += 1
 
-    # La orden DEMO se ejecuta en la apertura detectada de la siguiente M1.
-    global DEMO_PENDING_SIGNAL
-    if DEMO_TRADING_ENABLED and DEMO_TRADES_EXECUTED < MAX_DEMO_TRADES:
-        DEMO_PENDING_SIGNAL = prediction
+def _prediction_from_state(
+    state: Dict[str, Any],
+    candles: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """
+    Genera la predicción de la SIGUIENTE M1 usando solamente las velas
+    disponibles hasta el cierre actual.
 
+    Regla conservadora:
+    - estados fuertes de continuación -> misma dirección
+    - impulso extremo -> esperar; no perseguir automáticamente
+    - recuperación fuerte -> esperar confirmación
+    - desaceleración/pausa/transición/ruido -> NO SIGNAL
+    """
+    name = state["state"]
+    direction = state["direction"]
 
-def evaluate_pending(
-    next_candle: dict[str, Any],
-) -> None:
-    global PENDING_SIM
+    prediction = "NO SIGNAL"
+    quality = state["quality"]
+    reasons = list(state["evidence"])
 
-    if PENDING_SIM is None:
-        return
-
-    signal = PENDING_SIM["signal"]
-
-    entry = float(
-        next_candle["open"]
-    )
-
-    close = float(
-        next_candle["close"]
-    )
-
-    if close == entry:
-        STATS["doji"] += 1
-        outcome = "⚪ DOJI"
-
-    elif (
-        signal == "CALL"
-        and close > entry
-    ) or (
-        signal == "PUT"
-        and close < entry
-    ):
-        STATS["wins"] += 1
-        outcome = "✅ FAVORABLE"
-
+    if name in {
+        "CONTINUACION_ALCISTA_FUERTE",
+        "CONTINUACION_ALCISTA_CONFIRMADA",
+        "IMPULSO_ALCISTA",
+    }:
+        prediction = "CALL"
+    elif name in {
+        "CONTINUACION_BAJISTA_FUERTE",
+        "CONTINUACION_BAJISTA_CONFIRMADA",
+        "IMPULSO_BAJISTA",
+    }:
+        prediction = "PUT"
+    elif name in {
+        "RECUPERACION_ALCISTA",
+        "RESPUESTA_ALCISTA_FUERTE",
+    }:
+        # Recuperaciones aisladas no se persiguen.
+        prediction = "NO SIGNAL"
+        reasons.append("recuperación requiere confirmación")
+    elif name in {
+        "RECUPERACION_BAJISTA",
+        "RESPUESTA_BAJISTA_FUERTE",
+    }:
+        prediction = "NO SIGNAL"
+        reasons.append("respuesta bajista requiere confirmación")
+    elif "EXTREMO" in name:
+        prediction = "NO SIGNAL"
+        reasons.append("impulso extremo: evitar persecución inmediata")
     else:
-        STATS["losses"] += 1
-        outcome = "❌ CONTRARIA"
+        prediction = "NO SIGNAL"
 
-    tg(
-        "🧪 RESULTADO PREDICCION\n\n"
-        f"Prediccion: {signal}\n"
-        f"Estado anterior: "
-        f"{PENDING_SIM.get('state')}\n"
-        f"Apertura siguiente M1: "
-        f"{fmt(entry)}\n"
-        f"Cierre siguiente M1: "
-        f"{fmt(close)}\n\n"
-        f"Resultado: {outcome}\n\n"
-        f"Predicciones direccionales: "
-        f"{STATS['predictions']}\n"
-        f"Favorables: {STATS['wins']}\n"
-        f"Contrarias: {STATS['losses']}\n"
-        f"Doji: {STATS['doji']}\n"
-        f"No signal: {STATS['no_signal']}\n\n"
-        "🚫 Solo simulacion."
-    )
+    # La intraminuto es confirmación secundaria. Nunca crea por sí sola una
+    # señal cuando la anatomía principal no la respalda.
+    intrabar = _intrabar_quality(candles[-1])
 
-    PENDING_SIM = None
+    if prediction == "CALL" and intrabar["quality"] in {"BUENA", "MEDIA"}:
+        if intrabar["direction"] == "BAJISTA":
+            prediction = "NO SIGNAL"
+            reasons.append("intraminuto contradice CALL")
+    elif prediction == "PUT" and intrabar["quality"] in {"BUENA", "MEDIA"}:
+        if intrabar["direction"] == "ALCISTA":
+            prediction = "NO SIGNAL"
+            reasons.append("intraminuto contradice PUT")
 
+    # Calidad final.
+    if prediction == "NO SIGNAL":
+        final_quality = "BAJA"
+    elif state["quality"] == "ALTA":
+        final_quality = "ALTA"
+    else:
+        final_quality = "MEDIA"
 
-# ---------------------------------------------------------------------------
-# PROCESAMIENTO DE CIERRES
-# ---------------------------------------------------------------------------
-
-def process_closed_candle(
-    row: dict[str, Any],
-) -> None:
-    global CLOSED
-
-    candle = finalize_candle(
-        row,
-        CURRENT_SAMPLES,
-    )
-
-    # Primero se resuelve la prediccion que se hizo con la vela anterior.
-    evaluate_pending(candle)
-
-    CLOSED.append(candle)
-
-    # No recortar CLOSED: conservar todas las velas cerradas de esta sesión.
-
-    # Mensaje individual de la vela cerrada.
-    tg(
-        format_candle_message(candle)
-    )
-
-    # Mostrar todo el historial acumulado, no solo la ventana de 10 velas.
-    # Se divide en bloques para respetar el limite de longitud de Telegram.
-    if len(CLOSED) >= WINDOW:
-        send_full_context(CLOSED)
-        analyze_and_message()
-
-
-# ---------------------------------------------------------------------------
-# LOOP DEL STREAM
-# ---------------------------------------------------------------------------
-
-def process_stream_once() -> None:
-    global CURRENT_START
-    global CURRENT_SAMPLES
-    global LAST_CLOSED_START
-
-    candles = get_stream_candles()
-
-    if not candles:
-        return
-
-    now_start = floor_m1(
-        server_ts()
-    )
-
-    current = next(
-        (
-            c
-            for c in candles
-            if c["from"] == now_start
+    return {
+        "prediction": prediction,
+        "prediction_quality": final_quality,
+        "prediction_direction": (
+            "ALCISTA" if prediction == "CALL"
+            else "BAJISTA" if prediction == "PUT"
+            else "NEUTRAL"
         ),
-        candles[-1],
-    )
+        "prediction_reason": " | ".join(reasons),
+        "intrabar": intrabar,
+    }
 
-    if CURRENT_START is None:
-        CURRENT_START = current["from"]
-        CURRENT_SAMPLES = []
 
-        logger.info(
-            "Inicializado con vela %s; "
-            "esperando cierre.",
-            CURRENT_START,
+def analyze_market(
+    df: Optional[pd.DataFrame] = None,
+    **_: Any,
+) -> Dict[str, Any]:
+    """
+    Punto principal usado por bot.py.
+
+    Importante: la predicción corresponde a la siguiente M1 y se calcula
+    antes de recibir esa vela.
+    """
+    data = df if df is not None else pd.DataFrame()
+    candles = last_10_closed(data)
+    window = summarize_window(data)
+
+    base: Dict[str, Any] = {
+        "signal": None,
+        "blocked": True,
+        "score": 0,
+        "reason": "historial insuficiente",
+        "state": "SIN_HISTORIAL",
+        "state_direction": "NEUTRAL",
+        "state_quality": "BAJA",
+        "evidence": [],
+        "prediction": "NO SIGNAL",
+        "prediction_quality": "BAJA",
+        "prediction_direction": "NEUTRAL",
+        "prediction_reason": "faltan velas cerradas",
+        "analysis_timeframe": "M1",
+        "entry_timeframe": "M1",
+        "target_expiration_minutes": 1,
+        "window": window,
+    }
+
+    if len(candles) < WINDOW:
+        return base
+
+    state = _classify_state(candles)
+    pred = _prediction_from_state(state, candles)
+
+    signal = pred["prediction"]
+    is_signal = signal in {"CALL", "PUT"}
+
+    result = {
+        **base,
+        "signal": signal if is_signal else None,
+        "blocked": not is_signal,
+        "score": int(state["score"]),
+        "reason": pred["prediction_reason"],
+        "state": state["state"],
+        "state_direction": state["direction"],
+        "state_quality": state["quality"],
+        "evidence": state["evidence"],
+        "prediction": signal,
+        "prediction_quality": pred["prediction_quality"],
+        "prediction_direction": pred["prediction_direction"],
+        "prediction_reason": pred["prediction_reason"],
+        "intrabar": pred["intrabar"],
+        "window": window,
+        "current_candle": candles[-1],
+    }
+
+    return result
+
+
+def compare_window_to_next(
+    previous_10: List[Dict[str, Any]],
+    next_candle: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Utilidad de compatibilidad para comparar prediccion y resultado."""
+    if len(previous_10) != WINDOW:
+        return {"ready": False}
+
+    signal = None
+    if previous_10:
+        # No se recalcula con next_candle: solo sirve como comparador.
+        dummy = pd.DataFrame(
+            [
+                {
+                    "from": c.get("timestamp", i),
+                    "open": c["open"],
+                    "high": c["high"],
+                    "low": c["low"],
+                    "close": c["close"],
+                }
+                for i, c in enumerate(previous_10)
+            ]
         )
+        signal = analyze_market(dummy).get("prediction")
 
-        return
+    entry = float(next_candle.get("open", 0.0))
+    close = float(next_candle.get("close", 0.0))
 
-    # Cambio de vela: la anterior acaba de cerrar.
-    if current["from"] != CURRENT_START:
-        previous = next(
-            (
-                c
-                for c in candles
-                if c["from"] == CURRENT_START
-            ),
-            None,
+    if signal == "CALL":
+        outcome = (
+            "FAVORABLE" if close > entry
+            else "DOJI" if close == entry
+            else "CONTRARIA"
         )
-
-        # Fallback con el ultimo snapshot recibido.
-        if previous is None and CURRENT_SAMPLES:
-            last = CURRENT_SAMPLES[-1]
-
-            previous = {
-                "from": CURRENT_START,
-                "open": last["open"],
-                "high": last["high"],
-                "low": last["low"],
-                "close": last["close"],
-            }
-
-        if (
-            previous is not None
-            and LAST_CLOSED_START != CURRENT_START
-        ):
-            process_closed_candle(
-                previous
-            )
-
-            # Ya cambio la M1: este es el punto de entrada de la siguiente vela.
-            execute_demo_entry()
-
-            LAST_CLOSED_START = CURRENT_START
-
-        CURRENT_START = current["from"]
-        CURRENT_SAMPLES = []
-
-    # Snapshot intraminuto.
-    CURRENT_SAMPLES.append(
-        {
-            "ts": int(time.time()),
-            "open": current["open"],
-            "high": current["high"],
-            "low": current["low"],
-            "close": current["close"],
-        }
-    )
-
-
-# ---------------------------------------------------------------------------
-# MAIN
-# ---------------------------------------------------------------------------
-
-def main() -> None:
-    if not all(
-        (
-            IQ_EMAIL,
-            IQ_PASSWORD,
-            TELEGRAM_TOKEN,
-            TELEGRAM_CHAT_ID,
+    elif signal == "PUT":
+        outcome = (
+            "FAVORABLE" if close < entry
+            else "DOJI" if close == entry
+            else "CONTRARIA"
         )
-    ):
-        logger.error(
-            "Faltan IQ_EMAIL, IQ_PASSWORD, "
-            "TELEGRAM_TOKEN o TELEGRAM_CHAT_ID."
-        )
-        return
+    else:
+        outcome = "NO_SIGNAL"
 
-    tg(
-        "🤖 BOT M1 EURUSD INICIANDO\n\n"
-        "Par: EURUSD (mercado no OTC)\n"
-        "Cuenta: PRACTICE únicamente\n"
-        "Operaciones con dinero real: BLOQUEADAS\n"
-        f"Ejecución DEMO: {'ACTIVADA' if DEMO_TRADING_ENABLED else 'DESACTIVADA'}\n\n"
-        "La estrategia reconoce estado, "
-        "contexto, confirmacion y espera "
-        "cuando no existe evidencia suficiente."
-    )
-
-    try:
-        if not connect():
-            return
-
-        if DEMO_TRADING_ENABLED and not configure_demo_account():
-            return
-
-    except Exception as exc:
-        logger.exception(
-            "Conexion: %s",
-            exc,
-        )
-
-        tg(
-            "❌ ERROR DE CONEXION\n\n"
-            f"{type(exc).__name__}: {exc}"
-        )
-
-        return
-
-    while RUNNING:
-        try:
-            if not ensure_connection():
-                time.sleep(2)
-                continue
-
-            if not STREAM_STARTED:
-                if not start_stream():
-                    time.sleep(10)
-                    continue
-
-            process_stream_once()
-
-            time.sleep(
-                POLL_SECONDS
-            )
-
-        except KeyboardInterrupt:
-            break
-
-        except Exception as exc:
-            logger.exception(
-                "Error loop principal: %s",
-                exc,
-            )
-
-            tg(
-                "⚠️ ERROR CONTROLADO\n\n"
-                f"{type(exc).__name__}: {exc}\n\n"
-                "Reintentando."
-            )
-
-            stop_stream()
-            time.sleep(3)
-
-    stop_stream()
+    return {
+        "ready": True,
+        "sequence": " ".join(
+            "V" if c.get("color") == "VERDE"
+            else "R" if c.get("color") == "ROJA"
+            else "D"
+            for c in previous_10
+        ),
+        "prediction": signal or "NO SIGNAL",
+        "next_color": next_candle.get("color"),
+        "next_open": next_candle.get("open"),
+        "next_close": next_candle.get("close"),
+        "next_high": next_candle.get("high"),
+        "next_low": next_candle.get("low"),
+        "outcome": outcome,
+    }
 
 
-if __name__ == "__main__":
-    main()
+def get_signal(df: pd.DataFrame) -> Optional[str]:
+    return analyze_market(df).get("signal")
+
+
+def signal(df: pd.DataFrame) -> Optional[str]:
+    return get_signal(df)
