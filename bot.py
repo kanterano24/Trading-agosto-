@@ -8,15 +8,13 @@ from iqoptionapi.stable_api import IQ_Option
 import iqoptionapi.constants as OP_code
 from strategy import M1, WINDOW, analyze_market
 
-# Este bot opera únicamente en Binary OTC. Algunas versiones de iqoptionapi
-# inician un hilo digital durante connect(); si el servidor devuelve None,
-# ese hilo falla con: NoneType is not subscriptable. Desactivamos solo ese
-# sondeo interno de Digital, que aquí no se utiliza.
-def _disable_unused_digital_poll(self, *args, **kwargs):
-    return None
-
-if hasattr(IQ_Option, "_get_digital_open"):
-    IQ_Option._get_digital_open = _disable_unused_digital_poll
+# Este bot utiliza únicamente Binary OTC. Sobrescribimos el método en una
+# subclase antes de conectar para que, si la biblioteca crea el hilo digital,
+# su función objetivo no consulte la respuesta Digital que puede llegar como None.
+class OTCOnlyIQOption(IQ_Option):
+    def _get_digital_open(self, *args, **kwargs):
+        log.info("Sondeo interno Digital desactivado: este bot solo usa Binary OTC.")
+        return None
 
 IQ_EMAIL=os.getenv('IQ_EMAIL'); IQ_PASSWORD=os.getenv('IQ_PASSWORD')
 TELEGRAM_TOKEN=os.getenv('TELEGRAM_TOKEN'); TELEGRAM_CHAT_ID=os.getenv('TELEGRAM_CHAT_ID')
@@ -100,8 +98,17 @@ def telegram_control_loop() -> None:
                 else:
                     tg_control_panel(chat_id, reply)
                 log.info("Control Telegram: %s",reply.replace("\n"," | "))
+        except requests.exceptions.HTTPError as e:
+            status = getattr(getattr(e, "response", None), "status_code", None)
+            if status == 409:
+                log.error("Telegram 409 Conflict: otro proceso está usando getUpdates con este token. "
+                          "Deja una sola instancia activa en Railway y detén otros pollers.")
+                time.sleep(15)
+            else:
+                log.warning("Telegram polling HTTP: %s", e)
+                time.sleep(5)
         except Exception as e:
-            log.warning("Telegram polling: %s",e); time.sleep(3)
+            log.warning("Telegram polling: %s",e); time.sleep(5)
 
 
 def canonical(name:str)->str:
@@ -145,7 +152,12 @@ def refresh_pairs(force=False)->None:
     if not force and now-last_refresh<REFRESH_SECONDS: return
     catalog=active_catalog(); opened=binary_open_names()
     # Only OTC names present in the live binary catalog and marked open.
-    new=sorted(p for p in catalog if p.endswith('-OTC') and p in opened)
+    otc_names={p for p in catalog if p.endswith('-OTC')}
+    new=sorted(p for p in otc_names if p in opened)
+    if not new:
+        log.warning("Catálogo sin coincidencias OTC: activos OTC=%d, abiertos Binary=%d. "
+                    "Muestras activos=%s | abiertos=%s",
+                    len(otc_names), len(opened), sorted(otc_names)[:8], sorted(opened)[:8])
     removed=set(PAIRS)-set(new)
     for p in removed: last_candle.pop(p,None); last_signal_candle.pop(p,None)
     PAIRS=new; excluded_until_refresh.clear(); last_refresh=now
@@ -234,7 +246,7 @@ def main()->None:
         log.error('Credenciales detectadas después del arranque. Reinicia el servicio para iniciar la conexión.')
         return
     try:
-        IQ=IQ_Option(IQ_EMAIL,IQ_PASSWORD); ok,reason=IQ.connect()
+        IQ=OTCOnlyIQOption(IQ_EMAIL,IQ_PASSWORD); log.info('Conectando con cliente OTC-only...'); ok,reason=IQ.connect()
         if not ok:raise ConnectionError(reason)
         if not configure_demo():return
         threading.Thread(target=telegram_control_loop,daemon=True,name='telegram-control').start()
