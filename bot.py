@@ -8,6 +8,16 @@ from iqoptionapi.stable_api import IQ_Option
 import iqoptionapi.constants as OP_code
 from strategy import M1, WINDOW, analyze_market
 
+# Este bot opera únicamente en Binary OTC. Algunas versiones de iqoptionapi
+# inician un hilo digital durante connect(); si el servidor devuelve None,
+# ese hilo falla con: NoneType is not subscriptable. Desactivamos solo ese
+# sondeo interno de Digital, que aquí no se utiliza.
+def _disable_unused_digital_poll(self, *args, **kwargs):
+    return None
+
+if hasattr(IQ_Option, "_get_digital_open"):
+    IQ_Option._get_digital_open = _disable_unused_digital_poll
+
 IQ_EMAIL=os.getenv('IQ_EMAIL'); IQ_PASSWORD=os.getenv('IQ_PASSWORD')
 TELEGRAM_TOKEN=os.getenv('TELEGRAM_TOKEN'); TELEGRAM_CHAT_ID=os.getenv('TELEGRAM_CHAT_ID')
 REFRESH_SECONDS=max(60,int(os.getenv('CATALOG_REFRESH_SECONDS','600')))
