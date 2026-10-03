@@ -1,146 +1,137 @@
-"""Recolector de 200 velas M1 GBPUSD-OTC. No ejecuta operaciones."""
+"""bot.py: al iniciar el servicio, recopila 200 velas cerradas M1 de GBPUSD-OTC
+y envía el historial detallado a Telegram. No abre operaciones.
+"""
 import logging
 import os
 import time
 import requests
 from iqoptionapi.stable_api import IQ_Option
-from strategy import normalize_candles, describe_history
-from datetime import datetime, timezone
+from strategy import normalize_candles, describe_history, format_candle
 
-def format_candle(index, candle):
-    # Formatter local: evita depender de que strategy.py lo exporte.
-    o, h, l, c = (float(candle[k]) for k in ('open', 'high', 'low', 'close'))
-    span = max(h - l, 0.0)
-    body_pct = abs(c - o) / span * 100 if span else 0.0
-    upper = max(0.0, h - max(o, c))
-    lower = max(0.0, min(o, c) - l)
-    color = 'VERDE' if c > o else 'ROJA' if c < o else 'DOJI'
-    dt = datetime.fromtimestamp(int(candle['timestamp']), tz=timezone.utc)
-    return (f'{index:03d} | {dt:%Y-%m-%d %H:%M:%S} | {color} | '
-            f'{o:.6f} | {h:.6f} | {l:.6f} | {c:.6f} | '
-            f'{body_pct:.1f}% | {upper:.6f} | {lower:.6f}')
-
+PAIR = os.getenv("ANALYSIS_PAIR", "GBPUSD-OTC").strip().upper()
 TIMEFRAME = 60
-CANDLE_COUNT = max(200, int(os.getenv("CANDLE_COUNT_M1", "200")))
-POLL_SECONDS = max(5, float(os.getenv("POLL_SECONDS", "30")))
-BATCH_SIZE = max(1, int(os.getenv("TELEGRAM_BATCH_SIZE", "15")))
-PAIR = os.getenv("ANALYSIS_PAIR", "GBPUSD-OTC").upper()
-ACCOUNT_TYPE = os.getenv("ACCOUNT_TYPE", "PRACTICE").upper()
-IQ_EMAIL, IQ_PASSWORD = os.getenv("IQ_EMAIL", ""), os.getenv("IQ_PASSWORD", "")
-TG_TOKEN, TG_CHAT = os.getenv("TELEGRAM_TOKEN", ""), os.getenv("TELEGRAM_CHAT_ID", "")
+TARGET = max(200, int(os.getenv("CANDLE_COUNT_M1", "200")))
+RETRY_SECONDS = max(5, int(os.getenv("RETRY_SECONDS", "20")))
+IQ_EMAIL = os.getenv("IQ_EMAIL", "")
+IQ_PASSWORD = os.getenv("IQ_PASSWORD", "")
+TG_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
+TG_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 
 
-def telegram_send(message):
-    if not TG_TOKEN or not TG_CHAT:
-        logging.error("Faltan TELEGRAM_TOKEN o TELEGRAM_CHAT_ID")
-        return False
-    try:
-        r = requests.post(f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
-                          data={"chat_id": TG_CHAT, "text": message,
-                                "disable_web_page_preview": True}, timeout=20)
-        r.raise_for_status()
-        return bool(r.json().get("ok"))
-    except requests.RequestException:
-        logging.exception("Error de Telegram")
-        return False
+def telegram_send(text):
+    if not TG_TOKEN or not TG_CHAT_ID:
+        raise RuntimeError("Faltan TELEGRAM_TOKEN o TELEGRAM_CHAT_ID en las variables de Railway.")
+    url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
+    response = requests.post(
+        url, data={"chat_id": TG_CHAT_ID, "text": text, "disable_web_page_preview": True},
+        timeout=25
+    )
+    response.raise_for_status()
+    result = response.json()
+    if not result.get("ok"):
+        raise RuntimeError(f"Telegram rechazó el mensaje: {result}")
+    return True
 
 
-def connect_iq():
+def connect():
     if not IQ_EMAIL or not IQ_PASSWORD:
-        raise RuntimeError("Configura IQ_EMAIL e IQ_PASSWORD")
+        raise RuntimeError("Faltan IQ_EMAIL o IQ_PASSWORD.")
     iq = IQ_Option(IQ_EMAIL, IQ_PASSWORD)
-
-    # Evita el fallo de la consulta digital interna de la librería:
-    # el recolector no utiliza ese mercado y el método original puede devolver None.
-    iq.get_digital_underlying_list_data = lambda: {"underlying": []}
-
-    ok, reason = iq.connect()
-    if not ok:
-        raise RuntimeError(f"Conexión fallida: {reason}")
-    if ACCOUNT_TYPE in ("PRACTICE", "REAL"):
-        try:
-            iq.change_balance(ACCOUNT_TYPE)
-        except Exception:
-            logging.exception("No se pudo cambiar la cuenta")
-    logging.info("Conectado a IQ Option")
+    connected, reason = iq.connect()
+    if not connected:
+        raise RuntimeError(f"No se pudo conectar a IQ Option: {reason}")
+    logging.info("Conectado a IQ Option.")
     return iq
 
 
-def server_time(iq):
+def get_server_time(iq):
     try:
         return int(iq.get_server_timestamp())
     except Exception:
         return int(time.time())
 
 
-def is_pair_open(iq):
-    try:
-        data = iq.get_all_open_time() or {}
-        info = (data.get("binary") or {}).get(PAIR)
-        return isinstance(info, dict) and info.get("open") is True
-    except Exception:
-        logging.exception("No se pudo consultar apertura de par")
-        return False
-
-
-def get_closed_candles(iq):
-    now = server_time(iq)
-    raw = iq.get_candles(PAIR, TIMEFRAME, CANDLE_COUNT + 10, now) or []
-    minute_start = now - now % TIMEFRAME
+def get_closed_history(iq):
+    # Consultamos directamente el activo solicitado. No usamos get_all_open_time(),
+    # que en algunas versiones dispara consultas digitales que fallan con None.
+    now = get_server_time(iq)
+    raw = iq.get_candles(PAIR, TIMEFRAME, TARGET + 15, now) or []
+    current_minute = now - now % TIMEFRAME
     closed = []
-    for c in raw:
+    for candle in raw:
         try:
-            start = int(c.get("from", c.get("at", 0)))
-            if start > 0 and start + TIMEFRAME <= minute_start:
-                closed.append(c)
+            start = int(candle.get("from", candle.get("at", 0)))
+            if start > 0 and start + TIMEFRAME <= current_minute:
+                closed.append(candle)
         except (TypeError, ValueError):
-            pass
-    return normalize_candles(closed)[-CANDLE_COUNT:]
+            continue
+    return normalize_candles(closed)[-TARGET:]
 
 
-def send_history(candles):
-    info = describe_history(candles)
-    telegram_send(
-        f"📊 HISTORIAL M1 | {PAIR}\nVelas: {info['count']}/{CANDLE_COUNT}\n"
-        f"Verdes: {info['greens']} | Rojas: {info['reds']} | Doji: {info['dojis']}\n"
-        f"Máximo: {info['highest']} | Mínimo: {info['lowest']}\n"
-        f"Cambio neto: {info['net_change']:+.6f}\n"
-        "Solo recopilación; no se ejecutan operaciones."
+def split_messages(items, max_chars=3600):
+    """Agrupa velas sin exceder el límite práctico de Telegram."""
+    batches, current = [], []
+    for item in items:
+        candidate = "\n\n".join(current + [item])
+        if current and len(candidate) > max_chars:
+            batches.append("\n\n".join(current))
+            current = [item]
+        else:
+            current.append(item)
+    if current:
+        batches.append("\n\n".join(current))
+    return batches
+
+
+def send_full_history(candles):
+    report = describe_history(candles)
+    header = (
+        f"📊 HISTORIAL COMPLETO M1 | {PAIR}\n"
+        f"Velas cerradas: {report['count']}/{TARGET}\n"
+        f"Verdes: {report['greens']} | Rojas: {report['reds']} | Doji: {report['dojis']}\n"
+        f"Máximo del bloque: {report['highest']}\n"
+        f"Mínimo del bloque: {report['lowest']}\n"
+        f"Cambio neto: {report['net_change']:+.6f}\n"
+        "Cada vela incluye OHLC, rango, cuerpo, ambas mechas y posición del cierre.\n"
+        "Solo recopilación: operaciones desactivadas."
     )
-    lines = [format_candle(i, c) for i, c in enumerate(candles, 1)]
-    for start in range(0, len(lines), BATCH_SIZE):
-        batch = lines[start:start + BATCH_SIZE]
-        end = start + len(batch)
-        msg = (f"HISTORIAL M1 | Velas {start+1}-{end} de {len(lines)}\n"
-               f"Par: {PAIR}\nN | Hora UTC | Color | Open | High | Low | Close | "
-               f"Cuerpo% | Mecha sup | Mecha inf\n" + "\n".join(batch))
-        telegram_send(msg)
-        time.sleep(0.5)
+    telegram_send(header)
+
+    details = [format_candle(i, candle) for i, candle in enumerate(candles, 1)]
+    batches = split_messages(details)
+    total = len(batches)
+    for n, batch in enumerate(batches, 1):
+        telegram_send(f"🕯️ {PAIR} | Bloque {n}/{total}\n\n{batch}")
+        time.sleep(0.4)
+    logging.info("Enviadas %d velas en %d mensajes.", len(candles), total)
 
 
 def main():
-    iq = connect_iq()
-    telegram_send(f"🟡 Recolector M1 iniciado\nPar: {PAIR}\nObjetivo: {CANDLE_COUNT} velas cerradas")
+    iq = connect()
+    telegram_send(
+        f"🟡 Recolector iniciado al arrancar el servicio\n"
+        f"Par solicitado: {PAIR}\nTemporalidad: M1\nObjetivo: {TARGET} velas cerradas\n"
+        "Esperando datos; no se ejecutan operaciones."
+    )
+
     while True:
         try:
-            if not is_pair_open(iq):
-                logging.info("%s no figura abierto en binary; reintento.", PAIR)
-                time.sleep(POLL_SECONDS)
-                continue
-            candles = get_closed_candles(iq)
-            logging.info("Velas cerradas de %s: %d", PAIR, len(candles))
-            if len(candles) < CANDLE_COUNT:
-                time.sleep(POLL_SECONDS)
-                continue
-            send_history(candles)
-            logging.info("Historial enviado.")
-            break
+            candles = get_closed_history(iq)
+            logging.info("Velas cerradas recibidas para %s: %d/%d", PAIR, len(candles), TARGET)
+            if len(candles) >= TARGET:
+                send_full_history(candles)
+                logging.info("Historial completo enviado a Telegram.")
+                return
+            logging.warning("Aún no hay suficientes velas. Se reintentará.")
         except Exception as exc:
-            logging.exception("Error recopilando velas")
-            telegram_send(f"⚠️ Error del recolector: {exc}")
-            time.sleep(POLL_SECONDS)
+            logging.exception("Fallo al recopilar/enviar historial.")
+            try:
+                telegram_send(f"⚠️ {PAIR}: error al obtener/enviar historial: {exc}")
+            except Exception:
+                logging.exception("También falló el aviso por Telegram.")
+        time.sleep(RETRY_SECONDS)
 
 
 if __name__ == "__main__":
