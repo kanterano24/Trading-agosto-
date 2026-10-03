@@ -62,8 +62,8 @@ def analyze_market(data, pair=None, mode="M1_M1"):
     direction = "call" if close > opening else "put" if close < opening else None
     force_candle = body_ratio >= IMPULSE_BODY_RATIO
 
-    broke_high = high > previous_high
-    broke_low = low < previous_low
+    broke_high = close > previous_high
+    broke_low = close < previous_low
 
     signal = None
     reason = "Sin ruptura direccional con vela de fuerza"
@@ -72,13 +72,13 @@ def analyze_market(data, pair=None, mode="M1_M1"):
         signal = "call"
         reason = (
             f"CALL | vela alcista fuerte ({body_ratio:.2f} del rango) "
-            "y ruptura del máximo anterior"
+            "y cierre por encima del máximo anterior"
         )
     elif force_candle and direction == "put" and broke_low:
         signal = "put"
         reason = (
             f"PUT | vela bajista fuerte ({body_ratio:.2f} del rango) "
-            "y ruptura del mínimo anterior"
+            "y cierre por debajo del mínimo anterior"
         )
 
     confirmed = signal in ("call", "put")
