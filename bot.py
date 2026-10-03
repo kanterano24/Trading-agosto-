@@ -38,6 +38,8 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 M1 = 60
 EXPIRATION = 1
+MAX_TRADES_PER_MINUTE = max(1, int(os.getenv("MAX_TRADES_PER_MINUTE", "3")))
+ENTRY_MAX_SECOND = max(1.0, min(59.0, float(os.getenv("ENTRY_MAX_SECOND", "12"))))
 AMOUNT = float(os.getenv("AMOUNT", "1300"))
 MAX_PAIRS = max(1, int(os.getenv("MAX_OTC_PAIRS", "30")))
 CANDLE_COUNT_M1 = max(10, int(os.getenv("CANDLE_COUNT_M1", "120")))
@@ -56,6 +58,8 @@ STREAM_STARTED = set()
 STREAM_CACHE = {}
 TRADED_CANDLE = {}
 LAST_DIRECTION = {}
+TRADE_MINUTE_BUCKET = None
+TRADES_IN_MINUTE = 0
 STATE_LOCK = threading.RLock()
 
 logging.basicConfig(
@@ -139,7 +143,7 @@ def telegram_loop():
                         f"📊 ESTADO: {'🟢 ACTIVO' if running else '🔴 DETENIDO'}\n"
                         f"OTC: {pair_count}\n"
                         f"Importe: {AMOUNT:g}\n"
-                        "Expiración: 1 minuto\n"
+                        f"Expiración: 1 minuto\nMáximo: {MAX_TRADES_PER_MINUTE} operaciones/min\n"
                         f"Alternancia: {'ACTIVA' if ENFORCE_ALTERNATION else 'DESACTIVADA'}"
                     )
 
@@ -225,7 +229,7 @@ def connect():
     tg(
         f"🟢 IQ OPTION CONECTADO\n"
         f"M1 | Fuerza + ruptura\nOTC: {len(PAIRS)}\n"
-        "Expiración: 1 minuto."
+        f"Expiración: 1 minuto. Máximo {MAX_TRADES_PER_MINUTE} operaciones/min; ventana de entrada: {ENTRY_MAX_SECOND:.0f}s."
     )
 
 
@@ -314,10 +318,12 @@ def analyze_live_pair(pair):
 
     candle_ts = floor_ts(server_ts())
     context = data[data["from"] <= candle_ts].copy()
-    if context.empty or int(context.iloc[-1]["from"]) != candle_ts:
+    if context.empty or int(context.iloc[-1]["from"]) != candle_ts or len(context) < 3:
         return None
 
-    result = analyze_market(context, pair=pair, mode="M1_M1")
+    # Use only closed candles for the signal; current candle is reserved for execution.
+    closed_context = context.iloc[:-1].copy()
+    result = analyze_market(closed_context, pair=pair, mode="M1_M1")
     signal = result.get("signal")
     if (
         signal not in ("call", "put")
@@ -356,25 +362,41 @@ def buy(candidate):
 
 
 def execute(candidate):
+    global TRADE_MINUTE_BUCKET, TRADES_IN_MINUTE
     pair = candidate["pair"]
     signal = candidate["signal"]
     candle_ts = int(candidate["candle_ts"])
 
     with STATE_LOCK:
-        if TRADED_CANDLE.get(pair) == candle_ts:
+        now_server = server_ts()
+        current_bucket = floor_ts(now_server)
+        elapsed = now_server - candle_ts
+
+        # Do not chase an entry after the opening window has passed.
+        if current_bucket != candle_ts or elapsed < 0 or elapsed > ENTRY_MAX_SECOND:
             return False
-        if floor_ts(server_ts()) != candle_ts:
+        if TRADED_CANDLE.get(pair) == candle_ts:
             return False
         if ENFORCE_ALTERNATION and LAST_DIRECTION.get(pair) == signal:
             return False
-        # Reservar la vela evita órdenes duplicadas si el ciclo vuelve a entrar.
+
+        if TRADE_MINUTE_BUCKET != current_bucket:
+            TRADE_MINUTE_BUCKET = current_bucket
+            TRADES_IN_MINUTE = 0
+        if TRADES_IN_MINUTE >= MAX_TRADES_PER_MINUTE:
+            return False
+
+        # Reserve both the pair/candle and one global slot before sending the order.
         TRADED_CANDLE[pair] = candle_ts
+        TRADES_IN_MINUTE += 1
 
     ok, order_id = buy(candidate)
     if not ok:
         with STATE_LOCK:
             if TRADED_CANDLE.get(pair) == candle_ts:
                 TRADED_CANDLE.pop(pair, None)
+            if TRADE_MINUTE_BUCKET == candle_ts and TRADES_IN_MINUTE > 0:
+                TRADES_IN_MINUTE -= 1
         return False
 
     with STATE_LOCK:
