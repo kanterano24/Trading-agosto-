@@ -4,7 +4,21 @@ import os
 import time
 import requests
 from iqoptionapi.stable_api import IQ_Option
-from strategy import normalize_candles, describe_history, format_candle
+from strategy import normalize_candles, describe_history
+from datetime import datetime, timezone
+
+def format_candle(index, candle):
+    # Formatter local: evita depender de que strategy.py lo exporte.
+    o, h, l, c = (float(candle[k]) for k in ('open', 'high', 'low', 'close'))
+    span = max(h - l, 0.0)
+    body_pct = abs(c - o) / span * 100 if span else 0.0
+    upper = max(0.0, h - max(o, c))
+    lower = max(0.0, min(o, c) - l)
+    color = 'VERDE' if c > o else 'ROJA' if c < o else 'DOJI'
+    dt = datetime.fromtimestamp(int(candle['timestamp']), tz=timezone.utc)
+    return (f'{index:03d} | {dt:%Y-%m-%d %H:%M:%S} | {color} | '
+            f'{o:.6f} | {h:.6f} | {l:.6f} | {c:.6f} | '
+            f'{body_pct:.1f}% | {upper:.6f} | {lower:.6f}')
 
 TIMEFRAME = 60
 CANDLE_COUNT = max(200, int(os.getenv("CANDLE_COUNT_M1", "200")))
