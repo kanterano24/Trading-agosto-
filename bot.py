@@ -138,8 +138,20 @@ def place_binary(iq,pair,direction):
     iq.change_balance("PRACTICE")
     return iq.buy(AMOUNT,pair,direction.lower(),EXPIRATION_MINUTES)
 
+def connect_with_retry():
+    """Reintenta la conexión inicial ante fallos temporales."""
+    delay = 5
+    while True:
+        try:
+            return connect_iq()
+        except Exception as exc:
+            logging.exception("No se pudo conectar al iniciar: %s", exc)
+            telegram_send(f"⚠️ Error de conexión: {type(exc).__name__}: {exc}. Reintento automático.")
+            time.sleep(delay)
+            delay = min(delay * 2, 60)
+
 def main():
-    iq=connect_iq()
+    iq=connect_with_retry()
     pairs=[]
     last_refresh=0.0
     last_seen={}
@@ -209,8 +221,7 @@ def main():
             try:
                 if not iq.check_connect():
                     logging.warning("Reconectando IQ Option...")
-                    iq.connect()
-                    iq.change_balance("PRACTICE")
+                    iq = connect_with_retry()
             except Exception:
                 logging.exception("No se pudo reconectar.")
             time.sleep(3)
