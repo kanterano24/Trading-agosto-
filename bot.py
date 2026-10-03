@@ -38,10 +38,8 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 M1 = 60
 EXPIRATION = 1
-MAX_TRADES_PER_MINUTE = max(1, int(os.getenv("MAX_TRADES_PER_MINUTE", "3")))
-ENTRY_MAX_SECOND = max(1.0, min(59.0, float(os.getenv("ENTRY_MAX_SECOND", "12"))))
 AMOUNT = float(os.getenv("AMOUNT", "1300"))
-MAX_PAIRS = max(1, int(os.getenv("MAX_OTC_PAIRS", "30")))
+MAX_PAIRS = max(1, int(os.getenv("MAX_OTC_PAIRS", "3")))
 CANDLE_COUNT_M1 = max(10, int(os.getenv("CANDLE_COUNT_M1", "120")))
 PAIR_REFRESH_SECONDS = max(60.0, float(os.getenv("PAIR_REFRESH_SECONDS", "600")))
 WORKERS = max(1, int(os.getenv("ANALYSIS_WORKERS", "5")))
@@ -53,13 +51,14 @@ ENFORCE_ALTERNATION = os.getenv("ENFORCE_ALTERNATION", "1").strip().lower() not 
 PAIRS = []
 LAST_REFRESH = 0.0
 IQ: Optional[IQ_Option] = None
-BOT_RUNNING = False
+BOT_RUNNING = os.getenv("AUTO_START", "1").strip().lower() not in ("0", "false", "no", "off")
+ACCOUNT_MODE = "PRACTICE"  # Fijado: nunca usar REAL
+MAX_ENTRY_DELAY = max(1.0, float(os.getenv("MAX_ENTRY_DELAY_SECONDS", "5")))
+LAST_SIGNAL_CANDLE = {}
 STREAM_STARTED = set()
 STREAM_CACHE = {}
 TRADED_CANDLE = {}
 LAST_DIRECTION = {}
-TRADE_MINUTE_BUCKET = None
-TRADES_IN_MINUTE = 0
 STATE_LOCK = threading.RLock()
 
 logging.basicConfig(
@@ -126,9 +125,10 @@ def telegram_loop():
                         BOT_RUNNING = True
                     tg(
                         "🟢 BOT ACTIVADO\n\n"
-                        "M1 | VELA DE FUERZA + RUPTURA\n"
-                        "CALL = vela alcista fuerte + ruptura del máximo anterior\n"
-                        "PUT = vela bajista fuerte + ruptura del mínimo anterior\n"
+                        "Cuenta: PRACTICE (demo)\n"
+                        "Estrategia CI M1: cruce 61.8/38.2 + color de vela\n"
+                        "CALL: cruce arriba 61.8 con vela roja\n"
+                        "PUT: cruce abajo 38.2 con vela verde\n"
                         "Expiración: 1 minuto."
                     )
                 elif command == "/stop":
@@ -142,8 +142,9 @@ def telegram_loop():
                     tg(
                         f"📊 ESTADO: {'🟢 ACTIVO' if running else '🔴 DETENIDO'}\n"
                         f"OTC: {pair_count}\n"
-                        f"Importe: {AMOUNT:g}\n"
-                        f"Expiración: 1 minuto\nMáximo: {MAX_TRADES_PER_MINUTE} operaciones/min\n"
+                        f"Importe demo: {AMOUNT:g}\n"
+                        "Cuenta: PRACTICE\n"
+                        "Expiración: 1 minuto\n"
                         f"Alternancia: {'ACTIVA' if ENFORCE_ALTERNATION else 'DESACTIVADA'}"
                     )
 
@@ -219,18 +220,37 @@ def floor_ts(ts):
     return int(ts // M1) * M1
 
 
+def select_practice_account():
+    """Fuerza la cuenta demo y falla de forma segura si no puede seleccionarla."""
+    if IQ is None:
+        return False
+    try:
+        changed = IQ.change_balance("PRACTICE")
+        time.sleep(0.4)
+        getter = getattr(IQ, "get_balance_mode", None)
+        mode = getter() if callable(getter) else None
+        if mode is not None and str(mode).strip().upper() != "PRACTICE":
+            logger.error("Modo de cuenta inesperado: %r", mode)
+            return False
+        if changed is False:
+            return False
+        logger.info("Cuenta seleccionada: PRACTICE (demo)")
+        return True
+    except Exception as exc:
+        logger.error("No se pudo seleccionar PRACTICE: %s", exc)
+        return False
+
+
 def connect():
     global IQ
     IQ = IQ_Option(IQ_EMAIL, IQ_PASSWORD)
     ok, reason = IQ.connect()
     if not ok:
         raise ConnectionError(reason)
+    if not select_practice_account():
+        raise RuntimeError("No se confirmó PRACTICE; se bloquea el inicio por seguridad.")
     refresh_pairs(True)
-    tg(
-        f"🟢 IQ OPTION CONECTADO\n"
-        f"M1 | Fuerza + ruptura\nOTC: {len(PAIRS)}\n"
-        f"Expiración: 1 minuto. Máximo {MAX_TRADES_PER_MINUTE} operaciones/min; ventana de entrada: {ENTRY_MAX_SECOND:.0f}s."
-    )
+    tg(f"🟢 IQ OPTION CONECTADO\nCuenta: PRACTICE (demo)\nCI M1 | OTC: {len(PAIRS)}\nExpiración: 1 minuto.\nBot: {'ACTIVO' if BOT_RUNNING else 'PAUSADO'}")
 
 
 def ensure_connection():
@@ -246,10 +266,13 @@ def ensure_connection():
         result = IQ.connect()
         ok = bool(result[0]) if isinstance(result, tuple) else bool(result)
         if ok:
+            if not select_practice_account():
+                logger.error("Reconexión sin PRACTICE confirmado; operaciones bloqueadas.")
+                return False
             with STATE_LOCK:
                 STREAM_STARTED.clear()
                 STREAM_CACHE.clear()
-            logger.info("Conexión IQ Option restablecida.")
+            logger.info("Conexión IQ Option restablecida en PRACTICE.")
             return True
     except Exception as exc:
         logger.warning("Reconexión IQ Option: %s", exc)
@@ -313,40 +336,58 @@ def read_stream(pair):
 
 def analyze_live_pair(pair):
     data = read_stream(pair)
-    if data is None or len(data) < 2:
+    if data is None or data.empty:
+        logger.info("%s | esperando datos del stream", pair)
         return None
 
-    candle_ts = floor_ts(server_ts())
-    context = data[data["from"] <= candle_ts].copy()
-    if context.empty or int(context.iloc[-1]["from"]) != candle_ts or len(context) < 3:
+    now = server_ts()
+    current_open_ts = floor_ts(now)
+    # La estrategia recibe exclusivamente velas que ya completaron sus 60 segundos.
+    closed = data[data["from"] + M1 <= now].copy().reset_index(drop=True)
+    if len(closed) < 30:
+        logger.info("%s | velas cerradas insuficientes: %d/30", pair, len(closed))
         return None
 
-    # Use only closed candles for the signal; current candle is reserved for execution.
-    closed_context = context.iloc[:-1].copy()
-    result = analyze_market(closed_context, pair=pair, mode="M1_M1")
+    result = analyze_market(closed, pair=pair, mode="M1_M1")
     signal = result.get("signal")
-    if (
-        signal not in ("call", "put")
-        or not result.get("force_candle")
-        or not result.get("price_action_confirmed")
-    ):
+    details = result.get("analysis", {})
+    source_ts = result.get("candle_timestamp") or details.get("signal_candle_from")
+    if signal not in ("call", "put"):
+        last_closed_ts = int(closed.iloc[-1]["from"])
+        with STATE_LOCK:
+            first_log = LAST_SIGNAL_CANDLE.get((pair, "no_signal")) != last_closed_ts
+            if first_log:
+                LAST_SIGNAL_CANDLE[(pair, "no_signal")] = last_closed_ts
+        if first_log:
+            logger.info("%s | sin señal | %s", pair, result.get("reason", "sin señal"))
+        return None
+
+    source_ts = int(source_ts if source_ts is not None else closed.iloc[-1]["from"])
+    # Una señal de la vela N se ejecuta solo al abrir N+1, nunca más tarde.
+    if source_ts + M1 != current_open_ts:
+        return None
+    delay = now - current_open_ts
+    if delay > MAX_ENTRY_DELAY:
+        logger.info("%s | señal %s omitida por tardía: %.2fs", pair, signal.upper(), delay)
         return None
 
     with STATE_LOCK:
-        if ENFORCE_ALTERNATION and LAST_DIRECTION.get(pair) == signal:
+        if LAST_SIGNAL_CANDLE.get(pair) == source_ts:
             return None
+        if ENFORCE_ALTERNATION and LAST_DIRECTION.get(pair) == signal:
+            logger.info("%s | señal bloqueada por alternancia: %s", pair, signal.upper())
+            return None
+        LAST_SIGNAL_CANDLE[pair] = source_ts
 
-    return {
-        "pair": pair,
-        "signal": signal,
-        "reason": result.get("reason", "Fuerza y ruptura M1"),
-        "candle_ts": candle_ts,
-        "analysis": result.get("analysis", {}),
-    }
+    return {"pair": pair, "signal": signal, "reason": result.get("reason", "Cruce CI confirmado"),
+            "candle_ts": current_open_ts, "source_ts": source_ts, "analysis": details}
 
 
 def buy(candidate):
     try:
+        if IQ is None or not IQ.check_connect() or not select_practice_account():
+            logger.error("Orden bloqueada: no se confirmó conexión/cuenta PRACTICE.")
+            return False, None
         result = IQ.buy(
             AMOUNT,
             candidate["pair"],
@@ -362,41 +403,26 @@ def buy(candidate):
 
 
 def execute(candidate):
-    global TRADE_MINUTE_BUCKET, TRADES_IN_MINUTE
     pair = candidate["pair"]
     signal = candidate["signal"]
     candle_ts = int(candidate["candle_ts"])
 
     with STATE_LOCK:
-        now_server = server_ts()
-        current_bucket = floor_ts(now_server)
-        elapsed = now_server - candle_ts
-
-        # Do not chase an entry after the opening window has passed.
-        if current_bucket != candle_ts or elapsed < 0 or elapsed > ENTRY_MAX_SECOND:
-            return False
         if TRADED_CANDLE.get(pair) == candle_ts:
+            return False
+        now = server_ts()
+        if floor_ts(now) != candle_ts or now - candle_ts > MAX_ENTRY_DELAY:
             return False
         if ENFORCE_ALTERNATION and LAST_DIRECTION.get(pair) == signal:
             return False
-
-        if TRADE_MINUTE_BUCKET != current_bucket:
-            TRADE_MINUTE_BUCKET = current_bucket
-            TRADES_IN_MINUTE = 0
-        if TRADES_IN_MINUTE >= MAX_TRADES_PER_MINUTE:
-            return False
-
-        # Reserve both the pair/candle and one global slot before sending the order.
+        # Reservar la vela evita órdenes duplicadas si el ciclo vuelve a entrar.
         TRADED_CANDLE[pair] = candle_ts
-        TRADES_IN_MINUTE += 1
 
     ok, order_id = buy(candidate)
     if not ok:
         with STATE_LOCK:
             if TRADED_CANDLE.get(pair) == candle_ts:
                 TRADED_CANDLE.pop(pair, None)
-            if TRADE_MINUTE_BUCKET == candle_ts and TRADES_IN_MINUTE > 0:
-                TRADES_IN_MINUTE -= 1
         return False
 
     with STATE_LOCK:
@@ -408,7 +434,7 @@ def execute(candidate):
         pair, signal.upper(), inside, order_id, candidate["reason"]
     )
     tg(
-        f"⚡ ENTRADA EJECUTADA\nPar: {pair}\n"
+        f"⚡ ENTRADA DEMO EJECUTADA\nCuenta: PRACTICE\nPar: {pair}\n"
         f"Dirección: {signal.upper()}\nM1\n"
         f"Entrada dentro de vela: {inside:.2f}s\n"
         f"Expiración: 1 minuto\nRazón: {candidate['reason']}\nID: {order_id}"
