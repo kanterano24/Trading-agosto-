@@ -18,6 +18,7 @@ CANDLE_COUNT = max(200, int(os.getenv("CANDLE_COUNT_M1", "200")))
 POLL_SECONDS = float(os.getenv("POLL_SECONDS", "60"))
 BATCH_SIZE = max(1, int(os.getenv("TELEGRAM_BATCH_SIZE", "20")))
 ACCOUNT_TYPE = os.getenv("ACCOUNT_TYPE", "PRACTICE").upper()
+PAIR = os.getenv("ANALYSIS_PAIR", "GBPUSD-OTC").upper()
 
 IQ_EMAIL = os.getenv("IQ_EMAIL", "")
 IQ_PASSWORD = os.getenv("IQ_PASSWORD", "")
@@ -253,22 +254,24 @@ def send_history(pair, candles):
 def main():
     iq = connect_iq()
     telegram_send(
-        "🤖 Recopilador M1 iniciado. Buscará un par OTC abierto, "
-        f"recopilará hasta {CANDLE_COUNT} velas cerradas y enviará el historial. "
+        f"🤖 Recopilador M1 iniciado. Par fijo: {PAIR}. "
+        f"Recopilará hasta {CANDLE_COUNT} velas cerradas y enviará el historial. "
         "No realiza operaciones."
     )
 
     while True:
         pairs = discover_active_otc_pairs(iq)
-        if not pairs:
-            logging.warning("No se encontraron pares binary OTC abiertos.")
-            telegram_send("No se encontraron pares OTC abiertos en este momento.")
+        if PAIR not in pairs:
+            logging.warning("%s no aparece abierto en binary OTC en este momento.", PAIR)
+            telegram_send(
+                f"El par solicitado {PAIR} no aparece abierto ahora. "
+                "No se sustituirá por EURUSD ni por otro par."
+            )
             time.sleep(POLL_SECONDS)
             continue
 
-        # Selecciona el primer par de la lista activa ordenada.
-        pair = pairs[0]
-        logging.info("Par OTC seleccionado: %s", pair)
+        pair = PAIR
+        logging.info("Par OTC solicitado y activo: %s", pair)
 
         try:
             candles = get_closed_candles(iq, pair, CANDLE_COUNT)
