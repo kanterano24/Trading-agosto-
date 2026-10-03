@@ -1,17 +1,15 @@
 from __future__ import annotations
 
+from collections import Counter
 import pandas as pd
 
-# QUANT MODE M1 — reglas experimentales basadas en las operaciones compartidas.
-# Estas condiciones buscan filtrar señales de menor calidad; no garantizan ganancias.
-IMPULSE_BODY_RATIO = 0.60
-CONFIRMATION_BODY_RATIO = 0.45
-RETEST_TOLERANCE_RATIO = 0.20
-MAX_EXTENSION_RATIO = 0.30
+# QUANT MODE — análisis y simulación exclusivamente.
+# Esta estrategia NO emite señales ejecutables: signal siempre es None.
+WINDOW = 104
+BODY_RATIO_MIN = 0.0
 
 
 def _prepare(data):
-    """Normaliza y valida el DataFrame de velas."""
     if data is None or not isinstance(data, pd.DataFrame) or data.empty:
         return None
 
@@ -21,154 +19,191 @@ def _prepare(data):
     if "low" not in df.columns and "min" in df.columns:
         df["low"] = df["min"]
 
-    required = ["open", "high", "low", "close"]
-    if any(col not in df.columns for col in required):
+    cols = ["open", "high", "low", "close"]
+    if any(c not in df.columns for c in cols):
         return None
+    for c in cols:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+    df = df.dropna(subset=cols).reset_index(drop=True)
+    if df.empty:
+        return None
+    return df.tail(WINDOW).reset_index(drop=True)
 
-    for col in required:
-        df[col] = pd.to_numeric(df[col], errors="coerce")
 
-    df = df.dropna(subset=required).reset_index(drop=True)
-    return df if not df.empty else None
+def _candle_features(df):
+    out = df.copy()
+    out["range"] = out["high"] - out["low"]
+    safe_range = out["range"].where(out["range"] > 0)
+    out["body"] = (out["close"] - out["open"]).abs()
+    out["body_r"] = (out["body"] / safe_range).fillna(0.0)
+    out["upper_wick"] = (out["high"] - out[["open", "close"]].max(axis=1)).clip(lower=0)
+    out["lower_wick"] = (out[["open", "close"]].min(axis=1) - out["low"]).clip(lower=0)
+    out["close_position"] = ((out["close"] - out["low"]) / safe_range).fillna(0.5).clip(0, 1)
+    out["direction"] = out["close"].gt(out["open"]).astype(int) - out["close"].lt(out["open"]).astype(int)
+    return out
 
 
-def _no_signal(reason, analysis=None):
+def _sequence_stats(features, n):
+    part = features.tail(n)
+    if len(part) < n:
+        return {"available": False, "bull": 0, "bear": 0, "neutral": 0,
+                "net_change": 0.0, "avg_body_r": 0.0, "direction_consistency": 0.0}
+    dirs = part["direction"].tolist()
+    nonzero = [d for d in dirs if d != 0]
+    consistency = abs(sum(nonzero)) / len(nonzero) if nonzero else 0.0
+    first_open = float(part.iloc[0]["open"])
+    last_close = float(part.iloc[-1]["close"])
+    scale = float(part["range"].mean())
+    net_change = (last_close - first_open) / scale if scale > 0 else 0.0
     return {
-        "signal": None,
-        "prediction": "NO SIGNAL",
-        "force_candle": False,
-        "price_action_confirmed": False,
-        "reason": reason,
-        "analysis": analysis or {},
+        "available": True,
+        "bull": sum(d > 0 for d in dirs),
+        "bear": sum(d < 0 for d in dirs),
+        "neutral": sum(d == 0 for d in dirs),
+        "net_change": net_change,
+        "avg_body_r": float(part["body_r"].mean()),
+        "direction_consistency": consistency,
     }
 
 
-def analyze_market(data, pair=None, mode="M1_M1"):
+def analyze_market(data, pair=None, mode="M1_SIM"):
     """
-    Analiza velas M1 cerradas.
-
-    CALL:
-      1) La vela de ruptura cierra alcista por encima del máximo de referencia.
-      2) La ruptura tiene cuerpo/rango >= 0.60.
-      3) La vela siguiente retestea la zona del máximo roto dentro de tolerancia.
-      4) Cierra alcista por encima del nivel, con cuerpo/rango >= 0.45.
-      5) La confirmación no queda extendida más de 0.30 del rango de ruptura.
-
-    PUT: reglas simétricas bajo el mínimo de referencia.
-
-    Se requieren al menos tres velas cerradas: referencia, ruptura y retesteo/
-    confirmación. El bot debe llamar esta función solo con velas cerradas.
+    Analiza hasta 104 velas cerradas M1 y estima la dirección de la siguiente.
+    Devuelve prediction CALL/PUT/NEUTRAL solo como clasificación simulada.
+    `signal` permanece siempre en None para impedir que un bot existente
+    interprete la predicción como una orden real.
     """
     df = _prepare(data)
-    if df is None or len(df) < 3:
-        return _no_signal("Se necesitan al menos 3 velas cerradas")
+    if df is None or len(df) < 10:
+        return {
+            "signal": None, "prediction": "NEUTRAL",
+            "simulation_only": True, "price_action_confirmed": False,
+            "reason": "Datos insuficientes: se requieren al menos 10 velas válidas",
+            "analysis": {"pair": pair, "mode": mode, "candles": 0 if df is None else len(df)}
+        }
 
-    reference = df.iloc[-3]
-    breakout = df.iloc[-2]
-    confirm = df.iloc[-1]
+    f = _candle_features(df)
+    last = f.iloc[-1]
+    sequences = {n: _sequence_stats(f, n) for n in (2, 3, 5, 10)}
 
-    ref_high, ref_low = float(reference.high), float(reference.low)
-    bo_open, bo_high = float(breakout.open), float(breakout.high)
-    bo_low, bo_close = float(breakout.low), float(breakout.close)
-    cf_open, cf_high = float(confirm.open), float(confirm.high)
-    cf_low, cf_close = float(confirm.low), float(confirm.close)
+    # Componentes descriptivos del comportamiento reciente.
+    recent3 = f.tail(3)
+    recent5 = f.tail(5)
+    direction3 = int(recent3["direction"].sum())
+    direction5 = int(recent5["direction"].sum())
+    avg_body3 = float(recent3["body_r"].mean())
+    avg_body5 = float(recent5["body_r"].mean())
 
-    bo_range = bo_high - bo_low
-    cf_range = cf_high - cf_low
-    if bo_range <= 0 or cf_range <= 0 or ref_high <= ref_low:
-        return _no_signal("Rango inválido en las velas analizadas")
+    # Impulso: dirección consistente, cambio neto y cuerpos relativamente amplios.
+    impulse_score = max(-1.0, min(1.0, direction5 / 5.0)) * avg_body5
+    # Continuación: persistencia de la dirección en las últimas 2 y 3 velas.
+    continuation_score = (direction3 / 3.0) * avg_body3
+    # Recuperación/respuesta: última vela va contra la secuencia corta y recupera
+    # parte del rango medio reciente; se registra como contexto, no como orden.
+    prior_direction = int(f.iloc[-2]["direction"])
+    recovery = bool(last["direction"] != 0 and prior_direction != 0
+                    and last["direction"] == -prior_direction)
+    # Desaceleración: caída del cuerpo medio reciente frente al bloque previo.
+    prior5 = f.iloc[-10:-5]
+    prior_avg_body = float(prior5["body_r"].mean()) if len(prior5) == 5 else avg_body5
+    deceleration = avg_body3 < prior_avg_body * 0.70 if prior_avg_body > 0 else False
 
-    impulse_ratio = abs(bo_close - bo_open) / bo_range
-    confirm_ratio = abs(cf_close - cf_open) / cf_range
+    # Ruido/transición: direcciones muy alternantes y escaso desplazamiento neto.
+    last10 = f.tail(10)["direction"].tolist()
+    flips = sum(1 for a, b in zip(last10, last10[1:]) if a * b < 0)
+    noise = flips >= 6 and abs(sequences[10]["net_change"]) < 1.0
 
-    breakout_up = bo_close > ref_high and bo_close > bo_open
-    breakout_down = bo_close < ref_low and bo_close < bo_open
-    impulse_strong = impulse_ratio >= IMPULSE_BODY_RATIO
-    confirm_strong = confirm_ratio >= CONFIRMATION_BODY_RATIO
-    tolerance = bo_range * RETEST_TOLERANCE_RATIO
+    # Puntaje simple, transparente y determinista basado solo en precio.
+    score = 0.55 * impulse_score + 0.45 * continuation_score
+    if recovery:
+        score *= 0.75
+    if deceleration:
+        score *= 0.75
+    if noise:
+        score *= 0.35
 
-    # Extensión medida desde el nivel roto hasta el cierre de confirmación.
-    call_extension = max(0.0, cf_close - ref_high) / bo_range
-    put_extension = max(0.0, ref_low - cf_close) / bo_range
-    extension_ok_call = call_extension <= MAX_EXTENSION_RATIO
-    extension_ok_put = put_extension <= MAX_EXTENSION_RATIO
-
-    call_retest = (
-        breakout_up and impulse_strong
-        and cf_low >= ref_high - tolerance
-        and cf_low <= ref_high + tolerance
-        and cf_close > ref_high and cf_close > cf_open
-        and confirm_strong and extension_ok_call
-    )
-    put_retest = (
-        breakout_down and impulse_strong
-        and cf_high >= ref_low - tolerance
-        and cf_high <= ref_low + tolerance
-        and cf_close < ref_low and cf_close < cf_open
-        and confirm_strong and extension_ok_put
-    )
-
-    signal = "call" if call_retest else "put" if put_retest else None
-
-    if signal == "call":
-        reason = (
-            f"CALL | ruptura alcista fuerte ({impulse_ratio:.2f} del rango), "
-            f"retest y rechazo alcista; confirmación {confirm_ratio:.2f}; "
-            f"extensión {call_extension:.2f} (máx. {MAX_EXTENSION_RATIO:.2f})"
-        )
-    elif signal == "put":
-        reason = (
-            f"PUT | ruptura bajista fuerte ({impulse_ratio:.2f} del rango), "
-            f"retest y rechazo bajista; confirmación {confirm_ratio:.2f}; "
-            f"extensión {put_extension:.2f} (máx. {MAX_EXTENSION_RATIO:.2f})"
-        )
+    if noise or abs(score) < 0.12:
+        prediction = "NEUTRAL"
+        confidence = min(1.0, abs(score) / 0.12) if not noise else 0.0
     else:
-        reasons = []
-        if not (breakout_up or breakout_down):
-            reasons.append("sin cierre de ruptura")
-        elif not impulse_strong:
-            reasons.append("impulso débil")
-        if not confirm_strong:
-            reasons.append("confirmación débil")
-        if not (call_retest or put_retest):
-            reasons.append("retest/rechazo no confirmado")
-        if breakout_up and not extension_ok_call:
-            reasons.append("CALL demasiado extendido")
-        if breakout_down and not extension_ok_put:
-            reasons.append("PUT demasiado extendido")
-        reason = "Sin señal: " + (", ".join(dict.fromkeys(reasons)) or "filtros no cumplidos")
+        prediction = "CALL" if score > 0 else "PUT"
+        confidence = min(1.0, abs(score) / 0.65)
 
-    confirmed = signal is not None
+    quality_flags = []
+    if len(df) < WINDOW:
+        quality_flags.append(f"ventana parcial: {len(df)}/{WINDOW} velas")
+    if noise:
+        quality_flags.append("ruido/transición elevado")
+    if deceleration:
+        quality_flags.append("desaceleración detectada")
+    if recovery:
+        quality_flags.append("respuesta contraria reciente")
+    quality = "BAJA" if noise or len(df) < 20 else "MEDIA"
+    if len(df) >= WINDOW and not noise and not deceleration:
+        quality = "ALTA"
+
     return {
-        "signal": signal,
-        "prediction": signal.upper() if signal else "NO SIGNAL",
-        "force_candle": impulse_strong,
-        "price_action_confirmed": confirmed,
-        "reason": reason,
+        "signal": None,  # Bloqueo explícito: no enviar órdenes reales.
+        "prediction": prediction,
+        "simulation_only": True,
+        "price_action_confirmed": prediction != "NEUTRAL",
+        "force_candle": bool(float(last["body_r"]) >= 0.60),
+        "reason": (
+            f"SIMULACIÓN | predicción {prediction} | score {score:.3f} | "
+            f"confianza heurística {confidence:.2f} | calidad {quality}"
+        ),
         "analysis": {
             "pair": pair,
             "mode": mode,
-            "signal_type": "breakout_retest_rejection_extension_filter",
-            "breakout_body_ratio": impulse_ratio,
-            "confirmation_body_ratio": confirm_ratio,
-            "call_extension_ratio": call_extension,
-            "put_extension_ratio": put_extension,
-            "breakout_up": breakout_up,
-            "breakout_down": breakout_down,
-            "breakout_strong": impulse_strong,
-            "confirmation_strong": confirm_strong,
-            "call_retest": call_retest,
-            "put_retest": put_retest,
-            "extension_ok_call": extension_ok_call,
-            "extension_ok_put": extension_ok_put,
-            "reference_high": ref_high,
-            "reference_low": ref_low,
-            "retest_tolerance": tolerance,
-            "max_extension_ratio": MAX_EXTENSION_RATIO,
+            "window_used": len(df),
+            "window_target": WINDOW,
+            "last_candle": {
+                "body": float(last["body"]),
+                "range": float(last["range"]),
+                "body_r": float(last["body_r"]),
+                "upper_wick": float(last["upper_wick"]),
+                "lower_wick": float(last["lower_wick"]),
+                "close_position": float(last["close_position"]),
+                "direction": int(last["direction"]),
+            },
+            "sequences": sequences,
+            "impulse_score": impulse_score,
+            "continuation_score": continuation_score,
+            "recovery_or_response": recovery,
+            "deceleration": deceleration,
+            "transition_or_noise": noise,
+            "intraminute_data": "UNAVAILABLE_FROM_OHLC",
+            "information_quality": quality,
+            "quality_notes": quality_flags,
+            "prediction_score": score,
+            "heuristic_confidence": confidence,
+            "evaluation": "Pendiente: comparar con la siguiente vela cerrada",
         },
     }
 
 
-def analyze(data, pair=None, mode="M1_M1"):
-    """Alias de compatibilidad para el bot."""
+def analyze(data, pair=None, mode="M1_SIM"):
+    """Alias de compatibilidad; mantiene el modo de simulación."""
     return analyze_market(data, pair=pair, mode=mode)
+
+
+def evaluate_prediction(prediction, next_candle):
+    """
+    Evalúa una predicción ya registrada contra la vela siguiente.
+    No modifica la predicción ni ejecuta operaciones.
+    """
+    df = _prepare(next_candle)
+    if df is None or df.empty:
+        return {"evaluated": False, "result": "NO_DATA"}
+    candle = df.iloc[-1]
+    actual = "CALL" if candle["close"] > candle["open"] else (
+        "PUT" if candle["close"] < candle["open"] else "NEUTRAL"
+    )
+    predicted = str(prediction).upper()
+    return {
+        "evaluated": True,
+        "prediction": predicted,
+        "actual": actual,
+        "correct": predicted == actual if predicted != "NEUTRAL" else None,
+        "note": "Evaluación direccional de vela; no equivale a rentabilidad de una operación."
+    }
