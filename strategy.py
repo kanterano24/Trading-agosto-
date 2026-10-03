@@ -2,10 +2,10 @@ from __future__ import annotations
 
 import pandas as pd
 
-# QUANT MODE M1: ruptura + retesteo + rechazo.
-# La señal solo se genera cuando la vela cerrada más reciente confirma
-# un retesteo de una ruptura ocurrida en la vela inmediatamente anterior.
+# QUANT MODE M1 — ruptura + retesteo + rechazo.
+# Filtro experimental: cuerpo de la vela de confirmación >= 45% de su rango.
 IMPULSE_BODY_RATIO = 0.60
+CONFIRMATION_BODY_RATIO = 0.45
 RETEST_TOLERANCE_RATIO = 0.20
 
 
@@ -45,20 +45,21 @@ def _no_signal(reason="Sin confirmación de ruptura + retesteo + rechazo", analy
 
 def analyze_market(data, pair=None, mode="M1_M1"):
     """
-    Analiza velas cerradas M1 y busca esta secuencia:
+    Analiza exclusivamente velas cerradas M1.
 
     CALL:
-      1. La vela de ruptura cierra por encima del máximo previo.
-      2. La vela siguiente retrocede hasta la zona rota (con tolerancia).
-      3. Esa vela rechaza la zona y cierra alcista, por encima del nivel.
+      - La vela de ruptura cierra alcista sobre el máximo de referencia.
+      - La vela siguiente retestea esa zona dentro de la tolerancia.
+      - La vela de confirmación rechaza la zona y cierra alcista.
+      - El cuerpo de confirmación representa al menos 45% de su rango.
 
     PUT:
-      1. La vela de ruptura cierra por debajo del mínimo previo.
-      2. La vela siguiente retrocede hasta la zona rota (con tolerancia).
-      3. Esa vela rechaza la zona y cierra bajista, por debajo del nivel.
+      - La vela de ruptura cierra bajista bajo el mínimo de referencia.
+      - La vela siguiente retestea esa zona dentro de la tolerancia.
+      - La vela de confirmación rechaza la zona y cierra bajista.
+      - El cuerpo de confirmación representa al menos 45% de su rango.
 
-    La función conserva las claves de respuesta de la estrategia anterior.
-    Requiere al menos tres velas cerradas: referencia, ruptura y retesteo.
+    Requiere tres velas cerradas: referencia, ruptura y confirmación/retest.
     """
     df = _prepare(data)
     if df is None or len(df) < 3:
@@ -88,17 +89,16 @@ def analyze_market(data, pair=None, mode="M1_M1"):
         return _no_signal("Una de las velas no tiene un rango válido")
 
     breakout_body_ratio = abs(bo_close - bo_open) / breakout_range
-    retest_body_ratio = abs(rt_close - rt_open) / retest_range
+    confirmation_body_ratio = abs(rt_close - rt_open) / retest_range
 
     breakout_up = bo_close > ref_high and bo_close > bo_open
     breakout_down = bo_close < ref_low and bo_close < bo_open
     breakout_strong = breakout_body_ratio >= IMPULSE_BODY_RATIO
+    confirmation_strong = confirmation_body_ratio >= CONFIRMATION_BODY_RATIO
 
-    # La tolerancia se calcula con el rango de la vela de ruptura.
     tolerance = breakout_range * RETEST_TOLERANCE_RATIO
 
-    # Retesteo CALL: el mínimo vuelve cerca del máximo roto y el cierre
-    # recupera/quiebra el nivel con una vela alcista.
+    # CALL: la mecha inferior visita la zona rota y el cierre la recupera.
     call_retest = (
         breakout_up
         and breakout_strong
@@ -106,10 +106,10 @@ def analyze_market(data, pair=None, mode="M1_M1"):
         and rt_low >= ref_high - tolerance
         and rt_close > ref_high
         and rt_close > rt_open
+        and confirmation_strong
     )
 
-    # Retesteo PUT: el máximo vuelve cerca del mínimo roto y el cierre
-    # queda por debajo del nivel con una vela bajista.
+    # PUT: la mecha superior visita la zona rota y el cierre queda debajo.
     put_retest = (
         breakout_down
         and breakout_strong
@@ -117,6 +117,7 @@ def analyze_market(data, pair=None, mode="M1_M1"):
         and rt_high <= ref_low + tolerance
         and rt_close < ref_low
         and rt_close < rt_open
+        and confirmation_strong
     )
 
     signal = "call" if call_retest else "put" if put_retest else None
@@ -124,17 +125,20 @@ def analyze_market(data, pair=None, mode="M1_M1"):
     if signal == "call":
         reason = (
             f"CALL | ruptura alcista fuerte ({breakout_body_ratio:.2f} del rango), "
-            f"retest del máximo anterior y rechazo alcista "
-            f"(vela de confirmación {retest_body_ratio:.2f})"
+            f"retest y rechazo alcista; confirmación "
+            f"{confirmation_body_ratio:.2f} (mínimo {CONFIRMATION_BODY_RATIO:.2f})"
         )
     elif signal == "put":
         reason = (
             f"PUT | ruptura bajista fuerte ({breakout_body_ratio:.2f} del rango), "
-            f"retest del mínimo anterior y rechazo bajista "
-            f"(vela de confirmación {retest_body_ratio:.2f})"
+            f"retest y rechazo bajista; confirmación "
+            f"{confirmation_body_ratio:.2f} (mínimo {CONFIRMATION_BODY_RATIO:.2f})"
         )
     else:
-        reason = "Sin secuencia válida de ruptura + retesteo + rechazo"
+        reason = (
+            "Sin señal: falta ruptura, retesteo, rechazo o fuerza mínima "
+            "de confirmación"
+        )
 
     confirmed = signal in ("call", "put")
 
@@ -149,10 +153,11 @@ def analyze_market(data, pair=None, mode="M1_M1"):
             "mode": mode,
             "signal_type": "breakout_retest_rejection",
             "breakout_body_ratio": breakout_body_ratio,
-            "retest_body_ratio": retest_body_ratio,
+            "confirmation_body_ratio": confirmation_body_ratio,
             "breakout_up": breakout_up,
             "breakout_down": breakout_down,
             "breakout_strong": breakout_strong,
+            "confirmation_strong": confirmation_strong,
             "call_retest": call_retest,
             "put_retest": put_retest,
             "reference_high": ref_high,
@@ -162,10 +167,10 @@ def analyze_market(data, pair=None, mode="M1_M1"):
             "breakout_high": bo_high,
             "breakout_low": bo_low,
             "breakout_close": bo_close,
-            "retest_open": rt_open,
-            "retest_high": rt_high,
-            "retest_low": rt_low,
-            "retest_close": rt_close,
+            "confirmation_open": rt_open,
+            "confirmation_high": rt_high,
+            "confirmation_low": rt_low,
+            "confirmation_close": rt_close,
         },
     }
 
