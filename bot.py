@@ -1,233 +1,473 @@
 from __future__ import annotations
-import logging, os, threading, time
+
+import logging
+import os
+import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import Optional
+
 import pandas as pd
 import requests
 from iqoptionapi.stable_api import IQ_Option
 import iqoptionapi.constants as OP_code
+
+# Importación unidireccional: strategy.py NO debe importar bot.py ni importarse a sí mismo.
 from strategy import analyze_market
 
-# Binary only: disable digital-underlying discovery/open helpers.
+
+# Binary only: deshabilitar helpers de mercado digital.
 def _binary_only_digital_underlying(self):
     return {"underlying": []}
+
+
 def _disabled_digital_open(self, *args, **kwargs):
     return None
+
+
 setattr(IQ_Option, "get_digital_underlying_list_data", _binary_only_digital_underlying)
 for _name in ("_IQ_Option__get_digital_open", "__get_digital_open", "_get_digital_open"):
     if hasattr(IQ_Option, _name):
         setattr(IQ_Option, _name, _disabled_digital_open)
 
-IQ_EMAIL=os.getenv("IQ_EMAIL")
-IQ_PASSWORD=os.getenv("IQ_PASSWORD")
-TELEGRAM_TOKEN=os.getenv("TELEGRAM_TOKEN")
-TELEGRAM_CHAT_ID=os.getenv("TELEGRAM_CHAT_ID")
-M1=60
-EXPIRATION=1
-AMOUNT=float(os.getenv("AMOUNT","1300"))
-MAX_PAIRS=int(os.getenv("MAX_OTC_PAIRS","30"))
-CANDLE_COUNT_M1=int(os.getenv("CANDLE_COUNT_M1","120"))
-PAIR_REFRESH_SECONDS=float(os.getenv("PAIR_REFRESH_SECONDS","600"))
-WORKERS=int(os.getenv("ANALYSIS_WORKERS","30"))
-LOOP_SLEEP=float(os.getenv("LOOP_SLEEP","0.03"))
-ENFORCE_ALTERNATION=os.getenv("ENFORCE_ALTERNATION","1").strip().lower() not in ("0","false","no","off")
-PAIRS=[]
-LAST_REFRESH=0.0
-IQ: Optional[IQ_Option]=None
-BOT_RUNNING=False
-STREAM_STARTED=set()
-STREAM_CACHE={}
-TRADED_CANDLE={}
-LAST_DIRECTION={}
-logging.basicConfig(level=logging.INFO,format="%(asctime)s | %(levelname)s | %(message)s")
-logger=logging.getLogger(__name__)
 
-def tg(msg):
-    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID: return
+IQ_EMAIL = os.getenv("IQ_EMAIL")
+IQ_PASSWORD = os.getenv("IQ_PASSWORD")
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+
+M1 = 60
+EXPIRATION = 1
+AMOUNT = float(os.getenv("AMOUNT", "1300"))
+MAX_PAIRS = max(1, int(os.getenv("MAX_OTC_PAIRS", "30")))
+CANDLE_COUNT_M1 = max(10, int(os.getenv("CANDLE_COUNT_M1", "120")))
+PAIR_REFRESH_SECONDS = max(60.0, float(os.getenv("PAIR_REFRESH_SECONDS", "600")))
+WORKERS = max(1, int(os.getenv("ANALYSIS_WORKERS", "5")))
+LOOP_SLEEP = max(0.05, float(os.getenv("LOOP_SLEEP", "0.20")))
+ENFORCE_ALTERNATION = os.getenv("ENFORCE_ALTERNATION", "1").strip().lower() not in (
+    "0", "false", "no", "off"
+)
+
+PAIRS = []
+LAST_REFRESH = 0.0
+IQ: Optional[IQ_Option] = None
+BOT_RUNNING = False
+STREAM_STARTED = set()
+STREAM_CACHE = {}
+TRADED_CANDLE = {}
+LAST_DIRECTION = {}
+STATE_LOCK = threading.RLock()
+
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO").upper(),
+    format="%(asctime)s | %(levelname)s | %(message)s",
+)
+logger = logging.getLogger(__name__)
+
+TG_SESSION = requests.Session()
+
+
+def tg(msg: str) -> bool:
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        return False
     try:
-        requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-                      data={"chat_id":TELEGRAM_CHAT_ID,"text":msg},timeout=3)
-    except Exception: pass
+        response = TG_SESSION.post(
+            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+            data={"chat_id": TELEGRAM_CHAT_ID, "text": str(msg)},
+            timeout=(5, 15),
+        )
+        response.raise_for_status()
+        payload = response.json()
+        return bool(payload.get("ok"))
+    except (requests.RequestException, ValueError) as exc:
+        logger.warning("Telegram sendMessage: %s", exc)
+        return False
+
 
 def telegram_loop():
     global BOT_RUNNING
-    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID: return
-    offset=None
-    url=f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates"
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        logger.warning("Telegram desactivado: faltan variables de entorno.")
+        return
+
+    offset = None
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates"
+    retry_delay = 2
+
     while True:
         try:
-            params={"timeout":1}
-            if offset is not None: params["offset"]=offset+1
-            data=requests.get(url,params=params,timeout=3).json()
-            for update in data.get("result",[]):
-                offset=update.get("update_id",offset)
-                message=update.get("message") or {}
-                chat=str((message.get("chat") or {}).get("id",""))
-                if chat != str(TELEGRAM_CHAT_ID): continue
-                command=str(message.get("text","")).strip().lower()
-                if command=="/start":
-                    BOT_RUNNING=True
-                    tg("🟢 BOT ACTIVADO\n\nM1 | VELA DE FUERZA + RUPTURA\nCALL = fuerza verde + ruptura máximo anterior\nPUT = fuerza roja + ruptura mínimo anterior.\nEntrada dentro de la vela M1 actual.\nExpiración: 1 minuto.")
-                elif command=="/stop":
-                    BOT_RUNNING=False
+            params = {"timeout": 25}
+            if offset is not None:
+                params["offset"] = offset + 1
+
+            response = TG_SESSION.get(url, params=params, timeout=(5, 35))
+            response.raise_for_status()
+            data = response.json()
+            if not data.get("ok"):
+                raise RuntimeError("Respuesta no válida de Telegram")
+
+            for update in data.get("result", []):
+                update_id = update.get("update_id")
+                if update_id is not None:
+                    offset = update_id
+
+                message = update.get("message") or {}
+                chat = str((message.get("chat") or {}).get("id", ""))
+                if chat != str(TELEGRAM_CHAT_ID):
+                    continue
+
+                command = str(message.get("text", "")).strip().lower()
+                if command == "/start":
+                    with STATE_LOCK:
+                        BOT_RUNNING = True
+                    tg(
+                        "🟢 BOT ACTIVADO\n\n"
+                        "M1 | VELA DE FUERZA + RUPTURA\n"
+                        "CALL = vela alcista fuerte + ruptura del máximo anterior\n"
+                        "PUT = vela bajista fuerte + ruptura del mínimo anterior\n"
+                        "Expiración: 1 minuto."
+                    )
+                elif command == "/stop":
+                    with STATE_LOCK:
+                        BOT_RUNNING = False
                     tg("🔴 BOT DETENIDO")
-                elif command=="/status":
-                    tg(f"📊 ESTADO: {'🟢 ACTIVO' if BOT_RUNNING else '🔴 DETENIDO'}\nOTC: {len(PAIRS)}\nImporte: {AMOUNT:g}\nExpiración: 1 minuto\nAlternancia: {'ACTIVA' if ENFORCE_ALTERNATION else 'DESACTIVADA'}")
-        except Exception as exc:
-            logger.warning("Telegram polling: %s",exc)
-            time.sleep(1)
+                elif command == "/status":
+                    with STATE_LOCK:
+                        running = BOT_RUNNING
+                        pair_count = len(PAIRS)
+                    tg(
+                        f"📊 ESTADO: {'🟢 ACTIVO' if running else '🔴 DETENIDO'}\n"
+                        f"OTC: {pair_count}\n"
+                        f"Importe: {AMOUNT:g}\n"
+                        "Expiración: 1 minuto\n"
+                        f"Alternancia: {'ACTIVA' if ENFORCE_ALTERNATION else 'DESACTIVADA'}"
+                    )
+
+            retry_delay = 2
+
+        except (requests.RequestException, ValueError, RuntimeError) as exc:
+            logger.warning("Telegram polling: %s", exc)
+            time.sleep(retry_delay)
+            retry_delay = min(retry_delay * 2, 30)
+        except Exception:
+            logger.exception("Error inesperado en Telegram polling")
+            time.sleep(retry_delay)
+            retry_delay = min(retry_delay * 2, 30)
+
 
 def is_otc(name):
-    n=str(name).upper()
-    return n.endswith("-OTC") or n.endswith("_OTC") or "OTC" in n
+    value = str(name).upper()
+    return value.endswith("-OTC") or value.endswith("_OTC") or "OTC" in value
+
 
 def refresh_pairs(force=False):
-    global PAIRS,LAST_REFRESH
-    if IQ is None: return []
-    now=time.time()
-    if not force and now-LAST_REFRESH<PAIR_REFRESH_SECONDS: return PAIRS
+    global PAIRS, LAST_REFRESH
+    if IQ is None:
+        return []
+    now = time.time()
+    if not force and now - LAST_REFRESH < PAIR_REFRESH_SECONDS:
+        return PAIRS
+
     try:
-        data=IQ.get_all_init_v2()
-        binary=data.get("binary",{}) if isinstance(data,dict) else {}
-        actives=binary.get("actives",{}) if isinstance(binary,dict) else {}
+        data = IQ.get_all_init_v2()
+        binary = data.get("binary", {}) if isinstance(data, dict) else {}
+        actives = binary.get("actives", {}) if isinstance(binary, dict) else {}
     except Exception as exc:
-        logger.warning("Catálogo OTC: %s",exc); return PAIRS
-    found=[]
-    for active_id,info in actives.items():
-        if not isinstance(info,dict): continue
-        name=info.get("name")
-        if not isinstance(name,str): continue
-        name=name.split(".",1)[-1].strip()
-        if not is_otc(name) or info.get("enabled",True) is False or info.get("is_suspended",info.get("suspended",False)): continue
+        logger.warning("Catálogo OTC: %s", exc)
+        return PAIRS
+
+    found = []
+    for active_id, info in actives.items():
+        if not isinstance(info, dict):
+            continue
+        name = info.get("name")
+        if not isinstance(name, str):
+            continue
+        name = name.split(".", 1)[-1].strip()
+        suspended = info.get("is_suspended", info.get("suspended", False))
+        if not is_otc(name) or info.get("enabled", True) is False or suspended:
+            continue
         try:
-            OP_code.ACTIVES[name]=int(active_id); found.append(name)
-        except (TypeError,ValueError): continue
+            OP_code.ACTIVES[name] = int(active_id)
+            found.append(name)
+        except (TypeError, ValueError):
+            continue
+
     if found:
-        PAIRS=sorted(set(found))[:max(1,MAX_PAIRS)]
-        LAST_REFRESH=now
-        logger.info("OTC seleccionados: %d/%d",len(PAIRS),len(set(found)))
+        selected = sorted(set(found))[:MAX_PAIRS]
+        with STATE_LOCK:
+            PAIRS = selected
+            LAST_REFRESH = now
+        logger.info("OTC seleccionados: %d/%d", len(selected), len(set(found)))
+    else:
+        logger.warning("No se encontraron pares Binary OTC disponibles.")
     return PAIRS
 
+
 def server_ts():
-    try: return float(IQ.get_server_timestamp()) if IQ else time.time()
-    except Exception: return time.time()
-def floor_ts(ts): return int(ts//M1)*M1
+    try:
+        return float(IQ.get_server_timestamp()) if IQ else time.time()
+    except Exception:
+        return time.time()
+
+
+def floor_ts(ts):
+    return int(ts // M1) * M1
+
 
 def connect():
     global IQ
-    IQ=IQ_Option(IQ_EMAIL,IQ_PASSWORD)
-    ok,reason=IQ.connect()
-    if not ok: raise ConnectionError(reason)
+    IQ = IQ_Option(IQ_EMAIL, IQ_PASSWORD)
+    ok, reason = IQ.connect()
+    if not ok:
+        raise ConnectionError(reason)
     refresh_pairs(True)
-    tg(f"🟢 IQ OPTION CONECTADO\nM1 | Fuerza + ruptura\nOTC: {len(PAIRS)}\nExpiración: 1 minuto.")
+    tg(
+        f"🟢 IQ OPTION CONECTADO\n"
+        f"M1 | Fuerza + ruptura\nOTC: {len(PAIRS)}\n"
+        "Expiración: 1 minuto."
+    )
+
 
 def ensure_connection():
-    if IQ is None: return False
+    if IQ is None:
+        return False
     try:
-        if IQ.check_connect(): return True
-    except Exception: pass
+        if IQ.check_connect():
+            return True
+    except Exception:
+        pass
+
     try:
-        ok=bool(IQ.connect()[0])
-        if ok: STREAM_STARTED.clear()
-        return ok
-    except Exception: return False
+        result = IQ.connect()
+        ok = bool(result[0]) if isinstance(result, tuple) else bool(result)
+        if ok:
+            with STATE_LOCK:
+                STREAM_STARTED.clear()
+                STREAM_CACHE.clear()
+            logger.info("Conexión IQ Option restablecida.")
+            return True
+    except Exception as exc:
+        logger.warning("Reconexión IQ Option: %s", exc)
+    return False
+
 
 def ensure_stream(pair):
-    if IQ is None: return False
-    if pair in STREAM_STARTED: return True
+    if IQ is None:
+        return False
+    if pair in STREAM_STARTED:
+        return True
     try:
-        IQ.start_candles_stream(pair,M1,CANDLE_COUNT_M1)
-        STREAM_STARTED.add(pair); return True
+        IQ.start_candles_stream(pair, M1, CANDLE_COUNT_M1)
+        STREAM_STARTED.add(pair)
+        return True
     except Exception as exc:
-        logger.warning("stream %s: %s",pair,exc); return False
+        logger.warning("Stream %s: %s", pair, exc)
+        return False
+
 
 def read_stream(pair):
-    if IQ is None or not ensure_stream(pair): return None
+    if IQ is None or not ensure_stream(pair):
+        return None
     try:
-        raw=IQ.get_realtime_candles(pair,M1)
-        if not raw: return STREAM_CACHE.get(pair)
-        rows=[]
-        for c in raw.values():
-            if isinstance(c,dict):
-                rows.append({"from":c.get("from"),"open":c.get("open"),
-                    "high":c.get("max",c.get("high")),"low":c.get("min",c.get("low")),
-                    "close":c.get("close")})
-        data=pd.DataFrame(rows)
-        cols=["from","open","high","low","close"]
-        if data.empty or any(c not in data.columns for c in cols): return STREAM_CACHE.get(pair)
-        for c in cols: data[c]=pd.to_numeric(data[c],errors="coerce")
-        data=data.dropna(subset=cols).drop_duplicates("from").sort_values("from").reset_index(drop=True)
-        if not data.empty: STREAM_CACHE[pair]=data
-        return data if not data.empty else STREAM_CACHE.get(pair)
+        raw = IQ.get_realtime_candles(pair, M1)
+        if not raw:
+            return STREAM_CACHE.get(pair)
+
+        rows = []
+        for candle in raw.values():
+            if isinstance(candle, dict):
+                rows.append({
+                    "from": candle.get("from"),
+                    "open": candle.get("open"),
+                    "high": candle.get("max", candle.get("high")),
+                    "low": candle.get("min", candle.get("low")),
+                    "close": candle.get("close"),
+                })
+
+        data = pd.DataFrame(rows)
+        required = ["from", "open", "high", "low", "close"]
+        if data.empty or any(column not in data.columns for column in required):
+            return STREAM_CACHE.get(pair)
+
+        for column in required:
+            data[column] = pd.to_numeric(data[column], errors="coerce")
+        data = (
+            data.dropna(subset=required)
+            .drop_duplicates("from")
+            .sort_values("from")
+            .reset_index(drop=True)
+        )
+        if not data.empty:
+            STREAM_CACHE[pair] = data
+            return data
+        return STREAM_CACHE.get(pair)
     except Exception as exc:
-        logger.debug("Lectura stream %s: %s",pair,exc)
+        logger.debug("Lectura stream %s: %s", pair, exc)
         return STREAM_CACHE.get(pair)
 
+
 def analyze_live_pair(pair):
-    data=read_stream(pair)
-    if data is None or len(data)<2: return None
-    candle_ts=floor_ts(server_ts())
-    context=data[data["from"]<=candle_ts].copy()
-    if context.empty or int(context.iloc[-1]["from"])!=candle_ts: return None
-    result=analyze_market(context,pair=pair,mode="M1_M1")
-    signal=result.get("signal")
-    if signal not in ("call","put") or not result.get("force_candle") or not result.get("price_action_confirmed"): return None
-    if ENFORCE_ALTERNATION and LAST_DIRECTION.get(pair)==signal: return None
-    return {"pair":pair,"signal":signal,"reason":result.get("reason","Fuerza y ruptura M1"),
-            "candle_ts":candle_ts,"analysis":result.get("analysis",{})}
+    data = read_stream(pair)
+    if data is None or len(data) < 2:
+        return None
+
+    candle_ts = floor_ts(server_ts())
+    context = data[data["from"] <= candle_ts].copy()
+    if context.empty or int(context.iloc[-1]["from"]) != candle_ts:
+        return None
+
+    result = analyze_market(context, pair=pair, mode="M1_M1")
+    signal = result.get("signal")
+    if (
+        signal not in ("call", "put")
+        or not result.get("force_candle")
+        or not result.get("price_action_confirmed")
+    ):
+        return None
+
+    with STATE_LOCK:
+        if ENFORCE_ALTERNATION and LAST_DIRECTION.get(pair) == signal:
+            return None
+
+    return {
+        "pair": pair,
+        "signal": signal,
+        "reason": result.get("reason", "Fuerza y ruptura M1"),
+        "candle_ts": candle_ts,
+        "analysis": result.get("analysis", {}),
+    }
+
 
 def buy(candidate):
     try:
-        result=IQ.buy(AMOUNT,candidate["pair"],candidate["signal"],EXPIRATION)
-        if isinstance(result,tuple): return bool(result[0]),result[1] if len(result)>1 else result[0]
-        return result not in (False,None,-1),result
+        result = IQ.buy(
+            AMOUNT,
+            candidate["pair"],
+            candidate["signal"],
+            EXPIRATION,
+        )
+        if isinstance(result, tuple):
+            return bool(result[0]), result[1] if len(result) > 1 else result[0]
+        return result not in (False, None, -1), result
     except Exception as exc:
-        logger.error("buy %s: %s",candidate["pair"],exc); return False,None
+        logger.error("buy %s: %s", candidate["pair"], exc)
+        return False, None
+
 
 def execute(candidate):
-    pair,signal=candidate["pair"],candidate["signal"]
-    candle_ts=int(candidate["candle_ts"])
-    if TRADED_CANDLE.get(pair)==candle_ts or floor_ts(server_ts())!=candle_ts: return False
-    if ENFORCE_ALTERNATION and LAST_DIRECTION.get(pair)==signal: return False
-    ok,order_id=buy(candidate)
-    if not ok: return False
-    TRADED_CANDLE[pair]=candle_ts; LAST_DIRECTION[pair]=signal
-    inside=max(0.0,server_ts()-candle_ts)
-    logger.info("ENTRADA | %s | %s | segundo=%.2f | ID=%s | %s",pair,signal.upper(),inside,order_id,candidate["reason"])
-    tg(f"⚡ ENTRADA EJECUTADA\nPar: {pair}\nDirección: {signal.upper()}\nM1\nEntrada dentro de vela: {inside:.2f}s\nExpiración: 1 minuto\nRazón: {candidate['reason']}\nID: {order_id}")
+    pair = candidate["pair"]
+    signal = candidate["signal"]
+    candle_ts = int(candidate["candle_ts"])
+
+    with STATE_LOCK:
+        if TRADED_CANDLE.get(pair) == candle_ts:
+            return False
+        if floor_ts(server_ts()) != candle_ts:
+            return False
+        if ENFORCE_ALTERNATION and LAST_DIRECTION.get(pair) == signal:
+            return False
+        # Reservar la vela evita órdenes duplicadas si el ciclo vuelve a entrar.
+        TRADED_CANDLE[pair] = candle_ts
+
+    ok, order_id = buy(candidate)
+    if not ok:
+        with STATE_LOCK:
+            if TRADED_CANDLE.get(pair) == candle_ts:
+                TRADED_CANDLE.pop(pair, None)
+        return False
+
+    with STATE_LOCK:
+        LAST_DIRECTION[pair] = signal
+
+    inside = max(0.0, server_ts() - candle_ts)
+    logger.info(
+        "ENTRADA | %s | %s | segundo=%.2f | ID=%s | %s",
+        pair, signal.upper(), inside, order_id, candidate["reason"]
+    )
+    tg(
+        f"⚡ ENTRADA EJECUTADA\nPar: {pair}\n"
+        f"Dirección: {signal.upper()}\nM1\n"
+        f"Entrada dentro de vela: {inside:.2f}s\n"
+        f"Expiración: 1 minuto\nRazón: {candidate['reason']}\nID: {order_id}"
+    )
     return True
+
 
 def process():
     refresh_pairs()
-    if not PAIRS: return
-    for pair in PAIRS: read_stream(pair)
+    pairs_snapshot = list(PAIRS)
+    if not pairs_snapshot:
+        return
+
+    # Calentar/actualizar los streams antes de analizar.
+    for pair in pairs_snapshot:
+        read_stream(pair)
+
     def worker(pair):
-        try: return analyze_live_pair(pair)
+        try:
+            return analyze_live_pair(pair)
         except Exception as exc:
-            logger.debug("Análisis %s: %s",pair,exc); return None
-    with ThreadPoolExecutor(max_workers=max(1,min(WORKERS,len(PAIRS)))) as executor:
-        results=list(executor.map(worker,PAIRS))
-    candidates=[r for r in results if r]
-    candidates.sort(key=lambda x:PAIRS.index(x["pair"]))
+            logger.debug("Análisis %s: %s", pair, exc)
+            return None
+
+    with ThreadPoolExecutor(max_workers=min(WORKERS, len(pairs_snapshot))) as executor:
+        results = list(executor.map(worker, pairs_snapshot))
+
+    candidates = [item for item in results if item]
+    order = {pair: index for index, pair in enumerate(pairs_snapshot)}
+    candidates.sort(key=lambda item: order.get(item["pair"], 9999))
+
     for candidate in candidates:
-        if execute(candidate): break
+        if execute(candidate):
+            break
+
 
 def main():
     global BOT_RUNNING
-    if not all((IQ_EMAIL,IQ_PASSWORD,TELEGRAM_TOKEN,TELEGRAM_CHAT_ID)):
-        logger.error("Faltan IQ_EMAIL/IQ_PASSWORD/TELEGRAM_TOKEN/TELEGRAM_CHAT_ID"); return
-    threading.Thread(target=telegram_loop,daemon=True).start()
-    try: connect()
+    required = (IQ_EMAIL, IQ_PASSWORD, TELEGRAM_TOKEN, TELEGRAM_CHAT_ID)
+    if not all(required):
+        logger.error(
+            "Faltan variables: IQ_EMAIL, IQ_PASSWORD, TELEGRAM_TOKEN o TELEGRAM_CHAT_ID"
+        )
+        return
+    if AMOUNT <= 0:
+        logger.error("AMOUNT debe ser mayor que cero.")
+        return
+
+    threading.Thread(
+        target=telegram_loop,
+        name="telegram-polling",
+        daemon=True,
+    ).start()
+
+    try:
+        connect()
     except Exception as exc:
-        logger.exception("No se pudo iniciar IQ Option"); tg(f"❌ ERROR DE CONEXIÓN\n{exc}"); return
+        logger.exception("No se pudo iniciar IQ Option")
+        tg(f"❌ ERROR DE CONEXIÓN\n{exc}")
+        return
+
     while True:
         try:
-            if not BOT_RUNNING: time.sleep(.25); continue
-            if not ensure_connection(): time.sleep(1); continue
-            process(); time.sleep(max(.01,LOOP_SLEEP))
+            with STATE_LOCK:
+                running = BOT_RUNNING
+            if not running:
+                time.sleep(0.25)
+                continue
+            if not ensure_connection():
+                time.sleep(2)
+                continue
+            process()
+            time.sleep(LOOP_SLEEP)
         except KeyboardInterrupt:
-            BOT_RUNNING=False; break
+            with STATE_LOCK:
+                BOT_RUNNING = False
+            break
         except Exception as exc:
-            logger.exception("Error principal: %s",exc); time.sleep(1)
+            logger.exception("Error principal: %s", exc)
+            time.sleep(2)
 
-if __name__=="__main__": main()
+
+if __name__ == "__main__":
+    main()
