@@ -9,18 +9,20 @@ import time
 import requests
 from iqoptionapi.stable_api import IQ_Option
 
-# Protección para el hilo digital de iqoptionapi; el bot opera binarias.
-_original_digital_underlying_list_data = IQ_Option.get_digital_underlying_list_data
-
+# El bot opera únicamente binarias OTC: no consulta datos digitales.
+# Devolver una lista vacía evita la llamada lenta que origina el aviso
+# get_digital_underlying_list_data late 30 sec y el NoneType asociado.
 def _safe_digital_underlying_list_data(self):
-    data = _original_digital_underlying_list_data(self)
-    if not isinstance(data, dict):
-        return {"underlying": []}
-    if not isinstance(data.get("underlying"), list):
-        data["underlying"] = []
-    return data
+    return {"underlying": []}
 
 IQ_Option.get_digital_underlying_list_data = _safe_digital_underlying_list_data
+
+# Evita iniciar la rutina de actualización de activos digitales.
+# Se aplica antes de crear la instancia/conectar IQ_Option.
+def _disable_digital_open(self):
+    return None
+
+IQ_Option._get_digital_open = _disable_digital_open
 from strategy import normalize_candles, describe_history, format_candle, analyze_market
 
 MAX_OTC_PAIRS = 50
