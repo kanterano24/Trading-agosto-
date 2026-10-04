@@ -2,7 +2,7 @@
 import logging, os, time, requests
 from iqoptionapi.stable_api import IQ_Option
 from strategy import normalize_candles, describe_history, format_candle, analyze_market
-PAIR='EURUSD-OTC'; TF=60; COUNT=200; EXPIRATION=1
+MAX_PAIRS=6; TF=60; COUNT=200; EXPIRATION=1
 AMOUNT=float(os.getenv('AMOUNT','1000')); ENABLE_TRADES=os.getenv('ENABLE_TRADES','false').lower() in ('1','true','yes','si')
 EMAIL=os.getenv('IQ_EMAIL',''); PASSWORD=os.getenv('IQ_PASSWORD',''); TOKEN=os.getenv('TELEGRAM_TOKEN',''); CHAT=os.getenv('TELEGRAM_CHAT_ID','')
 POLL=max(1,float(os.getenv('POLL_SECONDS','2'))); logging.basicConfig(level=logging.INFO,format='%(asctime)s | %(levelname)s | %(message)s')
@@ -38,10 +38,20 @@ def connect_retry():
             logging.exception('No conectó; reintento en %ss',delay); tg(f'⚠️ Conexión fallida ({type(e).__name__}); reintento en {delay}s')
             time.sleep(delay); delay=min(delay*2,60)
 
-def get_candles(iq):
+def discover_pairs(iq):
+    found=[]
+    try:
+        opened=iq.get_all_open_time() or {}
+        for name,info in (opened.get('binary',{}) or {}).items():
+            if name.endswith('-OTC') and isinstance(info,dict) and info.get('open') is True:
+                found.append(name)
+    except Exception: logging.exception('Error consultando pares OTC')
+    return sorted(found)[:MAX_PAIRS]
+
+def get_candles(iq, pair):
     try: now=int(iq.get_server_timestamp())
     except Exception: now=int(time.time())
-    raw=iq.get_candles(PAIR,TF,COUNT+20,now) or []; minute=now-now%TF
+    raw=iq.get_candles(pair,TF,COUNT+20,now) or []; minute=now-now%TF
     closed=[]
     for c in raw:
         try:
@@ -51,33 +61,57 @@ def get_candles(iq):
     return normalize_candles(closed)[-COUNT:],now
 
 def main():
-    iq=connect_retry(); tg(f'🟢 Bot iniciado\nPar único: {PAIR}\nM1; expiración 1 min\nCuenta PRACTICE\nOperaciones: {"habilitadas" if ENABLE_TRADES else "solo análisis"}')
-    last=None; history_done=False; last_error=0
+    iq=connect_retry(); pairs=[]; last_candle={}; history_done=set(); last_error=0; refresh=0
+    tg('🟢 Bot iniciado\nHasta 6 pares OTC\nM1; expiración 1 min\nCuenta PRACTICE\nOperaciones: '+('habilitadas' if ENABLE_TRADES else 'solo análisis'))
     while True:
         try:
-            if not iq.check_connect(): iq=connect_retry()
-            cs,now=get_candles(iq)
-            if len(cs)<COUNT:
-                logging.info('Esperando historial %d/%d',len(cs),COUNT); time.sleep(POLL); continue
-            if not history_done:
-                st=describe_history(cs); tg(f'📊 {PAIR} historial M1: {st["count"]}/{COUNT}\nVerdes {st["greens"]} | Rojas {st["reds"]} | Doji {st["dojis"]}')
-                for x in range(0,len(cs),35): tg(f'🕯️ Velas {x+1}-{min(x+35,len(cs))}\n'+'\n'.join(format_candle(i+1,c) for i,c in enumerate(cs[x:x+35],x)))
-                history_done=True
-            stamp=cs[-1]['timestamp']
-            if stamp==last: time.sleep(POLL); continue
-            last=stamp; res=analyze_market(cs); ctx=res['contexts']; stages=', '.join(k for k,v in res['stages'].items() if v) or 'ninguna'
-            ctxs=' | '.join(f'{n}:{ctx[n]["bias"]}' for n in (2,3,5,10))
-            logging.info('%s señal=%s sesgo=%s CALL=%s PUT=%s | %s | etapas=%s',PAIR,res['signal'],res['bias'],res['call_score'],res['put_score'],res['reason'],stages)
-            tg(f'📈 {PAIR} M1\nSeñal: {res["signal"]}\nContexto: {ctxs}\nEtapas: {stages}\nMotivo: {res["reason"]}')
-            if res['signal'] in ('CALL','PUT') and ENABLE_TRADES:
-                sec=now%60
-                if sec<=8:
-                    iq.change_balance('PRACTICE'); ok,oid=iq.buy(AMOUNT,PAIR,res['signal'].lower(),EXPIRATION)
-                    tg(f'{"🧪 Orden enviada" if ok else "⚠️ Orden rechazada"}\n{PAIR} {res["signal"]}\nID/respuesta: {oid}')
-                else: logging.info('Señal fuera de ventana (%ss); no se ejecuta',sec)
+            if not iq.check_connect():
+                iq=connect_retry(); pairs=[]; refresh=0
+            mono=time.monotonic()
+            if not pairs or mono-refresh>=60:
+                new=discover_pairs(iq)
+                if new:
+                    if new!=pairs:
+                        pairs=new
+                        logging.info('Pares OTC cargados=%d | %s',len(pairs),', '.join(pairs))
+                        tg(f'🔄 Pares OTC cargados ({len(pairs)}):\n'+', '.join(pairs))
+                    refresh=mono
+                else:
+                    logging.warning('No se detectaron pares OTC abiertos; se reintentará.')
+                    time.sleep(POLL); continue
+            for pair in pairs:
+                try:
+                    cs,now=get_candles(iq,pair)
+                    if len(cs)<COUNT:
+                        logging.info('%s esperando historial %d/%d',pair,len(cs),COUNT); continue
+                    if pair not in history_done:
+                        st=describe_history(cs)
+                        tg(f'📊 {pair} historial M1: {st["count"]}/{COUNT}\nVerdes {st["greens"]} | Rojas {st["reds"]} | Doji {st["dojis"]}')
+                        for x in range(0,len(cs),35):
+                            tg(f'🕯️ {pair} velas {x+1}-{min(x+35,len(cs))}\n'+'\n'.join(format_candle(i+1,c) for i,c in enumerate(cs[x:x+35],x)))
+                        history_done.add(pair)
+                    stamp=cs[-1]['timestamp']
+                    if stamp==last_candle.get(pair): continue
+                    last_candle[pair]=stamp
+                    res=analyze_market(cs); ctx=res['contexts']
+                    stages=', '.join(k for k,v in res['stages'].items() if v) or 'ninguna'
+                    ctxs=' | '.join(f'{n}:{ctx[n]["bias"]}' for n in (2,3,5,10))
+                    logging.info('%s señal=%s sesgo=%s CALL=%s PUT=%s | %s | etapas=%s',pair,res['signal'],res['bias'],res['call_score'],res['put_score'],res['reason'],stages)
+                    tg(f'📈 {pair} M1\nSeñal: {res["signal"]}\nContexto: {ctxs}\nEtapas: {stages}\nMotivo: {res["reason"]}')
+                    if res['signal'] in ('CALL','PUT') and ENABLE_TRADES:
+                        sec=now%60
+                        if sec<=8:
+                            iq.change_balance('PRACTICE'); ok,oid=iq.buy(AMOUNT,pair,res['signal'].lower(),EXPIRATION)
+                            tg(f'{"🧪 Orden enviada" if ok else "⚠️ Orden rechazada"}\n{pair} {res["signal"]}\nID/respuesta: {oid}')
+                        else: logging.info('%s señal fuera de ventana (%ss); no se ejecuta',pair,sec)
+                except Exception as e:
+                    logging.exception('Error analizando %s',pair)
+                    if time.monotonic()-last_error>60:
+                        tg(f'⚠️ Error en {pair}: {type(e).__name__}: {e}'); last_error=time.monotonic()
         except Exception as e:
             logging.exception('Error de ciclo')
-            if time.monotonic()-last_error>60: tg(f'⚠️ Error: {type(e).__name__}: {e}'); last_error=time.monotonic()
+            if time.monotonic()-last_error>60:
+                tg(f'⚠️ Error: {type(e).__name__}: {e}'); last_error=time.monotonic()
             try:
                 if not iq.check_connect(): iq=connect_retry()
             except Exception: iq=connect_retry()
