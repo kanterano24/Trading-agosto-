@@ -2,7 +2,15 @@
 import logging, os, time, requests
 from iqoptionapi.stable_api import IQ_Option
 from strategy import normalize_candles, describe_history, format_candle, analyze_market
-MAX_PAIRS=6; TF=60; COUNT=200; EXPIRATION=1
+PAIRS = [
+    "EURUSD-OTC",
+    "EURJPY-OTC",
+    "EURGBP-OTC",
+    "GBPAUD-OTC",
+    "GBPUSD-OTC",
+    "USDCHF-OTC",
+]
+TF=60; COUNT=200; EXPIRATION=1
 AMOUNT=float(os.getenv('AMOUNT','1000')); ENABLE_TRADES=os.getenv('ENABLE_TRADES','false').lower() in ('1','true','yes','si')
 EMAIL=os.getenv('IQ_EMAIL',''); PASSWORD=os.getenv('IQ_PASSWORD',''); TOKEN=os.getenv('TELEGRAM_TOKEN',''); CHAT=os.getenv('TELEGRAM_CHAT_ID','')
 POLL=max(1,float(os.getenv('POLL_SECONDS','2'))); logging.basicConfig(level=logging.INFO,format='%(asctime)s | %(levelname)s | %(message)s')
@@ -39,14 +47,8 @@ def connect_retry():
             time.sleep(delay); delay=min(delay*2,60)
 
 def discover_pairs(iq):
-    found=[]
-    try:
-        opened=iq.get_all_open_time() or {}
-        for name,info in (opened.get('binary',{}) or {}).items():
-            if name.endswith('-OTC') and isinstance(info,dict) and info.get('open') is True:
-                found.append(name)
-    except Exception: logging.exception('Error consultando pares OTC')
-    return sorted(found)[:MAX_PAIRS]
+    """Usa únicamente los seis pares OTC solicitados."""
+    return PAIRS.copy()
 
 def get_candles(iq, pair):
     try: now=int(iq.get_server_timestamp())
@@ -62,7 +64,7 @@ def get_candles(iq, pair):
 
 def main():
     iq=connect_retry(); pairs=[]; last_candle={}; history_done=set(); last_error=0; refresh=0
-    tg('🟢 Bot iniciado\nHasta 6 pares OTC\nM1; expiración 1 min\nCuenta PRACTICE\nOperaciones: '+('habilitadas' if ENABLE_TRADES else 'solo análisis'))
+    tg('🟢 Bot iniciado\nPares configurados: EURUSD-OTC, EURJPY-OTC, EURGBP-OTC, GBPAUD-OTC, GBPUSD-OTC, USDCHF-OTC\nM1; expiración 1 min\nCuenta PRACTICE\nOperaciones: '+('habilitadas' if ENABLE_TRADES else 'solo análisis'))
     while True:
         try:
             if not iq.check_connect():
