@@ -25,7 +25,8 @@ def _disable_digital_open(self):
 IQ_Option._get_digital_open = _disable_digital_open
 from strategy import normalize_candles, describe_history, format_candle, analyze_market
 
-MAX_OTC_PAIRS = 59
+PAIR = "EURUSD-OTC"
+MAX_OTC_PAIRS = 1
 PAIR_REFRESH_SECONDS = 60
 TELEGRAM_SUMMARY_SECONDS = 300
 ERROR_NOTICE_SECONDS = 300
@@ -238,45 +239,20 @@ def send_analysis_summary(states, pair_count):
 
 
 def discover_otc_pairs(iq):
-    """Detecta hasta 59 símbolos OTC binarios sin depender de un único endpoint."""
-    candidates = set()
-
-    def add_symbol(value):
-        if isinstance(value, str):
-            symbol = value.strip().upper()
-            if symbol.endswith("-OTC") and symbol not in ("-OTC",):
-                candidates.add(symbol)
-
+    """El bot trabaja exclusivamente con EURUSD-OTC."""
     try:
         opened = iq.get_all_open_time()
-        if isinstance(opened, dict):
-            for market in ("binary", "turbo"):
-                section = opened.get(market)
-                if not isinstance(section, dict):
-                    continue
-                for symbol, info in section.items():
-                    if isinstance(info, dict) and info.get("open") is True:
-                        add_symbol(symbol)
+        for market in ("binary", "turbo"):
+            section = opened.get(market, {}) if isinstance(opened, dict) else {}
+            info = section.get(PAIR) if isinstance(section, dict) else None
+            if isinstance(info, dict) and info.get("open") is True:
+                logging.info("Par confirmado abierto: %s (%s)", PAIR, market)
+                return [PAIR]
+        logging.warning("%s no aparece abierto en la consulta; se conservará para reintentar velas.", PAIR)
     except Exception:
-        logging.exception("Fallo al consultar get_all_open_time; se probará el respaldo.")
-
-    # La lista de códigos puede venir como símbolo->ID o ID->símbolo.
-    try:
-        active = iq.get_all_ACTIVES_OPCODE()
-        if isinstance(active, dict):
-            for key, value in active.items():
-                add_symbol(key)
-                add_symbol(value)
-    except Exception:
-        logging.exception("Fallo al consultar get_all_ACTIVES_OPCODE.")
-
-    result = sorted(candidates)[:MAX_OTC_PAIRS]
-    logging.info("Detección OTC: %d símbolos candidatos; seleccionados=%d", len(candidates), len(result))
-    if result:
-        logging.info("Pares OTC: %s", ", ".join(result))
-    else:
-        logging.warning("La API no entregó símbolos OTC. Se reintentará; el proceso seguirá activo.")
-    return result
+        logging.exception("No se pudo verificar apertura de %s; se conservará para reintentar.", PAIR)
+    # Mantener el símbolo fijo evita que una respuesta incompleta de la API deje la lista vacía.
+    return [PAIR]
 
 
 def connect_with_retry():
@@ -294,7 +270,7 @@ def connect_with_retry():
 def main():
     iq = connect_with_retry()
     telegram_send(
-        f"🟢 Bot M1 iniciado\\nPares OTC: hasta {MAX_OTC_PAIRS}\\nTemporalidad: M1\\n"
+        f"🟢 Bot M1 iniciado\\nPar único: {PAIR}\\nTemporalidad: M1\\n"
         f"Cuenta: PRACTICE\\nExpiración: {EXPIRATION_MINUTES} minuto\\n"
         f"Entradas: {'HABILITADAS en demo' if ENABLE_TRADES else 'DESACTIVADAS (análisis)'}\\n"
         "Telegram: /start /stop /status"
@@ -321,7 +297,7 @@ def main():
 
             now_mono = time.monotonic()
             if now_mono - last_heartbeat >= 60:
-                logging.info("Bot activo | pares cargados=%d | cuenta=PRACTICE", len(pairs))
+                logging.info("Bot activo | par=%s | pares cargados=%d | cuenta=PRACTICE", PAIR, len(pairs))
                 last_heartbeat = now_mono
             if not pairs or now_mono - last_refresh >= PAIR_REFRESH_SECONDS:
                 updated = discover_otc_pairs(iq)
@@ -330,7 +306,7 @@ def main():
                     pairs = updated
                     logging.info("Pares OTC actualizados: %d", len(pairs))
                     telegram_send(
-                        f"🔄 Lista OTC actualizada: {len(pairs)} pares\\n"
+                        f"🔄 Símbolo configurado: {PAIR}\\n"
                         f"Agregados: {', '.join(added) or 'ninguno'}\\n"
                         f"Retirados: {', '.join(removed) or 'ninguno'}"
                     )
