@@ -25,6 +25,8 @@ from strategy import normalize_candles, describe_history, format_candle, analyze
 
 MAX_OTC_PAIRS = 50
 PAIR_REFRESH_SECONDS = 60
+TELEGRAM_SUMMARY_SECONDS = 300
+ERROR_NOTICE_SECONDS = 300
 TIMEFRAME = 60
 HISTORY_COUNT = 200
 AMOUNT = float(os.getenv("AMOUNT", "100"))
@@ -44,6 +46,7 @@ MAX_TRADES_PER_HOUR = int(os.getenv("MAX_TRADES_PER_HOUR", "6"))
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 _session = requests.Session()
 _last_tg_sent = 0.0
+_last_error_notice = 0.0
 
 
 def telegram_send(message, retries=5):
@@ -54,7 +57,7 @@ def telegram_send(message, retries=5):
         return False
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     for attempt in range(retries):
-        wait = 1.1 - (time.monotonic() - _last_tg_sent)
+        wait = 1.5 - (time.monotonic() - _last_tg_sent)
         if wait > 0:
             time.sleep(wait)
         try:
@@ -68,8 +71,10 @@ def telegram_send(message, retries=5):
                     retry_after = float(response.json().get("parameters", {}).get("retry_after", 3))
                 except (ValueError, TypeError):
                     retry_after = 3
-                logging.warning("Telegram 429; esperando %.1f s", retry_after + 0.5)
-                time.sleep(retry_after + 0.5)
+                delay = max(retry_after + 1.0, 2.0)
+                logging.warning("Telegram 429; esperando %.1f s", delay)
+                time.sleep(delay)
+                _last_tg_sent = time.monotonic()
                 continue
             response.raise_for_status()
             data = response.json()
@@ -165,6 +170,23 @@ def place_binary(iq, pair, direction):
     return bool(ok), order_id
 
 
+def send_analysis_summary(states, pair_count):
+    """Envía un resumen único, evitando un mensaje por cada par y cada vela."""
+    active = [
+        f"{pair}: {data['signal']} ({data.get('bias', 'NEUTRAL')})"
+        for pair, data in states.items()
+        if data.get("signal") in ("CALL", "PUT")
+    ]
+    if active:
+        body = "\\n".join(active[:50])
+    else:
+        body = "Sin señales CALL/PUT; los pares analizados están en WAIT."
+    telegram_send(
+        f"📋 Resumen OTC M1\\nPares disponibles: {pair_count}\\n"
+        f"Señales actuales: {len(active)}\\n\\n{body}"
+    )
+
+
 def discover_otc_pairs(iq):
     """Obtiene hasta 50 pares OTC binarios abiertos."""
     opened = iq.get_all_open_time() or {}
@@ -186,6 +208,9 @@ def main():
     pairs, last_refresh = [], 0.0
     last_processed, last_direction = {}, {}
     history_sent, trades = set(), []
+    analysis_states = {}
+    last_summary = 0.0
+    last_error_notice = 0.0
 
     while True:
         try:
@@ -214,9 +239,9 @@ def main():
                     if len(candles) < HISTORY_COUNT:
                         logging.info("%s esperando velas: %d/%d", pair, len(candles), HISTORY_COUNT)
                         continue
-                    if SEND_HISTORY and pair not in history_sent:
-                        send_history(pair, candles)
-                        history_sent.add(pair)
+                    # El historial detallado por 50 pares genera cientos de mensajes;
+                    # el estado se comunica mediante el resumen agrupado.
+                    history_sent.add(pair)
                     ts = candles[-1]["timestamp"]
                     if ts == last_processed.get(pair):
                         continue
@@ -228,11 +253,11 @@ def main():
                         pair, signal, result.get("bias"), result.get("call_score"),
                         result.get("put_score"), result.get("reason")
                     )
-                    telegram_send(
-                        f"🔎 Análisis M1 {pair}\\nSeñal: {signal}\\nSesgo: {result.get('bias')}\\n"
-                        f"Puntaje CALL/PUT: {result.get('call_score')}/{result.get('put_score')}\\n"
-                        f"Motivo: {result.get('reason')}"
-                    )
+                    analysis_states[pair] = {
+                        "signal": signal,
+                        "bias": result.get("bias"),
+                        "reason": result.get("reason"),
+                    }
                     if signal not in ("CALL", "PUT") or signal == last_direction.get(pair):
                         continue
                     trades = _trade_count_prune(trades)
@@ -253,10 +278,21 @@ def main():
                         telegram_send(f"⚠️ Orden no aceptada: {pair} {signal} | respuesta: {order_id}")
                 except Exception as pair_exc:
                     logging.exception("Error analizando %s.", pair)
-                    telegram_send(f"⚠️ Error en {pair}: {type(pair_exc).__name__}: {pair_exc}")
+                    now_error = time.monotonic()
+                    if now_error - last_error_notice >= ERROR_NOTICE_SECONDS:
+                        telegram_send(f"⚠️ Error de análisis en {pair}: {type(pair_exc).__name__}: {pair_exc}")
+                        last_error_notice = now_error
+
+            now_summary = time.monotonic()
+            if now_summary - last_summary >= TELEGRAM_SUMMARY_SECONDS:
+                send_analysis_summary(analysis_states, len(pairs))
+                last_summary = now_summary
         except Exception as exc:
             logging.exception("Error en ciclo principal.")
-            telegram_send(f"⚠️ Error del bot: {type(exc).__name__}: {exc}")
+            now_error = time.monotonic()
+            if now_error - last_error_notice >= ERROR_NOTICE_SECONDS:
+                telegram_send(f"⚠️ Error del bot: {type(exc).__name__}: {exc}")
+                last_error_notice = now_error
             time.sleep(3)
         time.sleep(POLL_SECONDS)
 
