@@ -102,9 +102,10 @@ def main():
                     # Ejecutar inmediatamente al detectar la señal; sin esperar una ventana de segundos.
                     if res['signal'] in ('CALL','PUT') and ENABLE_TRADES:
                         iq.change_balance('PRACTICE')
-                        ok,oid=iq.buy(AMOUNT,pair,res['signal'].lower(),EXPIRATION)
-                        logging.info('%s orden %s | ok=%s | respuesta=%s',pair,res['signal'],ok,oid)
-                        tg(f'{"🧪 Orden enviada" if ok else "⚠️ Orden rechazada"}\n{pair} {res["signal"]}\nID/respuesta: {oid}')
+                        inverse_signal = 'PUT' if res['signal'] == 'CALL' else 'CALL'
+                        ok,oid=iq.buy(AMOUNT,pair,inverse_signal.lower(),EXPIRATION)
+                        logging.info('%s señal=%s | orden invertida=%s | ok=%s | respuesta=%s',pair,res['signal'],inverse_signal,ok,oid)
+                        tg(f'{"🧪 Orden enviada" if ok else "⚠️ Orden rechazada"}\n{pair} señal {res["signal"]} → orden {inverse_signal}\nID/respuesta: {oid}')
                     tg(f'📈 {pair} M1\nSeñal: {res["signal"]}\nContexto: {ctxs}\nEtapas: {stages}\nMotivo: {res["reason"]}')
                 except Exception as e:
                     logging.exception('Error analizando %s',pair)
