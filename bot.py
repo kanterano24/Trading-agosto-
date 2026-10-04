@@ -23,10 +23,11 @@ def _safe_digital_underlying_list_data(self):
 IQ_Option.get_digital_underlying_list_data = _safe_digital_underlying_list_data
 from strategy import normalize_candles, describe_history, format_candle, analyze_market
 
-PAIR = os.getenv("ANALYSIS_PAIR", "GBPUSD-OTC").strip().upper()
+MAX_OTC_PAIRS = 50
+PAIR_REFRESH_SECONDS = 60
 TIMEFRAME = 60
 HISTORY_COUNT = 200
-AMOUNT = float(os.getenv("AMOUNT", "1000"))
+AMOUNT = float(os.getenv("AMOUNT", "100"))
 EXPIRATION_MINUTES = 1
 POLL_SECONDS = max(1.0, float(os.getenv("POLL_SECONDS", "2")))
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
@@ -117,9 +118,9 @@ def server_time(iq):
         return int(time.time())
 
 
-def get_closed_candles(iq, count=HISTORY_COUNT):
+def get_closed_candles(iq, pair, count=HISTORY_COUNT):
     now = server_time(iq)
-    raw = iq.get_candles(PAIR, TIMEFRAME, count + 20, now) or []
+    raw = iq.get_candles(pair, TIMEFRAME, count + 20, now) or []
     current_minute = now - now % TIMEFRAME
     closed = []
     for item in raw:
@@ -132,10 +133,10 @@ def get_closed_candles(iq, count=HISTORY_COUNT):
     return normalize_candles(closed)[-count:]
 
 
-def send_history(candles):
+def send_history(pair, candles):
     report = describe_history(candles)
     header = (
-        f"📊 HISTORIAL M1 | {PAIR}\n"
+        f"📊 HISTORIAL M1 | {pair}\n"
         f"Velas cerradas: {report['count']}/{HISTORY_COUNT}\n"
         f"Verdes: {report['greens']} | Rojas: {report['reds']} | Doji: {report['dojis']}\n"
         f"Máximo: {report['highest']} | Mínimo: {report['lowest']}\n"
@@ -146,7 +147,7 @@ def send_history(candles):
     details = [format_candle(i, candle) for i, candle in enumerate(candles, 1)]
     chunks = split_messages(details)
     for i, chunk in enumerate(chunks, 1):
-        telegram_send(f"🕯️ {PAIR} | Historial {i}/{len(chunks)}\n\n{chunk}")
+        telegram_send(f"🕯️ {pair} | Historial {i}/{len(chunks)}\n\n{chunk}")
 
 
 def _trade_count_prune(trades):
@@ -154,98 +155,109 @@ def _trade_count_prune(trades):
     return [t for t in trades if t >= cutoff]
 
 
-def place_binary(iq, direction):
+def place_binary(iq, pair, direction):
     """Abre operación binaria de 1 minuto; solo si ENABLE_TRADES está habilitado."""
     if not ENABLE_TRADES:
         return False, "ENABLE_TRADES=false; solo análisis"
     # Reafirma PRACTICE justo antes de cualquier orden.
     iq.change_balance("PRACTICE")
-    ok, order_id = iq.buy(AMOUNT, PAIR, direction.lower(), EXPIRATION_MINUTES)
+    ok, order_id = iq.buy(AMOUNT, pair, direction.lower(), EXPIRATION_MINUTES)
     return bool(ok), order_id
+
+
+def discover_otc_pairs(iq):
+    """Obtiene hasta 50 pares OTC binarios abiertos."""
+    opened = iq.get_all_open_time() or {}
+    binary = opened.get("binary", {}) if isinstance(opened, dict) else {}
+    names = [
+        name for name, info in binary.items()
+        if name.upper().endswith("-OTC") and isinstance(info, dict) and info.get("open") is True
+    ]
+    return sorted(set(names))[:MAX_OTC_PAIRS]
 
 
 def main():
     iq = connect_iq()
     telegram_send(
-        f"🟢 Bot M1 iniciado\nPar: {PAIR}\nTemporalidad: M1\n"
-        f"Cuenta: PRACTICE\nExpiración: {EXPIRATION_MINUTES} minuto\n"
+        f"🟢 Bot M1 iniciado\\nPares OTC: hasta {MAX_OTC_PAIRS}\\nTemporalidad: M1\\n"
+        f"Cuenta: PRACTICE\\nExpiración: {EXPIRATION_MINUTES} minuto\\n"
         f"Entradas: {'HABILITADAS en demo' if ENABLE_TRADES else 'DESACTIVADAS (análisis)'}"
     )
-
-    history_sent = False
-    last_processed = None
-    last_direction = None
-    trades = []
+    pairs, last_refresh = [], 0.0
+    last_processed, last_direction = {}, {}
+    history_sent, trades = set(), []
 
     while True:
         try:
-            candles = get_closed_candles(iq, HISTORY_COUNT)
-            if len(candles) < HISTORY_COUNT:
-                logging.info("Esperando velas: %d/%d", len(candles), HISTORY_COUNT)
+            now_mono = time.monotonic()
+            if not pairs or now_mono - last_refresh >= PAIR_REFRESH_SECONDS:
+                updated = discover_otc_pairs(iq)
+                if updated != pairs:
+                    added, removed = sorted(set(updated)-set(pairs)), sorted(set(pairs)-set(updated))
+                    pairs = updated
+                    logging.info("Pares OTC actualizados: %d", len(pairs))
+                    telegram_send(
+                        f"🔄 Lista OTC actualizada: {len(pairs)} pares\\n"
+                        f"Agregados: {', '.join(added) or 'ninguno'}\\n"
+                        f"Retirados: {', '.join(removed) or 'ninguno'}"
+                    )
+                last_refresh = now_mono
+
+            if not pairs:
+                logging.warning("No hay pares OTC abiertos.")
                 time.sleep(POLL_SECONDS)
                 continue
 
-            if SEND_HISTORY and not history_sent:
-                send_history(candles)
-                history_sent = True
-
-            latest = candles[-1]
-            candle_ts = latest["timestamp"]
-            if candle_ts == last_processed:
-                time.sleep(POLL_SECONDS)
-                continue
-            last_processed = candle_ts
-
-            result = analyze_market(candles)
-            signal = result["signal"]
-            logging.info(
-                "Análisis %s | señal=%s | sesgo=%s | CALL=%s PUT=%s | %s",
-                PAIR, signal, result.get("bias"), result.get("call_score"),
-                result.get("put_score"), result.get("reason")
-            )
-            telegram_send(
-                f"🔎 Análisis M1 {PAIR}\nSeñal: {signal}\nSesgo: {result.get('bias')}\n"
-                f"Puntaje CALL/PUT: {result.get('call_score')}/{result.get('put_score')}\n"
-                f"Motivo: {result.get('reason')}"
-            )
-
-            if signal not in ("CALL", "PUT"):
-                continue
-            if signal == last_direction:
-                logging.info("Se omite señal repetida consecutiva: %s", signal)
-                continue
-            trades = _trade_count_prune(trades)
-            if len(trades) >= MAX_TRADES_PER_HOUR:
-                logging.warning("Límite horario alcanzado.")
-                continue
-
-            # Se ejecuta solo dentro de la ventana inicial de la vela siguiente.
-            now = server_time(iq)
-            second = now % TIMEFRAME
-            if second > MAX_ENTRY_SECOND or second < MIN_SECONDS_IN_CANDLE:
-                msg = f"Señal {signal} omitida: fuera de ventana de entrada (segundo {second})."
-                logging.info(msg)
-                telegram_send(msg)
-                continue
-
-            ok, order_id = place_binary(iq, signal)
-            if ok:
-                trades.append(time.time())
-                last_direction = signal
-                telegram_send(
-                    f"🧪 Entrada enviada en PRACTICE\nPar: {PAIR}\nDirección: {signal}\n"
-                    f"Expiración: 1 minuto\nID: {order_id}"
-                )
-                logging.info("Orden aceptada: %s %s id=%s", PAIR, signal, order_id)
-            else:
-                telegram_send(f"⚠️ Orden no aceptada: {signal} | respuesta: {order_id}")
-                logging.warning("Orden rechazada: %s", order_id)
-
+            for pair in list(pairs):
+                try:
+                    candles = get_closed_candles(iq, pair, HISTORY_COUNT)
+                    if len(candles) < HISTORY_COUNT:
+                        logging.info("%s esperando velas: %d/%d", pair, len(candles), HISTORY_COUNT)
+                        continue
+                    if SEND_HISTORY and pair not in history_sent:
+                        send_history(pair, candles)
+                        history_sent.add(pair)
+                    ts = candles[-1]["timestamp"]
+                    if ts == last_processed.get(pair):
+                        continue
+                    last_processed[pair] = ts
+                    result = analyze_market(candles)
+                    signal = result["signal"]
+                    logging.info(
+                        "Análisis %s | señal=%s | sesgo=%s | CALL=%s PUT=%s | %s",
+                        pair, signal, result.get("bias"), result.get("call_score"),
+                        result.get("put_score"), result.get("reason")
+                    )
+                    telegram_send(
+                        f"🔎 Análisis M1 {pair}\\nSeñal: {signal}\\nSesgo: {result.get('bias')}\\n"
+                        f"Puntaje CALL/PUT: {result.get('call_score')}/{result.get('put_score')}\\n"
+                        f"Motivo: {result.get('reason')}"
+                    )
+                    if signal not in ("CALL", "PUT") or signal == last_direction.get(pair):
+                        continue
+                    trades = _trade_count_prune(trades)
+                    if len(trades) >= MAX_TRADES_PER_HOUR:
+                        continue
+                    sec = server_time(iq) % TIMEFRAME
+                    if sec > MAX_ENTRY_SECOND or sec < MIN_SECONDS_IN_CANDLE:
+                        continue
+                    ok, order_id = place_binary(iq, pair, signal)
+                    if ok:
+                        trades.append(time.time())
+                        last_direction[pair] = signal
+                        telegram_send(
+                            f"🧪 Entrada enviada en PRACTICE\\nPar: {pair}\\nDirección: {signal}\\n"
+                            f"Expiración: 1 minuto\\nID: {order_id}"
+                        )
+                    else:
+                        telegram_send(f"⚠️ Orden no aceptada: {pair} {signal} | respuesta: {order_id}")
+                except Exception as pair_exc:
+                    logging.exception("Error analizando %s.", pair)
+                    telegram_send(f"⚠️ Error en {pair}: {type(pair_exc).__name__}: {pair_exc}")
         except Exception as exc:
             logging.exception("Error en ciclo principal.")
             telegram_send(f"⚠️ Error del bot: {type(exc).__name__}: {exc}")
             time.sleep(3)
-
         time.sleep(POLL_SECONDS)
 
 
