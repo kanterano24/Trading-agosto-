@@ -8,9 +8,22 @@ import os
 import time
 import requests
 from iqoptionapi.stable_api import IQ_Option
+
+# Protección para el hilo digital de iqoptionapi; el bot opera binarias.
+_original_digital_underlying_list_data = IQ_Option.get_digital_underlying_list_data
+
+def _safe_digital_underlying_list_data(self):
+    data = _original_digital_underlying_list_data(self)
+    if not isinstance(data, dict):
+        return {"underlying": []}
+    if not isinstance(data.get("underlying"), list):
+        data["underlying"] = []
+    return data
+
+IQ_Option.get_digital_underlying_list_data = _safe_digital_underlying_list_data
 from strategy import normalize_candles, describe_history, format_candle, analyze_market
 
-PAIR = os.getenv("ANALYSIS_PAIR", "GBPUSD-OTC", "USDCHF-OTC").strip().upper()
+PAIR = os.getenv("ANALYSIS_PAIR", "GBPUSD-OTC").strip().upper()
 TIMEFRAME = 60
 HISTORY_COUNT = 200
 AMOUNT = float(os.getenv("AMOUNT", "1000"))
