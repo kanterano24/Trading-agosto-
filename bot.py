@@ -173,20 +173,21 @@ def place_binary(iq, pair, direction):
 
 
 def send_analysis_summary(states, pair_count):
-    """Envía un resumen único, evitando un mensaje por cada par y cada vela."""
-    active = [
-        f"{pair}: {data['signal']} ({data.get('bias', 'NEUTRAL')})"
-        for pair, data in states.items()
-        if data.get("signal") in ("CALL", "PUT")
+    """Resumen compacto de los pares ya analizados."""
+    calls = [p for p, d in states.items() if d.get("signal") == "CALL"]
+    puts = [p for p, d in states.items() if d.get("signal") == "PUT"]
+    waits = sum(1 for d in states.values() if d.get("signal") == "WAIT")
+    lines = [
+        "📋 Resumen OTC M1",
+        f"Pares disponibles: {pair_count}",
+        f"Pares analizados: {len(states)}",
+        f"CALL: {len(calls)} | PUT: {len(puts)} | WAIT: {waits}",
     ]
-    if active:
-        body = "\\n".join(active[:50])
-    else:
-        body = "Sin señales CALL/PUT; los pares analizados están en WAIT."
-    telegram_send(
-        f"📋 Resumen OTC M1\\nPares disponibles: {pair_count}\\n"
-        f"Señales actuales: {len(active)}\\n\\n{body}"
-    )
+    if calls:
+        lines.append("CALL: " + ", ".join(calls[:25]))
+    if puts:
+        lines.append("PUT: " + ", ".join(puts[:25]))
+    telegram_send("\n".join(lines))
 
 
 def discover_otc_pairs(iq):
@@ -200,8 +201,20 @@ def discover_otc_pairs(iq):
     return sorted(set(names))[:MAX_OTC_PAIRS]
 
 
+def connect_with_retry():
+    delay = 5
+    while True:
+        try:
+            return connect_iq()
+        except Exception as exc:
+            logging.exception("Fallo de conexión IQ Option; reintentando.")
+            telegram_send(f"⚠️ Conexión IQ Option fallida ({type(exc).__name__}); reintento en {delay}s.")
+            time.sleep(delay)
+            delay = min(delay * 2, 60)
+
+
 def main():
-    iq = connect_iq()
+    iq = connect_with_retry()
     telegram_send(
         f"🟢 Bot M1 iniciado\\nPares OTC: hasta {MAX_OTC_PAIRS}\\nTemporalidad: M1\\n"
         f"Cuenta: PRACTICE\\nExpiración: {EXPIRATION_MINUTES} minuto\\n"
@@ -216,6 +229,15 @@ def main():
 
     while True:
         try:
+            try:
+                connected = iq.check_connect()
+            except Exception:
+                connected = False
+            if not connected:
+                logging.warning("Conexión IQ Option perdida; reconectando.")
+                pairs = []
+                iq = connect_with_retry()
+
             now_mono = time.monotonic()
             if not pairs or now_mono - last_refresh >= PAIR_REFRESH_SECONDS:
                 updated = discover_otc_pairs(iq)
