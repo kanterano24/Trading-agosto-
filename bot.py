@@ -11,7 +11,7 @@ PAIRS = [
     "USDCHF-OTC",
 ]
 TF=60; COUNT=200; EXPIRATION=1
-AMOUNT=float(os.getenv('AMOUNT','1000')); ENABLE_TRADES=os.getenv('ENABLE_TRADES','false').lower() in ('1','true','yes','si')
+AMOUNT=float(os.getenv('AMOUNT','1000')); ENABLE_TRADES=os.getenv('ENABLE_TRADES','true').lower() in ('1','true','yes','si')
 EMAIL=os.getenv('IQ_EMAIL',''); PASSWORD=os.getenv('IQ_PASSWORD',''); TOKEN=os.getenv('TELEGRAM_TOKEN',''); CHAT=os.getenv('TELEGRAM_CHAT_ID','')
 POLL=max(1,float(os.getenv('POLL_SECONDS','2'))); logging.basicConfig(level=logging.INFO,format='%(asctime)s | %(levelname)s | %(message)s')
 sess=requests.Session(); tg_last=0
@@ -99,13 +99,13 @@ def main():
                     stages=', '.join(k for k,v in res['stages'].items() if v) or 'ninguna'
                     ctxs=' | '.join(f'{n}:{ctx[n]["bias"]}' for n in (2,3,5,10))
                     logging.info('%s señal=%s sesgo=%s CALL=%s PUT=%s | %s | etapas=%s',pair,res['signal'],res['bias'],res['call_score'],res['put_score'],res['reason'],stages)
-                    tg(f'📈 {pair} M1\nSeñal: {res["signal"]}\nContexto: {ctxs}\nEtapas: {stages}\nMotivo: {res["reason"]}')
+                    # Ejecutar inmediatamente al detectar la señal; sin esperar una ventana de segundos.
                     if res['signal'] in ('CALL','PUT') and ENABLE_TRADES:
-                        sec=now%60
-                        if sec<=8:
-                            iq.change_balance('PRACTICE'); ok,oid=iq.buy(AMOUNT,pair,res['signal'].lower(),EXPIRATION)
-                            tg(f'{"🧪 Orden enviada" if ok else "⚠️ Orden rechazada"}\n{pair} {res["signal"]}\nID/respuesta: {oid}')
-                        else: logging.info('%s señal fuera de ventana (%ss); no se ejecuta',pair,sec)
+                        iq.change_balance('PRACTICE')
+                        ok,oid=iq.buy(AMOUNT,pair,res['signal'].lower(),EXPIRATION)
+                        logging.info('%s orden %s | ok=%s | respuesta=%s',pair,res['signal'],ok,oid)
+                        tg(f'{"🧪 Orden enviada" if ok else "⚠️ Orden rechazada"}\n{pair} {res["signal"]}\nID/respuesta: {oid}')
+                    tg(f'📈 {pair} M1\nSeñal: {res["signal"]}\nContexto: {ctxs}\nEtapas: {stages}\nMotivo: {res["reason"]}')
                 except Exception as e:
                     logging.exception('Error analizando %s',pair)
                     if time.monotonic()-last_error>60:
