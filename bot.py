@@ -40,7 +40,7 @@ IQ_EMAIL = os.getenv("IQ_EMAIL", "")
 IQ_PASSWORD = os.getenv("IQ_PASSWORD", "")
 SEND_HISTORY = os.getenv("SEND_HISTORY", "true").lower() in ("1", "true", "yes")
 # El usuario debe habilitarlo explícitamente; aun así, la cuenta queda forzada a PRACTICE.
-ENABLE_TRADES = os.getenv("ENABLE_TRADES", "false").lower() in ("1", "true", "yes")
+ENABLE_TRADES = os.getenv("ENABLE_TRADES", "true").lower() in ("1", "true", "yes")
 MIN_SECONDS_IN_CANDLE = float(os.getenv("MIN_SECONDS_IN_CANDLE", "1.5"))
 MAX_ENTRY_SECOND = float(os.getenv("MAX_ENTRY_SECOND", "12"))
 MAX_TRADES_PER_HOUR = int(os.getenv("MAX_TRADES_PER_HOUR", "6"))
@@ -226,6 +226,7 @@ def main():
     analysis_states = {}
     last_summary = 0.0
     last_error_notice = 0.0
+    last_heartbeat = 0.0
 
     while True:
         try:
@@ -239,6 +240,9 @@ def main():
                 iq = connect_with_retry()
 
             now_mono = time.monotonic()
+            if now_mono - last_heartbeat >= 60:
+                logging.info("Bot activo | pares cargados=%d | cuenta=PRACTICE", len(pairs))
+                last_heartbeat = now_mono
             if not pairs or now_mono - last_refresh >= PAIR_REFRESH_SECONDS:
                 updated = discover_otc_pairs(iq)
                 if updated != pairs:
@@ -322,4 +326,16 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    while True:
+        try:
+            main()
+        except KeyboardInterrupt:
+            logging.info("Interrupción solicitada; cerrando bot.")
+            break
+        except Exception:
+            logging.exception("Fallo fatal fuera del ciclo; reinicio en 10 segundos.")
+            try:
+                telegram_send("⚠️ El proceso principal terminó por un error. Reintentando en 10 segundos.")
+            except Exception:
+                logging.exception("No se pudo notificar el fallo fatal.")
+            time.sleep(10)
