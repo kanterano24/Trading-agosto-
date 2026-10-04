@@ -25,13 +25,13 @@ def _disable_digital_open(self):
 IQ_Option._get_digital_open = _disable_digital_open
 from strategy import normalize_candles, describe_history, format_candle, analyze_market
 
-MAX_OTC_PAIRS = 50
+MAX_OTC_PAIRS = 59
 PAIR_REFRESH_SECONDS = 60
 TELEGRAM_SUMMARY_SECONDS = 300
 ERROR_NOTICE_SECONDS = 300
 TIMEFRAME = 60
 HISTORY_COUNT = 200
-AMOUNT = float(os.getenv("AMOUNT", "100"))
+AMOUNT = float(os.getenv("AMOUNT", "1000"))
 EXPIRATION_MINUTES = 1
 POLL_SECONDS = max(1.0, float(os.getenv("POLL_SECONDS", "2")))
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
@@ -49,6 +49,8 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(
 _session = requests.Session()
 _last_tg_sent = 0.0
 _last_error_notice = 0.0
+_tg_update_offset = 0
+_scan_enabled = True
 
 
 def telegram_send(message, retries=5):
@@ -89,6 +91,47 @@ def telegram_send(message, retries=5):
             time.sleep(min(2 ** attempt, 15))
     logging.error("No se pudo enviar el mensaje a Telegram.")
     return False
+
+
+
+def telegram_commands(iq, pairs, analysis_states):
+    """Procesa /start, /stop y /status en el chat configurado."""
+    global _tg_update_offset, _scan_enabled
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        return
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates"
+    try:
+        response = _session.get(
+            url,
+            params={"offset": _tg_update_offset, "timeout": 1, "allowed_updates": ["message"]},
+            timeout=5,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        if not payload.get("ok"):
+            return
+        for update in payload.get("result", []):
+            _tg_update_offset = max(_tg_update_offset, int(update.get("update_id", 0)) + 1)
+            message = update.get("message", {})
+            chat_id = str(message.get("chat", {}).get("id", ""))
+            if chat_id != str(TELEGRAM_CHAT_ID):
+                continue
+            command = (message.get("text") or "").strip().split()[0].lower().split("@")[0]
+            if command == "/start":
+                _scan_enabled = True
+                telegram_send("▶️ Análisis y operaciones habilitados. Cuenta PRACTICE.")
+            elif command == "/stop":
+                _scan_enabled = False
+                telegram_send("⏸️ Análisis y nuevas operaciones detenidos. El proceso sigue conectado.")
+            elif command == "/status":
+                state = "ACTIVO" if _scan_enabled else "DETENIDO"
+                telegram_send(
+                    f"📊 Estado: {state}\\nConexión IQ: {'conectada' if iq.check_connect() else 'desconectada'}"
+                    f"\\nCuenta: PRACTICE\\nPares cargados: {len(pairs)}"
+                    f"\\nPares con análisis: {len(analysis_states)}\\nExpiración: 1 minuto"
+                )
+    except Exception as exc:
+        logging.warning("No se pudieron consultar comandos Telegram: %s", exc)
 
 
 def split_messages(lines, max_chars=3200):
@@ -191,14 +234,32 @@ def send_analysis_summary(states, pair_count):
 
 
 def discover_otc_pairs(iq):
-    """Obtiene hasta 50 pares OTC binarios abiertos."""
-    opened = iq.get_all_open_time() or {}
-    binary = opened.get("binary", {}) if isinstance(opened, dict) else {}
-    names = [
-        name for name, info in binary.items()
-        if name.upper().endswith("-OTC") and isinstance(info, dict) and info.get("open") is True
-    ]
-    return sorted(set(names))[:MAX_OTC_PAIRS]
+    """Descubre hasta 59 pares OTC habilitados; usa códigos activos como respaldo."""
+    candidates = set()
+    try:
+        opened = iq.get_all_open_time() or {}
+        if isinstance(opened, dict):
+            for market in ("binary", "turbo"):
+                section = opened.get(market, {})
+                if isinstance(section, dict):
+                    for name, info in section.items():
+                        if name.upper().endswith("-OTC") and isinstance(info, dict) and info.get("open") is True:
+                            candidates.add(name.upper())
+    except Exception as exc:
+        logging.warning("No se pudo leer horario de activos: %s", exc)
+
+    # El endpoint de horarios puede omitir OTC aunque haya activos disponibles.
+    try:
+        active = iq.get_all_ACTIVES_OPCODE() or {}
+        if isinstance(active, dict):
+            for name in active:
+                normalized = str(name).upper()
+                if normalized.endswith("-OTC"):
+                    candidates.add(normalized)
+    except Exception as exc:
+        logging.warning("No se pudo leer lista de activos: %s", exc)
+
+    return sorted(candidates)[:MAX_OTC_PAIRS]
 
 
 def connect_with_retry():
@@ -218,7 +279,8 @@ def main():
     telegram_send(
         f"🟢 Bot M1 iniciado\\nPares OTC: hasta {MAX_OTC_PAIRS}\\nTemporalidad: M1\\n"
         f"Cuenta: PRACTICE\\nExpiración: {EXPIRATION_MINUTES} minuto\\n"
-        f"Entradas: {'HABILITADAS en demo' if ENABLE_TRADES else 'DESACTIVADAS (análisis)'}"
+        f"Entradas: {'HABILITADAS en demo' if ENABLE_TRADES else 'DESACTIVADAS (análisis)'}\\n"
+        "Telegram: /start /stop /status"
     )
     pairs, last_refresh = [], 0.0
     last_processed, last_direction = {}, {}
@@ -230,6 +292,7 @@ def main():
 
     while True:
         try:
+            telegram_commands(iq, pairs, analysis_states)
             try:
                 connected = iq.check_connect()
             except Exception:
@@ -257,7 +320,11 @@ def main():
                 last_refresh = now_mono
 
             if not pairs:
-                logging.warning("No hay pares OTC abiertos.")
+                logging.warning("No se detectaron pares OTC. Se reintentará la detección.")
+                time.sleep(POLL_SECONDS)
+                continue
+
+            if not _scan_enabled:
                 time.sleep(POLL_SECONDS)
                 continue
 
