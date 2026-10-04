@@ -1,223 +1,90 @@
-"""
-Bot M1 para hasta 50 pares BINARY OTC activos.
-Analiza 200 velas cerradas por par con strategy.py.
-Las órdenes, si se habilitan, se envían únicamente a PRACTICE.
-"""
-import logging, os, time
-import requests
+"""Bot EURUSD-OTC M1: contexto 2/3/5/10 y secuencia de precio. PRACTICE solamente."""
+import logging, os, time, requests
 from iqoptionapi.stable_api import IQ_Option
 from strategy import normalize_candles, describe_history, format_candle, analyze_market
+PAIR='EURUSD-OTC'; TF=60; COUNT=200; EXPIRATION=1
+AMOUNT=float(os.getenv('AMOUNT','1000')); ENABLE_TRADES=os.getenv('ENABLE_TRADES','false').lower() in ('1','true','yes','si')
+EMAIL=os.getenv('IQ_EMAIL',''); PASSWORD=os.getenv('IQ_PASSWORD',''); TOKEN=os.getenv('TELEGRAM_TOKEN',''); CHAT=os.getenv('TELEGRAM_CHAT_ID','')
+POLL=max(1,float(os.getenv('POLL_SECONDS','2'))); logging.basicConfig(level=logging.INFO,format='%(asctime)s | %(levelname)s | %(message)s')
+sess=requests.Session(); tg_last=0
+# Evita el hilo digital que en algunas versiones falla al indexar None.
+def safe_underlying(self): return {'underlying':[]}
+def no_digital_open(self): return None
+IQ_Option.get_digital_underlying_list_data=safe_underlying
+if hasattr(IQ_Option,'_get_digital_open'): IQ_Option._get_digital_open=no_digital_open
 
-TIMEFRAME = 60
-HISTORY_COUNT = 200
-PAIR = "EURUSD-OTC"
-MAX_OTC_PAIRS = 1
-AMOUNT = float(os.getenv("AMOUNT", "1"))
-EXPIRATION_MINUTES = 1
-POLL_SECONDS = max(1.0, float(os.getenv("POLL_SECONDS", "1")))
-PAIR_REFRESH_SECONDS = max(60.0, float(os.getenv("PAIR_REFRESH_SECONDS", "600")))
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
-IQ_EMAIL, IQ_PASSWORD = os.getenv("IQ_EMAIL", ""), os.getenv("IQ_PASSWORD", "")
-SEND_HISTORY = os.getenv("SEND_HISTORY", "false").lower() in ("1","true","yes")
-ENABLE_TRADES = os.getenv("ENABLE_TRADES", "true").lower() in ("1","true","yes")
-MIN_ENTRY_SECOND = float(os.getenv("MIN_ENTRY_SECOND", "1"))
-MAX_ENTRY_SECOND = float(os.getenv("MAX_ENTRY_SECOND", "20"))
-MAX_TRADES_PER_HOUR = max(1, int(os.getenv("MAX_TRADES_PER_HOUR", "6")))
-TG_MIN_INTERVAL = max(1.2, float(os.getenv("TG_MIN_INTERVAL", "2.0")))
-
-logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
-session = requests.Session()
-last_tg_sent = 0.0
-
-def telegram_send(message, retries=5):
-    global last_tg_sent
-    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        logging.warning("Telegram no configurado; mensaje omitido.")
-        return False
-    url=f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    for attempt in range(retries):
-        pause=TG_MIN_INTERVAL-(time.monotonic()-last_tg_sent)
-        if pause>0: time.sleep(pause)
-        try:
-            r=session.post(url, data={"chat_id":TELEGRAM_CHAT_ID,"text":message,
-                                      "disable_web_page_preview":True}, timeout=25)
-            if r.status_code==429:
-                try: delay=float(r.json().get("parameters",{}).get("retry_after",5))
-                except (ValueError,TypeError): delay=5
-                logging.warning("Telegram 429; pausa %.1fs",delay+1)
-                time.sleep(delay+1); continue
-            r.raise_for_status()
-            if not r.json().get("ok"): raise RuntimeError(f"Telegram: {r.text}")
-            last_tg_sent=time.monotonic()
-            return True
-        except requests.RequestException as e:
-            logging.warning("Telegram intento %d/%d: %s",attempt+1,retries,e)
-            time.sleep(min(2**attempt,20))
-    logging.error("Telegram no aceptó el mensaje.")
-    return False
-
-def split_messages(lines, max_chars=3000):
-    chunks=[]; current=""
-    for line in lines:
-        addition=("\n\n" if current else "")+line
-        if current and len(current)+len(addition)>max_chars:
-            chunks.append(current); current=line
-        else: current+=addition
-    if current: chunks.append(current)
-    return chunks
-
-def connect_iq():
-    if not IQ_EMAIL or not IQ_PASSWORD:
-        raise RuntimeError("Faltan IQ_EMAIL/IQ_PASSWORD.")
-    iq=IQ_Option(IQ_EMAIL,IQ_PASSWORD)
-    ok, reason=iq.connect()
-    if not ok: raise RuntimeError(f"No conecta IQ Option: {reason}")
-    iq.change_balance("PRACTICE")
-    time.sleep(1)
-    logging.info("Conectado a IQ Option; PRACTICE solicitado.")
-    return iq
-
-def server_time(iq):
+def tg(msg):
+    global tg_last
+    if not TOKEN or not CHAT: return False
     try:
-        value=iq.get_server_timestamp()
-        return float(value) if value else time.time()
-    except Exception:
-        return time.time()
+        wait=1.2-(time.monotonic()-tg_last)
+        if wait>0: time.sleep(wait)
+        r=sess.post(f'https://api.telegram.org/bot{TOKEN}/sendMessage',data={'chat_id':CHAT,'text':msg},timeout=15); r.raise_for_status()
+        if not r.json().get('ok'): raise RuntimeError(str(r.json()))
+        tg_last=time.monotonic(); return True
+    except Exception: logging.exception('Error Telegram'); return False
 
-def discover_otc_pairs(iq):
-    """Mantiene EURUSD-OTC como único símbolo; la disponibilidad se valida al pedir velas."""
-    return [PAIR]
+def connect():
+    if not EMAIL or not PASSWORD: raise RuntimeError('Faltan IQ_EMAIL/IQ_PASSWORD en Railway')
+    iq=IQ_Option(EMAIL,PASSWORD); ok,why=iq.connect()
+    if not ok: raise RuntimeError(f'Conexión fallida: {why}')
+    iq.change_balance('PRACTICE'); logging.info('Conectado a PRACTICE'); return iq
 
-    """Obtiene activos OTC binarios abiertos; si el endpoint falla, usa lista de activos."""
-    found=[]
-    try:
-        data=iq.get_all_open_time() or {}
-        binary=data.get("binary") or {}
-        for pair, info in binary.items():
-            if "-OTC" in pair.upper() and isinstance(info,dict) and info.get("open") is True:
-                found.append(pair)
-    except Exception:
-        logging.exception("No se pudo consultar el horario de activos binarios.")
-    # Algunos builds no exponen correctamente el horario; usar códigos conocidos disponibles.
-    if not found:
-        try:
-            codes=iq.get_all_ACTIVES_OPCODE() or {}
-            found=[name for name in codes if "-OTC" in str(name).upper()]
-        except Exception:
-            logging.exception("No se pudo obtener la lista alternativa de activos.")
-    pairs=sorted(set(found))[:MAX_OTC_PAIRS]
-    if not pairs:
-        raise RuntimeError("IQ Option no devolvió pares OTC binarios disponibles.")
-    return pairs
+def connect_retry():
+    delay=5
+    while True:
+        try: return connect()
+        except Exception as e:
+            logging.exception('No conectó; reintento en %ss',delay); tg(f'⚠️ Conexión fallida ({type(e).__name__}); reintento en {delay}s')
+            time.sleep(delay); delay=min(delay*2,60)
 
-def get_closed_candles(iq, pair, count=HISTORY_COUNT):
-    now=server_time(iq)
-    raw=iq.get_candles(pair,TIMEFRAME,count+30,int(now)) or []
-    current_start=int(now//TIMEFRAME)*TIMEFRAME
+def get_candles(iq):
+    try: now=int(iq.get_server_timestamp())
+    except Exception: now=int(time.time())
+    raw=iq.get_candles(PAIR,TF,COUNT+20,now) or []; minute=now-now%TF
     closed=[]
     for c in raw:
         try:
-            ts=int(c.get("from",c.get("at",0)))
-            if ts>0 and ts+TIMEFRAME<=current_start:
-                closed.append(c)
-        except (TypeError,ValueError):
-            continue
-    return normalize_candles(closed)[-count:]
-
-def send_history(pair,candles):
-    report=describe_history(candles)
-    telegram_send(f"📊 HISTORIAL M1 | {pair}\nVelas: {report['count']}/{HISTORY_COUNT}\n"
-                  f"Verdes: {report['greens']} | Rojas: {report['reds']} | Doji: {report['dojis']}\n"
-                  f"Máximo: {report['highest']} | Mínimo: {report['lowest']}\n"
-                  f"Cambio neto: {report['net_change']:+.6f}")
-    for i,chunk in enumerate(split_messages([format_candle(n,c) for n,c in enumerate(candles,1)]),1):
-        if not telegram_send(f"🕯️ {pair} | Bloque {i}\n\n{chunk}"):
-            logging.error("Falló historial de %s bloque %d",pair,i)
-            return False
-    return True
-
-def place_binary(iq,pair,direction):
-    if not ENABLE_TRADES: return False,"ENABLE_TRADES=false"
-    iq.change_balance("PRACTICE")
-    return iq.buy(AMOUNT,pair,direction.lower(),EXPIRATION_MINUTES)
+            start=int(c.get('from',c.get('at',0)))
+            if start>0 and start+TF<=minute: closed.append(c)
+        except (TypeError,ValueError): pass
+    return normalize_candles(closed)[-COUNT:],now
 
 def main():
-    iq=connect_iq()
-    pairs=[]
-    last_refresh=0.0
-    last_seen={}
-    last_direction={}
-    history_sent=set()
-    trades=[]
-    telegram_send("🟢 Bot M1 iniciado\nMercado: OTC binario\nPar único: EURUSD-OTC\n"
-                  "Análisis: 200 velas cerradas M1 por par\nCuenta solicitada: PRACTICE")
+    iq=connect_retry(); tg(f'🟢 Bot iniciado\nPar único: {PAIR}\nM1; expiración 1 min\nCuenta PRACTICE\nOperaciones: {"habilitadas" if ENABLE_TRADES else "solo análisis"}')
+    last=None; history_done=False; last_error=0
     while True:
         try:
-            now_mono=time.monotonic()
-            if not pairs or now_mono-last_refresh>=PAIR_REFRESH_SECONDS:
-                pairs=discover_otc_pairs(iq)
-                last_refresh=now_mono
-                logging.info("Pares cargados=%d | par=%s",len(pairs),PAIR)
-                telegram_send(f"🔄 Par configurado: {PAIR} | pares cargados: {len(pairs)}")
-            for pair in pairs:
-                try:
-                    candles=get_closed_candles(iq,pair)
-                    if len(candles)<HISTORY_COUNT:
-                        logging.info("%s: velas %d/%d",pair,len(candles),HISTORY_COUNT)
-                        continue
-                    if SEND_HISTORY and pair not in history_sent:
-                        if send_history(pair,candles): history_sent.add(pair)
-                    candle_ts=candles[-1]["timestamp"]
-                    if last_seen.get(pair)==candle_ts:
-                        continue
-                    last_seen[pair]=candle_ts
-                    result=analyze_market(candles)
-                    signal=result.get("signal","WAIT")
-                    logging.info("%s señal=%s sesgo=%s CALL=%s PUT=%s: %s",
-                                 pair,signal,result.get("bias"),result.get("call_score"),
-                                 result.get("put_score"),result.get("reason"))
-                    if signal not in ("CALL","PUT"):
-                        continue
-                    telegram_send(f"🔎 M1 {pair}\nSeñal: {signal}\nSesgo: {result.get('bias')}\n"
-                                  f"Puntaje CALL/PUT: {result.get('call_score',0)}/{result.get('put_score',0)}\n"
-                                  f"Motivo: {result.get('reason')}")
-                    if signal==last_direction.get(pair):
-                        logging.info("%s señal repetida omitida: %s",pair,signal)
-                        continue
-                    now=server_time(iq)
-                    elapsed=now-(candle_ts+TIMEFRAME)
-                    if elapsed<MIN_ENTRY_SECOND or elapsed>MAX_ENTRY_SECOND:
-                        logging.info("%s señal omitida fuera de ventana (segundo %.1f)",pair,elapsed)
-                        continue
-                    cutoff=time.time()-3600
-                    trades=[t for t in trades if t>cutoff]
-                    if len(trades)>=MAX_TRADES_PER_HOUR:
-                        logging.info("Límite horario alcanzado; señal %s %s omitida",pair,signal)
-                        continue
-                    ok,order_id=place_binary(iq,pair,signal)
-                    if ok:
-                        trades.append(time.time())
-                        last_direction[pair]=signal
-                        telegram_send(f"🧪 Orden demo aceptada\n{pair} | {signal}\nExpiración: 1 min\nID: {order_id}")
-                        logging.info("Orden aceptada: %s %s id=%s",pair,signal,order_id)
-                    else:
-                        telegram_send(f"⚠️ Orden rechazada: {pair} {signal} | {order_id}")
-                        logging.warning("Orden rechazada %s: %s",pair,order_id)
-                except Exception:
-                    logging.exception("Error analizando %s; se continúa con el siguiente par",pair)
-            time.sleep(POLL_SECONDS)
+            if not iq.check_connect(): iq=connect_retry()
+            cs,now=get_candles(iq)
+            if len(cs)<COUNT:
+                logging.info('Esperando historial %d/%d',len(cs),COUNT); time.sleep(POLL); continue
+            if not history_done:
+                st=describe_history(cs); tg(f'📊 {PAIR} historial M1: {st["count"]}/{COUNT}\nVerdes {st["greens"]} | Rojas {st["reds"]} | Doji {st["dojis"]}')
+                for x in range(0,len(cs),35): tg(f'🕯️ Velas {x+1}-{min(x+35,len(cs))}\n'+'\n'.join(format_candle(i+1,c) for i,c in enumerate(cs[x:x+35],x)))
+                history_done=True
+            stamp=cs[-1]['timestamp']
+            if stamp==last: time.sleep(POLL); continue
+            last=stamp; res=analyze_market(cs); ctx=res['contexts']; stages=', '.join(k for k,v in res['stages'].items() if v) or 'ninguna'
+            ctxs=' | '.join(f'{n}:{ctx[n]["bias"]}' for n in (2,3,5,10))
+            logging.info('%s señal=%s sesgo=%s CALL=%s PUT=%s | %s | etapas=%s',PAIR,res['signal'],res['bias'],res['call_score'],res['put_score'],res['reason'],stages)
+            tg(f'📈 {PAIR} M1\nSeñal: {res["signal"]}\nContexto: {ctxs}\nEtapas: {stages}\nMotivo: {res["reason"]}')
+            if res['signal'] in ('CALL','PUT') and ENABLE_TRADES:
+                sec=now%60
+                if sec<=8:
+                    iq.change_balance('PRACTICE'); ok,oid=iq.buy(AMOUNT,PAIR,res['signal'].lower(),EXPIRATION)
+                    tg(f'{"🧪 Orden enviada" if ok else "⚠️ Orden rechazada"}\n{PAIR} {res["signal"]}\nID/respuesta: {oid}')
+                else: logging.info('Señal fuera de ventana (%ss); no se ejecuta',sec)
         except Exception as e:
-            logging.exception("Error del ciclo general")
-            telegram_send(f"⚠️ Error general: {type(e).__name__}: {e}")
+            logging.exception('Error de ciclo')
+            if time.monotonic()-last_error>60: tg(f'⚠️ Error: {type(e).__name__}: {e}'); last_error=time.monotonic()
             try:
-                if not iq.check_connect():
-                    logging.warning("Reconectando IQ Option...")
-                    iq.connect()
-                    iq.change_balance("PRACTICE")
-            except Exception:
-                logging.exception("No se pudo reconectar.")
-            time.sleep(3)
+                if not iq.check_connect(): iq=connect_retry()
+            except Exception: iq=connect_retry()
+        time.sleep(POLL)
 
-if __name__=="__main__":
-    main()
+if __name__=='__main__':
+    while True:
+        try: main()
+        except KeyboardInterrupt: break
+        except Exception: logging.exception('Fallo principal; reinicio en 10s'); time.sleep(10)
