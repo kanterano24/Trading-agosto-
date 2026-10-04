@@ -116,7 +116,10 @@ def telegram_commands(iq, pairs, analysis_states):
             chat_id = str(message.get("chat", {}).get("id", ""))
             if chat_id != str(TELEGRAM_CHAT_ID):
                 continue
-            command = (message.get("text") or "").strip().split()[0].lower().split("@")[0]
+            parts = (message.get("text") or "").strip().split()
+            if not parts:
+                continue
+            command = parts[0].lower().split("@")[0]
             if command == "/start":
                 _scan_enabled = True
                 telegram_send("▶️ Análisis y operaciones habilitados. Cuenta PRACTICE.")
@@ -150,7 +153,8 @@ def split_messages(lines, max_chars=3200):
 
 def connect_iq():
     if not IQ_EMAIL or not IQ_PASSWORD:
-        raise RuntimeError("Configura IQ_EMAIL e IQ_PASSWORD en Railway.")
+        raise RuntimeError("Faltan IQ_EMAIL o IQ_PASSWORD en las variables de Railway.")
+    logging.info("Iniciando conexión con IQ Option; cuenta de destino PRACTICE.")
     iq = IQ_Option(IQ_EMAIL, IQ_PASSWORD)
     ok, reason = iq.connect()
     if not ok:
@@ -252,10 +256,14 @@ def discover_otc_pairs(iq):
     try:
         active = iq.get_all_ACTIVES_OPCODE() or {}
         if isinstance(active, dict):
-            for name in active:
-                normalized = str(name).upper()
-                if normalized.endswith("-OTC"):
-                    candidates.add(normalized)
+            for name, value in active.items():
+                # Algunas versiones exponen símbolo->código; otras pueden
+                # devolver código->símbolo. Admitimos ambos formatos.
+                for candidate in (name, value):
+                    if isinstance(candidate, str):
+                        normalized = candidate.strip().upper()
+                        if normalized.endswith("-OTC"):
+                            candidates.add(normalized)
     except Exception as exc:
         logging.warning("No se pudo leer lista de activos: %s", exc)
 
@@ -320,8 +328,11 @@ def main():
                 last_refresh = now_mono
 
             if not pairs:
-                logging.warning("No se detectaron pares OTC. Se reintentará la detección.")
-                time.sleep(POLL_SECONDS)
+                logging.warning(
+                    "No se detectaron pares OTC. Se mantiene el proceso activo y "
+                    "se volverá a consultar la lista en el siguiente ciclo."
+                )
+                time.sleep(max(POLL_SECONDS, 5.0))
                 continue
 
             if not _scan_enabled:
