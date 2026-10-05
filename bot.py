@@ -7,7 +7,7 @@ PAIRS=['EURUSD-OTC','EURJPY-OTC','EURGBP-OTC','GBPUSD-OTC','USDCHF-OTC']
 TF=60; COUNT=int(os.getenv('CANDLE_COUNT','200')); EXPIRATION=1
 AMOUNT=float(os.getenv('AMOUNT','1'))
 # Seguridad: PRACTICE y sin órdenes hasta habilitar explícitamente.
-ENABLE_TRADES=os.getenv('ENABLE_TRADES','false').lower() in ('1','true','yes','si')
+ENABLE_TRADES=os.getenv('ENABLE_TRADES','true').lower() in ('1','true','yes','si')
 EMAIL=os.getenv('IQ_EMAIL',''); PASSWORD=os.getenv('IQ_PASSWORD',''); TOKEN=os.getenv('TELEGRAM_TOKEN',''); CHAT=os.getenv('TELEGRAM_CHAT_ID','')
 POLL=max(1.0,float(os.getenv('POLL_SECONDS','2'))); COOLDOWN=float(os.getenv('TRADE_COOLDOWN','60'))
 logging.basicConfig(level=logging.INFO,format='%(asctime)s | %(levelname)s | %(message)s')
@@ -56,8 +56,14 @@ def main():
                     # La orden sigue la señal: se elimina la inversión que venía perdiendo.
                     if ENABLE_TRADES and time.time()-last_trade.get(pair,0)>=COOLDOWN:
                         iq.change_balance('PRACTICE')
-                        ok,oid=iq.buy(AMOUNT,pair,res['signal'].lower(),EXPIRATION)
-                        last_trade[pair]=time.time()
+                        action=res['signal'].lower()
+                        logging.info('ENVIANDO ORDEN | %s | %s | monto=%s | expiracion=%sm', pair, action.upper(), AMOUNT, EXPIRATION)
+                        ok,oid=iq.buy(AMOUNT,pair,action,EXPIRATION)
+                        if ok:
+                            last_trade[pair]=time.time()
+                            logging.info('ORDEN EJECUTADA | %s | %s | ID=%s', pair, action.upper(), oid)
+                        else:
+                            logging.error('ORDEN RECHAZADA | %s | %s | respuesta=%s', pair, action.upper(), oid)
                         tg(f'{"🧪 Orden enviada" if ok else "⚠️ Orden rechazada"}\n{pair} señal {res["signal"]} → orden {res["signal"]}\nID/respuesta: {oid}')
                     tg(f'📈 {pair} M1\nSeñal: {res["signal"]}\nContexto: {ctxs}\nEtapas: {stages}\nMotivo: {res["reason"]}')
             except Exception as e:
