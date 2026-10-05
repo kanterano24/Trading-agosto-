@@ -3,7 +3,7 @@ import logging, os, time, requests
 from iqoptionapi.stable_api import IQ_Option
 from strategy import normalize_candles, analyze_market
 
-PAIRS=['EURUSD-OTC','EURJPY-OTC','EURGBP-OTC','GBPAUD-OTC','GBPUSD-OTC','USDCHF-OTC']
+PAIRS=['EURUSD-OTC','EURJPY-OTC','EURGBP-OTC','EURCHF-OTC','GBPUSD-OTC','USDCHF-OTC']
 TF=60; COUNT=int(os.getenv('CANDLE_COUNT','200')); EXPIRATION=1
 AMOUNT=float(os.getenv('AMOUNT','1'))
 # Seguridad: PRACTICE y sin órdenes hasta habilitar explícitamente.
