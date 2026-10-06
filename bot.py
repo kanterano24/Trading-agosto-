@@ -6,12 +6,11 @@ PAIRS = [
     "EURUSD-OTC",
     "EURJPY-OTC",
     "EURGBP-OTC",
-    "GBPAUD-OTC",
     "GBPUSD-OTC",
     "USDCHF-OTC",
 ]
 TF=60; COUNT=200; EXPIRATION=1
-AMOUNT=float(os.getenv('AMOUNT','1300')); ENABLE_TRADES=os.getenv('ENABLE_TRADES','true').lower() in ('1','true','yes','si')
+AMOUNT=float(os.getenv('AMOUNT','130')); ENABLE_TRADES=os.getenv('ENABLE_TRADES','true').lower() in ('1','true','yes','si')
 EMAIL=os.getenv('IQ_EMAIL',''); PASSWORD=os.getenv('IQ_PASSWORD',''); TOKEN=os.getenv('TELEGRAM_TOKEN',''); CHAT=os.getenv('TELEGRAM_CHAT_ID','')
 POLL=max(1,float(os.getenv('POLL_SECONDS','2'))); logging.basicConfig(level=logging.INFO,format='%(asctime)s | %(levelname)s | %(message)s')
 sess=requests.Session(); tg_last=0
