@@ -8,12 +8,12 @@ COUNT = 200
 EXPIRATION = 1
 MAX_OTC_PAIRS = 20
 PAIR_REFRESH_SECONDS = 15 * 60
-AMOUNT = float(os.getenv('AMOUNT', '333'))
+AMOUNT = float(os.getenv('AMOUNT', '30'))
 TRADES_ENABLED = os.getenv('ENABLE_TRADES', 'true').lower() in ('1', 'true', 'yes', 'si')
 EMAIL = os.getenv('IQ_EMAIL', '')
 PASSWORD = os.getenv('IQ_PASSWORD', '')
-TOKEN = os.getenv('TELEGRAM_TOKEN', '').strip()
-CHAT = os.getenv('TELEGRAM_CHAT_ID', '').strip()
+TOKEN = os.getenv('TELEGRAM_TOKEN', '')
+CHAT = os.getenv('TELEGRAM_CHAT_ID', '')
 POLL = max(1, float(os.getenv('POLL_SECONDS', '2')))
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(levelname)s | %(message)s')
@@ -38,7 +38,7 @@ def tg_api(method, data=None):
         return None
     r = sess.post(
         f'https://api.telegram.org/bot{TOKEN}/{method}',
-        json=data or {},
+        data=data or {},
         timeout=15,
     )
     r.raise_for_status()
@@ -51,28 +51,71 @@ def tg_api(method, data=None):
 def tg(msg, reply_markup=None):
     global tg_last
     if not TOKEN or not CHAT:
+        logging.error('Telegram no configurado: TELEGRAM_TOKEN o TELEGRAM_CHAT_ID vacío')
         return False
+
+    delay = 3.2 - (time.monotonic() - tg_last)
+    if delay > 0:
+        time.sleep(delay)
+
+    data = {'chat_id': CHAT, 'text': msg}
+    if reply_markup is not None:
+        import json
+        data['reply_markup'] = json.dumps(reply_markup, ensure_ascii=False)
+
     try:
-        wait=1.2-(time.monotonic()-tg_last)
-        if wait>0:
-            time.sleep(wait)
-        payload={'chat_id':CHAT,'text':msg}
-        if reply_markup is not None:
-            payload['reply_markup']=reply_markup
-        r=sess.post(
+        r = sess.post(
             f'https://api.telegram.org/bot{TOKEN}/sendMessage',
-            json=payload,
+            data=data,
+            timeout=15
+        )
+        if r.status_code == 429:
+            logging.warning('Telegram 429: mensaje omitido')
+            tg_last = time.monotonic()
+            return False
+
+        r.raise_for_status()
+        result = r.json()
+        if not result.get('ok'):
+            logging.error('Telegram sendMessage rechazado: %s', result)
+            return False
+
+        tg_last = time.monotonic()
+        logging.info('Telegram enviado correctamente')
+        return True
+    except Exception as e:
+        logging.exception('Error Telegram sendMessage: %s', e)
+        return False
+
+def tg_api(method, data=None):
+    if not TOKEN:
+        logging.error('TELEGRAM_TOKEN vacío')
+        return None
+    try:
+        r = sess.post(
+            f'https://api.telegram.org/bot{TOKEN}/{method}',
+            data=data or {},
             timeout=15
         )
         r.raise_for_status()
-        result=r.json()
+        result = r.json()
         if not result.get('ok'):
-            raise RuntimeError(f'Telegram sendMessage rechazado: {result}')
-        tg_last=time.monotonic()
-        return True
-    except Exception:
-        logging.exception('Error Telegram')
+            logging.error('Telegram %s rechazado: %s', method, result)
+            return None
+        return result.get('result')
+    except Exception as e:
+        logging.exception('Error Telegram %s: %s', method, e)
+        return None
+
+
+def prepare_telegram():
+    if not TOKEN:
         return False
+    result = tg_api('deleteWebhook', {'drop_pending_updates': 'false'})
+    if result is not None:
+        logging.info('Telegram preparado para getUpdates')
+        return True
+    return False
 
 
 def tg_keyboard():
@@ -112,7 +155,11 @@ def connect():
     if not ok:
         raise RuntimeError(f'Conexión fallida: {why}')
     iq.change_balance('PRACTICE')
-    logging.info('Conectado a PRACTICE')
+    try:
+        iq.update_ACTIVES_OPCODE()
+    except Exception:
+        pass
+    logging.info('Conectado a PRACTICE | operaciones=%s', TRADES_ENABLED)
     return iq
 
 
@@ -144,6 +191,78 @@ def discover_pairs(iq):
     except Exception:
         logging.exception('No se pudieron consultar los pares OTC abiertos')
         return []
+
+def refresh_active_codes(iq):
+    try:
+        iq.update_ACTIVES_OPCODE()
+        logging.info('Códigos de activos actualizados')
+    except Exception as e:
+        logging.warning('No se pudieron actualizar códigos: %s', e)
+
+
+def binary_open(iq, pair):
+    try:
+        data = iq.get_all_open_time() or {}
+        binary = bool(data.get('binary', {}).get(pair, {}).get('open', False))
+        turbo = bool(data.get('turbo', {}).get(pair, {}).get('open', False))
+        logging.info(
+            '%s disponibilidad | binary=%s turbo=%s',
+            pair, binary, turbo
+        )
+        return binary or turbo
+    except Exception as e:
+        logging.warning('%s no se pudo consultar disponibilidad: %s', pair, e)
+        return False
+
+
+def buy_when_available(iq, pair, direction):
+    retries = 4
+    retry_seconds = 2.0
+    last_error = 'activo no disponible'
+
+    for attempt in range(1, retries + 1):
+        if not binary_open(iq, pair):
+            last_error = 'active is suspended / activo cerrado'
+            refresh_active_codes(iq)
+            if attempt < retries:
+                time.sleep(retry_seconds)
+            continue
+
+        try:
+            logging.info(
+                'ENVIANDO ORDEN | %s | %s | intento %d/%d',
+                pair, direction, attempt, retries
+            )
+            ok, oid = iq.buy(
+                AMOUNT,
+                pair,
+                direction.lower(),
+                EXPIRATION
+            )
+        except Exception as e:
+            ok, oid = False, str(e)
+
+        if ok:
+            logging.info(
+                'ORDEN EJECUTADA | %s | %s | ID=%s',
+                pair, direction, oid
+            )
+            return True, oid
+
+        last_error = oid or 'respuesta vacía'
+        logging.warning(
+            'Orden rechazada | %s | %s | %s',
+            pair, direction, last_error
+        )
+
+        if 'suspended' in str(last_error).lower():
+            refresh_active_codes(iq)
+            if attempt < retries:
+                time.sleep(retry_seconds)
+                continue
+        break
+
+    return False, last_error
 
 
 def get_candles(iq, pair):
@@ -258,18 +377,20 @@ def main():
 
     # El panel se puede abrir con /panel o /start; no se envían avisos de análisis.
     if TOKEN and CHAT:
-        try:
-            tg_api('deleteWebhook', {'drop_pending_updates': False})
-        except Exception:
-            logging.exception('No se pudo preparar Telegram para recibir botones')
+        prepare_telegram()
         tg('🎛 PANEL DEL BOT\nSelecciona una opción:', tg_keyboard())
 
     while True:
         try:
-            if not iq.check_connect():
+            try:
+                connected = iq.check_connect()
+            except Exception:
+                connected = False
+            if not connected:
                 iq = connect_retry()
                 pairs = []
                 refresh = 0.0
+                prepare_telegram()
 
             selected_pair, enabled = process_telegram(pairs, selected_pair, enabled)
 
@@ -311,7 +432,7 @@ def main():
                     if res['signal'] in ('CALL', 'PUT') and enabled:
                         iq.change_balance('PRACTICE')
                         inverse_signal = 'PUT' if res['signal'] == 'CALL' else 'CALL'
-                        ok, oid = iq.buy(AMOUNT, pair, inverse_signal.lower(), EXPIRATION)
+                        ok, oid = buy_when_available(iq, pair, inverse_signal)
                         logging.info(
                             '%s señal=%s | orden invertida=%s | ok=%s | respuesta=%s',
                             pair, res['signal'], inverse_signal, ok, oid
