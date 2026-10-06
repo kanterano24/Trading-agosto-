@@ -48,56 +48,32 @@ def tg_api(method, data=None):
     return result.get('result')
 
 
-def tg(msg, reply_markup=None, chat_id=None):
-    """Envía mensajes normales de Telegram. Se usa para el panel y las órdenes ejecutadas."""
+def tg(msg, reply_markup=None):
     global tg_last
-    target = CHAT if chat_id is None else str(chat_id)
-    if not TOKEN or not target:
+    if not TOKEN or not CHAT:
         return False
     try:
-        wait = 1.2 - (time.monotonic() - tg_last)
-        if wait > 0:
+        wait=1.2-(time.monotonic()-tg_last)
+        if wait>0:
             time.sleep(wait)
-        data = {'chat_id': target, 'text': msg}
-        if reply_markup:
-            data['reply_markup'] = reply_markup
-        result = tg_api('sendMessage', data)
-        tg_last = time.monotonic()
-        return bool(result)
+        data={'chat_id':CHAT,'text':msg}
+        if reply_markup is not None:
+            import json
+            data['reply_markup']=json.dumps(reply_markup, ensure_ascii=False)
+        r=sess.post(
+            f'https://api.telegram.org/bot{TOKEN}/sendMessage',
+            data=data,
+            timeout=15
+        )
+        r.raise_for_status()
+        result=r.json()
+        if not result.get('ok'):
+            raise RuntimeError(str(result))
+        tg_last=time.monotonic()
+        return True
     except Exception:
         logging.exception('Error Telegram')
         return False
-
-
-def tg_keyboard():
-    return {
-        'inline_keyboard': [
-            [
-                {'text': '▶️ INICIAR', 'callback_data': 'bot_start'},
-                {'text': '⏹ DETENER', 'callback_data': 'bot_stop'},
-            ],
-            [
-                {'text': '📊 ESTADO', 'callback_data': 'bot_status'},
-                {'text': '📋 ELEGIR PAR', 'callback_data': 'choose_pair'},
-            ],
-        ]
-    }
-
-
-def pair_keyboard(pairs):
-    rows = []
-    row = []
-    for i, pair in enumerate(pairs):
-        row.append({'text': pair, 'callback_data': f'pair:{pair}'})
-        if len(row) == 2:
-            rows.append(row)
-            row = []
-    if row:
-        rows.append(row)
-    rows.append([{'text': '🌐 TODOS LOS 20', 'callback_data': 'pair:ALL'}])
-    rows.append([{'text': '⬅️ MENÚ', 'callback_data': 'main_menu'}])
-    return {'inline_keyboard': rows}
-
 
 def connect():
     if not EMAIL or not PASSWORD:
