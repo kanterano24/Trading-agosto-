@@ -8,7 +8,7 @@ COUNT = 200
 EXPIRATION = 1
 MAX_OTC_PAIRS = 20
 PAIR_REFRESH_SECONDS = 15 * 60
-AMOUNT = float(os.getenv('AMOUNT', '130'))
+AMOUNT = float(os.getenv('AMOUNT', '333'))
 TRADES_ENABLED = os.getenv('ENABLE_TRADES', 'true').lower() in ('1', 'true', 'yes', 'si')
 EMAIL = os.getenv('IQ_EMAIL', '')
 PASSWORD = os.getenv('IQ_PASSWORD', '')
@@ -74,6 +74,36 @@ def tg(msg, reply_markup=None):
     except Exception:
         logging.exception('Error Telegram')
         return False
+
+
+def tg_keyboard():
+    return {
+        'inline_keyboard': [
+            [
+                {'text': '▶️ INICIAR', 'callback_data': 'bot_start'},
+                {'text': '⏹ DETENER', 'callback_data': 'bot_stop'},
+            ],
+            [
+                {'text': '📊 ESTADO', 'callback_data': 'bot_status'},
+                {'text': '📋 ELEGIR PAR', 'callback_data': 'choose_pair'},
+            ],
+        ]
+    }
+
+
+def pair_keyboard(pairs):
+    rows = []
+    row = []
+    for pair in pairs:
+        row.append({'text': pair, 'callback_data': f'pair:{pair}'})
+        if len(row) == 2:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    rows.append([{'text': '🌐 TODOS LOS 20', 'callback_data': 'pair:ALL'}])
+    rows.append([{'text': '⬅️ MENÚ', 'callback_data': 'main_menu'}])
+    return {'inline_keyboard': rows}
 
 def connect():
     if not EMAIL or not PASSWORD:
