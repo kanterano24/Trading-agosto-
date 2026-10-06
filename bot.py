@@ -12,8 +12,8 @@ AMOUNT = float(os.getenv('AMOUNT', '333'))
 TRADES_ENABLED = os.getenv('ENABLE_TRADES', 'true').lower() in ('1', 'true', 'yes', 'si')
 EMAIL = os.getenv('IQ_EMAIL', '')
 PASSWORD = os.getenv('IQ_PASSWORD', '')
-TOKEN = os.getenv('TELEGRAM_TOKEN', '')
-CHAT = os.getenv('TELEGRAM_CHAT_ID', '')
+TOKEN = os.getenv('TELEGRAM_TOKEN', '').strip()
+CHAT = os.getenv('TELEGRAM_CHAT_ID', '').strip()
 POLL = max(1, float(os.getenv('POLL_SECONDS', '2')))
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(levelname)s | %(message)s')
@@ -38,7 +38,7 @@ def tg_api(method, data=None):
         return None
     r = sess.post(
         f'https://api.telegram.org/bot{TOKEN}/{method}',
-        data=data or {},
+        json=data or {},
         timeout=15,
     )
     r.raise_for_status()
@@ -56,19 +56,18 @@ def tg(msg, reply_markup=None):
         wait=1.2-(time.monotonic()-tg_last)
         if wait>0:
             time.sleep(wait)
-        data={'chat_id':CHAT,'text':msg}
+        payload={'chat_id':CHAT,'text':msg}
         if reply_markup is not None:
-            import json
-            data['reply_markup']=json.dumps(reply_markup, ensure_ascii=False)
+            payload['reply_markup']=reply_markup
         r=sess.post(
             f'https://api.telegram.org/bot{TOKEN}/sendMessage',
-            data=data,
+            json=payload,
             timeout=15
         )
         r.raise_for_status()
         result=r.json()
         if not result.get('ok'):
-            raise RuntimeError(str(result))
+            raise RuntimeError(f'Telegram sendMessage rechazado: {result}')
         tg_last=time.monotonic()
         return True
     except Exception:
@@ -259,6 +258,10 @@ def main():
 
     # El panel se puede abrir con /panel o /start; no se envían avisos de análisis.
     if TOKEN and CHAT:
+        try:
+            tg_api('deleteWebhook', {'drop_pending_updates': False})
+        except Exception:
+            logging.exception('No se pudo preparar Telegram para recibir botones')
         tg('🎛 PANEL DEL BOT\nSelecciona una opción:', tg_keyboard())
 
     while True:
