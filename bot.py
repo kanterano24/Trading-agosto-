@@ -8,7 +8,7 @@ COUNT = 200
 EXPIRATION = 1
 MAX_OTC_PAIRS = 20
 PAIR_REFRESH_SECONDS = 15 * 60
-AMOUNT = float(os.getenv('AMOUNT', '10'))
+AMOUNT = float(os.getenv('AMOUNT', '130'))
 TRADES_ENABLED = os.getenv('ENABLE_TRADES', 'true').lower() in ('1', 'true', 'yes', 'si')
 EMAIL = os.getenv('IQ_EMAIL', '')
 PASSWORD = os.getenv('IQ_PASSWORD', '')
@@ -33,141 +33,47 @@ if hasattr(IQ_Option, '_get_digital_open'):
     IQ_Option._get_digital_open = no_digital_open
 
 
+def tg_api(method, data=None):
+    if not TOKEN:
+        return None
+    r = sess.post(
+        f'https://api.telegram.org/bot{TOKEN}/{method}',
+        data=data or {},
+        timeout=15,
+    )
+    r.raise_for_status()
+    result = r.json()
+    if not result.get('ok'):
+        raise RuntimeError(str(result))
+    return result.get('result')
+
+
 def tg(msg, reply_markup=None):
-    """Envía mensajes usando el mismo método simple del bot funcional."""
     global tg_last
-
     if not TOKEN or not CHAT:
-        logging.error(
-            'Telegram no configurado: TELEGRAM_TOKEN=%s TELEGRAM_CHAT_ID=%s',
-            'OK' if TOKEN else 'VACIO',
-            'OK' if CHAT else 'VACIO'
-        )
         return False
-
-    delay = 3.2 - (time.monotonic() - tg_last)
-    if delay > 0:
-        time.sleep(delay)
-
-    data = {
-        'chat_id': CHAT,
-        'text': msg,
-    }
-
-    if reply_markup is not None:
-        import json
-        data['reply_markup'] = json.dumps(
-            reply_markup,
-            ensure_ascii=False,
-            separators=(',', ':')
-        )
-
     try:
-        r = sess.post(
+        wait=1.2-(time.monotonic()-tg_last)
+        if wait>0:
+            time.sleep(wait)
+        data={'chat_id':CHAT,'text':msg}
+        if reply_markup is not None:
+            import json
+            data['reply_markup']=json.dumps(reply_markup, ensure_ascii=False)
+        r=sess.post(
             f'https://api.telegram.org/bot{TOKEN}/sendMessage',
             data=data,
             timeout=15
         )
-
-        if r.status_code == 429:
-            logging.warning('Telegram 429; mensaje omitido')
-            tg_last = time.monotonic()
-            return False
-
-        # Registrar la respuesta real de Telegram si existe un error.
-        result = r.json()
-        if not result.get('ok'):
-            logging.error(
-                'Telegram sendMessage rechazado | HTTP=%s | respuesta=%s',
-                r.status_code, result
-            )
-            tg_last = time.monotonic()
-            return False
-
         r.raise_for_status()
-        tg_last = time.monotonic()
-        logging.info('Telegram enviado correctamente | chat_id=%s', CHAT)
-        return True
-
-    except Exception as e:
-        logging.exception('Telegram sendMessage: %s', e)
-        return False
-
-
-def tg_api(method, data=None):
-    """Llamadas auxiliares al Bot API para los botones."""
-    if not TOKEN:
-        logging.error('TELEGRAM_TOKEN vacío')
-        return None
-
-    try:
-        r = sess.post(
-            f'https://api.telegram.org/bot{TOKEN}/{method}',
-            data=data or {},
-            timeout=15
-        )
-        result = r.json()
-
+        result=r.json()
         if not result.get('ok'):
-            logging.error(
-                'Telegram %s rechazado | HTTP=%s | respuesta=%s',
-                method, r.status_code, result
-            )
-            return None
-
-        return result.get('result')
-
-    except Exception as e:
-        logging.exception('Telegram %s: %s', method, e)
-        return None
-
-
-def prepare_telegram():
-    """Deja el bot listo para recibir callbacks con getUpdates."""
-    if not TOKEN:
-        return False
-
-    # Si existe un webhook antiguo, getUpdates no funcionará.
-    result = tg_api(
-        'deleteWebhook',
-        {'drop_pending_updates': 'false'}
-    )
-
-    if result is not None:
-        logging.info('Telegram listo para getUpdates')
+            raise RuntimeError(str(result))
+        tg_last=time.monotonic()
         return True
-
-    return False
-
-
-def tg_keyboard():
-    return {
-        'inline_keyboard': [
-            [
-                {'text': '▶️ INICIAR', 'callback_data': 'bot_start'},
-                {'text': '⏹ DETENER', 'callback_data': 'bot_stop'},
-            ],
-            [
-                {'text': '📊 ESTADO', 'callback_data': 'bot_status'},
-                {'text': '📋 ELEGIR PAR', 'callback_data': 'choose_pair'},
-            ],
-        ]
-    }
-
-
-def pair_keyboard(pairs):
-    rows = []
-    row = []
-    for pair in pairs:
-        row.append({'text': pair, 'callback_data': f'pair:{pair}'})
-        if len(row) == 2:
-            rows.append(row)
-            row = []
-    if row:
-        rows.append(row)
-    rows.append([{'text': '🌐 TODOS LOS 20', 'callback_data': 'pair:ALL'}])
-    rows.append([{'text': '⬅️ MENÚ', 'callback_data': 'main_menu'}])
-    return {'inline_keyboard': rows}
+    except Exception:
+        logging.exception('Error Telegram')
+        return False
 
 def connect():
     if not EMAIL or not PASSWORD:
@@ -323,7 +229,6 @@ def main():
 
     # El panel se puede abrir con /panel o /start; no se envían avisos de análisis.
     if TOKEN and CHAT:
-        prepare_telegram()
         tg('🎛 PANEL DEL BOT\nSelecciona una opción:', tg_keyboard())
 
     while True:
@@ -332,7 +237,6 @@ def main():
                 iq = connect_retry()
                 pairs = []
                 refresh = 0.0
-                prepare_telegram()
 
             selected_pair, enabled = process_telegram(pairs, selected_pair, enabled)
 
