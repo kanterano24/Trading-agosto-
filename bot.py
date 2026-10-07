@@ -1,4 +1,11 @@
-"""Bot EURUSD M1: REVERSIÓN sobre EURUSD normal (no OTC)."""
+"""Bot EURUSD M1: REVERSIÓN sobre EURUSD normal (no OTC).
+
+- Obtiene únicamente velas M1 cerradas desde IQ Option.
+- Envía cada vela cerrada a Telegram.
+- NO usa Telegram getUpdates.
+- Expone /health, /candles y /openapi.json para consultas externas.
+- /candles puede protegerse con CANDLES_API_KEY.
+"""
 
 import json
 import logging
@@ -22,6 +29,7 @@ AMOUNT = 333.0
 ENABLE_TRADES = os.getenv("ENABLE_TRADES", "true").lower() in (
     "1", "true", "yes", "si"
 )
+
 EMAIL = os.getenv("IQ_EMAIL", "")
 PASSWORD = os.getenv("IQ_PASSWORD", "")
 TOKEN = os.getenv("TELEGRAM_TOKEN", "")
@@ -39,7 +47,7 @@ logging.basicConfig(
 sess = requests.Session()
 tg_last = 0.0
 
-# Historial que queda expuesto por /candles.
+# Historial actual que queda expuesto por /candles.
 received_candles = []
 
 
@@ -73,8 +81,120 @@ def tg(msg):
         return False
 
 
+OPENAPI_SPEC = {
+    "openapi": "3.0.1",
+    "info": {
+        "title": "EURUSD Candles API",
+        "version": "1.0.0",
+        "description": (
+            "API de solo lectura para consultar las velas M1 "
+            "cerradas de EURUSD."
+        ),
+    },
+    "servers": [
+        {
+            "url": "https://worker-production-be7f.up.railway.app"
+        }
+    ],
+    "paths": {
+        "/health": {
+            "get": {
+                "operationId": "health",
+                "summary": "Estado del servicio",
+                "responses": {
+                    "200": {
+                        "description": "Servicio activo"
+                    }
+                },
+            }
+        },
+        "/candles": {
+            "get": {
+                "operationId": "getCandles",
+                "summary": "Obtiene las velas M1 cerradas",
+                "description": (
+                    "Devuelve el historial actual de velas M1 "
+                    "cerradas de EURUSD."
+                ),
+                "security": [
+                    {"bearerAuth": []}
+                ],
+                "responses": {
+                    "200": {
+                        "description": "Historial de velas",
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "type": "object",
+                                    "properties": {
+                                        "ok": {
+                                            "type": "boolean"
+                                        },
+                                        "pair": {
+                                            "type": "string"
+                                        },
+                                        "timeframe": {
+                                            "type": "string"
+                                        },
+                                        "count": {
+                                            "type": "integer"
+                                        },
+                                        "candles": {
+                                            "type": "array",
+                                            "items": {
+                                                "$ref": (
+                                                    "#/components/schemas/"
+                                                    "Candle"
+                                                )
+                                            }
+                                        },
+                                    },
+                                }
+                            }
+                        },
+                    },
+                    "401": {
+                        "description": "No autorizado"
+                    },
+                },
+            }
+        },
+    },
+    "components": {
+        "securitySchemes": {
+            "bearerAuth": {
+                "type": "http",
+                "scheme": "bearer",
+                "bearerFormat": "API key",
+            }
+        },
+        "schemas": {
+            "Candle": {
+                "type": "object",
+                "properties": {
+                    "number": {"type": "integer"},
+                    "timestamp": {"type": "integer"},
+                    "time": {"type": "string"},
+                    "pair": {"type": "string"},
+                    "timeframe": {"type": "string"},
+                    "color": {"type": "string"},
+                    "open": {"type": "number"},
+                    "close": {"type": "number"},
+                    "high": {"type": "number"},
+                    "low": {"type": "number"},
+                    "range": {"type": "number"},
+                    "body": {"type": "number"},
+                    "lower_wick": {"type": "number"},
+                    "upper_wick": {"type": "number"},
+                },
+            }
+        },
+    },
+}
+
+
 class CandlesAPIHandler(BaseHTTPRequestHandler):
-    """API de solo lectura para que un cliente autorizado consulte las velas."""
+    """API de solo lectura para un cliente autorizado."""
 
     def _authorized(self):
         if not CANDLES_API_KEY:
@@ -117,84 +237,7 @@ class CandlesAPIHandler(BaseHTTPRequestHandler):
             return
 
         if path == "/openapi.json":
-            self._send_json(
-                200,
-                {
-                    "openapi": "3.0.1",
-                    "info": {
-                        "title": "EURUSD Candles API",
-                        "version": "1.0.0",
-                        "description": "API de solo lectura para consultar velas M1 cerradas de EURUSD.",
-                    },
-                    "servers": [
-                        {
-                            "url": "https://worker-production-be7f.up.railway.app"
-                        }
-                    ],
-                    "paths": {
-                        "/health": {
-                            "get": {
-                                "operationId": "health",
-                                "summary": "Comprobar estado de la API",
-                                "responses": {
-                                    "200": {
-                                        "description": "API disponible"
-                                    }
-                                }
-                            }
-                        },
-                        "/candles": {
-                            "get": {
-                                "operationId": "getCandles",
-                                "summary": "Obtener velas M1 cerradas de EURUSD",
-                                "responses": {
-                                    "200": {
-                                        "description": "Velas M1 cerradas",
-                                        "content": {
-                                            "application/json": {
-                                                "schema": {
-                                                    "type": "object",
-                                                    "properties": {
-                                                        "ok": {"type": "boolean"},
-                                                        "pair": {"type": "string"},
-                                                        "timeframe": {"type": "string"},
-                                                        "count": {"type": "integer"},
-                                                        "candles": {
-                                                            "type": "array",
-                                                            "items": {
-                                                                "type": "object",
-                                                                "properties": {
-                                                                    "number": {"type": "integer"},
-                                                                    "timestamp": {"type": "integer"},
-                                                                    "time": {"type": "string"},
-                                                                    "pair": {"type": "string"},
-                                                                    "timeframe": {"type": "string"},
-                                                                    "color": {"type": "string"},
-                                                                    "open": {"type": "number"},
-                                                                    "close": {"type": "number"},
-                                                                    "high": {"type": "number"},
-                                                                    "low": {"type": "number"},
-                                                                    "range": {"type": "number"},
-                                                                    "body": {"type": "number"},
-                                                                    "lower_wick": {"type": "number"},
-                                                                    "upper_wick": {"type": "number"}
-                                                                }
-                                                            }
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    },
-                                    "401": {
-                                        "description": "No autorizado"
-                                    }
-                                }
-                            }
-                        }
-                    }
-                },
-            )
+            self._send_json(200, OPENAPI_SPEC)
             return
 
         if path != "/candles":
@@ -273,7 +316,8 @@ def start_candles_api():
     thread.start()
 
     logging.info(
-        "API de velas disponible en puerto %s | /health | /candles | /openapi.json",
+        "API de velas disponible en puerto %s | "
+        "/health | /candles | /openapi.json",
         API_PORT,
     )
 
@@ -294,7 +338,6 @@ def connect():
             f"Conexión fallida: {why}"
         )
 
-    # Se mantiene PRACTICE como en la configuración anterior.
     iq.change_balance("PRACTICE")
     logging.info("Conectado a PRACTICE")
 
