@@ -116,6 +116,87 @@ class CandlesAPIHandler(BaseHTTPRequestHandler):
             )
             return
 
+        if path == "/openapi.json":
+            self._send_json(
+                200,
+                {
+                    "openapi": "3.0.1",
+                    "info": {
+                        "title": "EURUSD Candles API",
+                        "version": "1.0.0",
+                        "description": "API de solo lectura para consultar velas M1 cerradas de EURUSD.",
+                    },
+                    "servers": [
+                        {
+                            "url": "https://worker-production-be7f.up.railway.app"
+                        }
+                    ],
+                    "paths": {
+                        "/health": {
+                            "get": {
+                                "operationId": "health",
+                                "summary": "Comprobar estado de la API",
+                                "responses": {
+                                    "200": {
+                                        "description": "API disponible"
+                                    }
+                                }
+                            }
+                        },
+                        "/candles": {
+                            "get": {
+                                "operationId": "getCandles",
+                                "summary": "Obtener velas M1 cerradas de EURUSD",
+                                "responses": {
+                                    "200": {
+                                        "description": "Velas M1 cerradas",
+                                        "content": {
+                                            "application/json": {
+                                                "schema": {
+                                                    "type": "object",
+                                                    "properties": {
+                                                        "ok": {"type": "boolean"},
+                                                        "pair": {"type": "string"},
+                                                        "timeframe": {"type": "string"},
+                                                        "count": {"type": "integer"},
+                                                        "candles": {
+                                                            "type": "array",
+                                                            "items": {
+                                                                "type": "object",
+                                                                "properties": {
+                                                                    "number": {"type": "integer"},
+                                                                    "timestamp": {"type": "integer"},
+                                                                    "time": {"type": "string"},
+                                                                    "pair": {"type": "string"},
+                                                                    "timeframe": {"type": "string"},
+                                                                    "color": {"type": "string"},
+                                                                    "open": {"type": "number"},
+                                                                    "close": {"type": "number"},
+                                                                    "high": {"type": "number"},
+                                                                    "low": {"type": "number"},
+                                                                    "range": {"type": "number"},
+                                                                    "body": {"type": "number"},
+                                                                    "lower_wick": {"type": "number"},
+                                                                    "upper_wick": {"type": "number"}
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    },
+                                    "401": {
+                                        "description": "No autorizado"
+                                    }
+                                }
+                            }
+                        }
+                    }
+                },
+            )
+            return
+
         if path != "/candles":
             self._send_json(
                 404,
@@ -192,7 +273,7 @@ def start_candles_api():
     thread.start()
 
     logging.info(
-        "API de velas disponible en puerto %s | /health | /candles",
+        "API de velas disponible en puerto %s | /health | /candles | /openapi.json",
         API_PORT,
     )
 
