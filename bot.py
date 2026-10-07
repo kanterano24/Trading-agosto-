@@ -37,249 +37,6 @@ sess = requests.Session()
 tg_last = 0.0
 
 
-tg_update_offset = 0
-received_candles = []
-received_candle_stamps = set()
-
-
-def parse_telegram_candles(update):
-    """Extrae velas EURUSD de mensajes del grupo con el formato actual."""
-    global received_candles
-
-    try:
-        message = update.get("message") or update.get("channel_post") or {}
-        msg = message.get("text", "") or ""
-        if "🕯️ VELA M1 CERRADA" not in msg or "Par: EURUSD" not in msg:
-            return []
-
-        blocks = re.split(r"(?=🕯️ VELA M1 CERRADA)", msg)
-        parsed = []
-
-        for block in blocks:
-            if "🕯️ VELA M1 CERRADA" not in block:
-                continue
-
-            def val(pattern):
-                m = re.search(pattern, block, re.MULTILINE)
-                return float(m.group(1)) if m else None
-
-            m_num = re.search(r"🕯️ VELA M1 CERRADA #(\d+)", block)
-            m_time = re.search(r"Hora apertura:\s*(.+)", block)
-            m_color = re.search(r"Color:\s*(.+)", block)
-
-            if not (m_num and m_time and m_color):
-                continue
-
-            o = val(r"Apertura:\s*([0-9.eE+-]+)")
-            cl = val(r"Cierre:\s*([0-9.eE+-]+)")
-            hi = val(r"Máximo:\s*([0-9.eE+-]+)")
-            lo = val(r"Mínimo:\s*([0-9.eE+-]+)")
-            rng = val(r"Rango:\s*([0-9.eE+-]+)")
-            body = val(r"Cuerpo:\s*([0-9.eE+-]+)")
-            lw = val(r"Mecha inferior:\s*([0-9.eE+-]+)")
-            uw = val(r"Mecha superior:\s*([0-9.eE+-]+)")
-
-            if None in (o, cl, hi, lo):
-                continue
-
-            try:
-                stamp = int(datetime.strptime(
-                    m_time.group(1).strip(), "%Y-%m-%d %H:%M:%S"
-                ).timestamp())
-            except ValueError:
-                continue
-
-            color_txt = m_color.group(1).strip().upper()
-            color = (
-                "green" if color_txt == "VERDE"
-                else "red" if color_txt == "ROJA"
-                else "doji"
-            )
-
-            parsed.append({
-                "number": int(m_num.group(1)),
-                "timestamp": stamp,
-                "time_text": m_time.group(1).strip(),
-                "open": o,
-                "close": cl,
-                "high": hi,
-                "low": lo,
-                "min": lo,
-                "max": hi,
-                "range": rng if rng is not None else hi - lo,
-                "body": body if body is not None else abs(cl - o),
-                "lower_wick": lw if lw is not None else min(o, cl) - lo,
-                "upper_wick": uw if uw is not None else hi - max(o, cl),
-                "color": color,
-            })
-
-        return parsed
-
-    except Exception:
-        logging.exception("Error procesando mensaje de Telegram")
-        return []
-
-
-def poll_telegram_candles():
-    """Lee mensajes nuevos del grupo mediante getUpdates."""
-    global tg_update_offset
-
-    if not TOKEN:
-        return []
-
-    try:
-        r = sess.get(
-            f"https://api.telegram.org/bot{TOKEN}/getUpdates",
-            params={
-                "offset": tg_update_offset,
-                "timeout": 1,
-                "allowed_updates": '["message","channel_post"]',
-            },
-            timeout=5,
-        )
-        r.raise_for_status()
-        data = r.json()
-
-        if not data.get("ok"):
-            return []
-
-        new_candles = []
-
-        for update in data.get("result", []):
-            tg_update_offset = max(
-                tg_update_offset, int(update.get("update_id", 0)) + 1
-            )
-
-            for candle in parse_telegram_candles(update):
-                stamp = candle["timestamp"]
-                if stamp not in received_candle_stamps:
-                    received_candle_stamps.add(stamp)
-                    received_candles.append(candle)
-                    new_candles.append(candle)
-
-        # Mantener solo el historial necesario para la estrategia.
-        received_candles[:] = sorted(
-            received_candles, key=lambda x: x["timestamp"]
-        )[-COUNT:]
-
-        return new_candles
-
-    except Exception:
-        logging.exception("Error recibiendo mensajes de Telegram")
-        return []
-
-
-def tg(msg):
-    global tg_last
-
-    if not TOKEN or not CHAT:
-        return False
-
-    try:
-        wait = 1.2 - (time.monotonic() - tg_last)
-        if wait > 0:
-            time.sleep(wait)
-
-        r = sess.post(
-            f"https://api.telegram.org/bot{TOKEN}/sendMessage",
-            data={"chat_id": CHAT, "text": msg},
-            timeout=15,
-        )
-        r.raise_for_status()
-
-        if not r.json().get("ok"):
-            raise RuntimeError(str(r.json()))
-
-        tg_last = time.monotonic()
-        return True
-
-    except Exception:
-        logging.exception("Error Telegram")
-        return False
-
-
-
-class CandlesAPIHandler(BaseHTTPRequestHandler):
-    def _authorized(self):
-        # Si no se configura clave, el endpoint queda accesible.
-        # En Railway se recomienda configurar CANDLES_API_KEY.
-        if not CANDLES_API_KEY:
-            return True
-
-        auth = self.headers.get("Authorization", "")
-        return auth == f"Bearer {CANDLES_API_KEY}"
-
-    def _send_json(self, status, payload):
-        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("Content-Length", str(len(body)))
-        self.send_header("Cache-Control", "no-store")
-        self.end_headers()
-        self.wfile.write(body)
-
-    def do_GET(self):
-        if self.path.split("?", 1)[0] == "/health":
-            self._send_json(200, {"ok": True, "service": "EURUSD candles"})
-            return
-
-        if self.path.split("?", 1)[0] != "/candles":
-            self._send_json(404, {"ok": False, "error": "not found"})
-            return
-
-        if not self._authorized():
-            self._send_json(401, {"ok": False, "error": "unauthorized"})
-            return
-
-        candles = []
-        for c in received_candles[-COUNT:]:
-            candles.append({
-                "number": c.get("number"),
-                "timestamp": c.get("timestamp"),
-                "time": c.get("time_text"),
-                "pair": PAIR,
-                "timeframe": "M1",
-                "color": c.get("color"),
-                "open": c.get("open"),
-                "close": c.get("close"),
-                "high": c.get("high"),
-                "low": c.get("low"),
-                "range": c.get("range"),
-                "body": c.get("body"),
-                "lower_wick": c.get("lower_wick"),
-                "upper_wick": c.get("upper_wick"),
-            })
-
-        self._send_json(200, {
-            "ok": True,
-            "pair": PAIR,
-            "timeframe": "M1",
-            "count": len(candles),
-            "candles": candles,
-        })
-
-    def log_message(self, format, *args):
-        logging.info("HTTP %s - %s", self.address_string(), format % args)
-
-
-def start_candles_api():
-    server = ThreadingHTTPServer(("0.0.0.0", API_PORT), CandlesAPIHandler)
-
-    import threading
-    thread = threading.Thread(
-        target=server.serve_forever,
-        name="candles-api",
-        daemon=True,
-    )
-    thread.start()
-
-    logging.info(
-        "API de velas disponible en puerto %s | /health | /candles",
-        API_PORT,
-    )
-    return server
-
-
 
 def connect():
     if not EMAIL or not PASSWORD:
@@ -366,8 +123,6 @@ def main():
     last_candle = None
     candle_number = 0
 
-    # Inicializa el offset sin ejecutar operaciones con mensajes antiguos.
-    poll_telegram_candles()
 
     tg(
         "🟢 Bot iniciado\n"
@@ -387,34 +142,39 @@ def main():
             if not iq.check_connect():
                 iq = connect_retry()
 
-            # Las velas para la estrategia llegan desde los mensajes
-            # de Telegram del grupo.
-            new_candles = poll_telegram_candles()
+            # Fuente de mercado: velas M1 cerradas de IQ Option.
+            # No usa getUpdates, evitando conflicto con el receptor
+            # de Telegram que ya tienes funcionando.
+            cs, now = get_candles(iq)
 
-            if not new_candles:
+            if len(cs) < 4:
+                logging.info("Esperando historial M1: %d/4", len(cs))
                 time.sleep(POLL)
                 continue
 
-            for new_candle in new_candles:
-                cs = list(received_candles)
+            stamp = cs[-1]["timestamp"]
 
-                if len(cs) < 4:
-                    logging.info(
-                        "Esperando velas recibidas de Telegram: %d/4",
-                        len(cs)
-                    )
-                    continue
+            # Solo procesa una vez cada vela cerrada.
+            if stamp == last_candle:
+                time.sleep(POLL)
+                continue
 
-                stamp = new_candle["timestamp"]
+            last_candle = stamp
+            candle_number += 1
 
-                # Solo procesa una vez cada vela cerrada.
-                if stamp == last_candle:
-                    continue
+            # Publica la vela cerrada al grupo y la deja disponible
+            # mediante /candles para la futura conexión con ChatGPT.
+            tg(candle_message(cs[-1], candle_number))
 
-                last_candle = stamp
-                candle_number = new_candle["number"]
+            # Actualiza el conjunto de velas expuesto por la API.
+            received_candles[:] = [
+                dict(c, number=i + 1, time_text=datetime.fromtimestamp(
+                    c["timestamp"]
+                ).strftime("%Y-%m-%d %H:%M:%S"))
+                for i, c in enumerate(cs)
+            ]
 
-                res = analyze_market(cs)
+            res = analyze_market(cs)
 
             logging.info(
                 "%s señal=%s | motivo=%s",
