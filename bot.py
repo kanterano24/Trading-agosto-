@@ -1,4 +1,4 @@
-"""Bot EURUSD-OTC M1: REVERSIÓN sobre EURUSD-OTC.
+"""Bot EURUSD M1: REVERSIÓN sobre EURUSD normal (no OTC).
 
 - Obtiene únicamente velas M1 cerradas desde IQ Option.
 - Envía cada vela cerrada a Telegram.
@@ -20,7 +20,7 @@ from iqoptionapi.stable_api import IQ_Option
 from strategy import normalize_candles, analyze_market
 
 
-PAIR = "EURUSD-OTC"
+PAIR = "EURUSD"
 TF = 60
 COUNT = 200
 EXPIRATION = 1
@@ -84,11 +84,11 @@ def tg(msg):
 OPENAPI_SPEC = {
     "openapi": "3.0.1",
     "info": {
-        "title": "EURUSD-OTC Candles API",
+        "title": "EURUSD Candles API",
         "version": "1.0.0",
         "description": (
             "API de solo lectura para consultar las velas M1 "
-            "cerradas de EURUSD-OTC."
+            "cerradas de EURUSD."
         ),
     },
     "servers": [
@@ -114,7 +114,7 @@ OPENAPI_SPEC = {
                 "summary": "Obtiene las velas M1 cerradas",
                 "description": (
                     "Devuelve el historial actual de velas M1 "
-                    "cerradas de EURUSD-OTC."
+                    "cerradas de EURUSD."
                 ),
                 "security": [
                     {"bearerAuth": []}
@@ -331,6 +331,17 @@ def connect():
         )
 
     iq = IQ_Option(EMAIL, PASSWORD)
+
+    # Este bot NO utiliza Digital.
+    # Algunas versiones de iqoptionapi lanzan un hilo interno
+    # __get_digital_open que puede recibir None desde
+    # get_digital_underlying_list_data() y provocar un TypeError.
+    # Devolvemos una lista Digital vacía; Binary/Turbo siguen activos.
+    def _no_digital_underlying():
+        return {"underlying": []}
+
+    iq.get_digital_underlying_list_data = _no_digital_underlying
+
     ok, why = iq.connect()
 
     if not ok:
@@ -643,14 +654,16 @@ def main():
     tg(
         "🟢 Bot iniciado\n"
         f"Par: {PAIR}\n"
-        "Mercado: EURUSD-OTC\n"
+        "Mercado: EURUSD normal (NO OTC)\n"
         "Temporalidad: M1\n"
         "Estrategia: REVERSIÓN\n"
         f"Expiración: {EXPIRATION} minuto\n"
         f"Importe: {AMOUNT:.0f} USD\n"
         "Indicadores: ninguno\n"
         "S/R: no\n"
-        "Rechazo: no"
+        "Rechazo: no\n"
+        "Digital: desactivado\n"
+        "Mercado de entrada: Binary/Turbo"
     )
 
     while True:
