@@ -1,4 +1,4 @@
-"""Bot EURUSD M1: REVERSIÓN sobre EURUSD normal (no OTC).
+"""Bot EURUSD-OTC M1: REVERSIÓN sobre EURUSD-OTC.
 
 - Obtiene únicamente velas M1 cerradas desde IQ Option.
 - Envía cada vela cerrada a Telegram.
@@ -17,10 +17,11 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import requests
 from iqoptionapi.stable_api import IQ_Option
+from iqoptionapi import constants as OP_code
 from strategy import normalize_candles, analyze_market
 
 
-PAIR = "EURUSD"
+PAIR = "EURUSD-OTC"
 TF = 60
 COUNT = 200
 EXPIRATION = 1
@@ -84,11 +85,11 @@ def tg(msg):
 OPENAPI_SPEC = {
     "openapi": "3.0.1",
     "info": {
-        "title": "EURUSD Candles API",
+        "title": "EURUSD-OTC Candles API",
         "version": "1.0.0",
         "description": (
             "API de solo lectura para consultar las velas M1 "
-            "cerradas de EURUSD."
+            "cerradas de EURUSD-OTC."
         ),
     },
     "servers": [
@@ -114,7 +115,7 @@ OPENAPI_SPEC = {
                 "summary": "Obtiene las velas M1 cerradas",
                 "description": (
                     "Devuelve el historial actual de velas M1 "
-                    "cerradas de EURUSD."
+                    "cerradas de EURUSD-OTC."
                 ),
                 "security": [
                     {"bearerAuth": []}
@@ -332,11 +333,10 @@ def connect():
 
     iq = IQ_Option(EMAIL, PASSWORD)
 
-    # Este bot NO utiliza Digital.
-    # Algunas versiones de iqoptionapi lanzan un hilo interno
-    # __get_digital_open que puede recibir None desde
-    # get_digital_underlying_list_data() y provocar un TypeError.
-    # Devolvemos una lista Digital vacía; Binary/Turbo siguen activos.
+    # Este bot solo usa Binary/Turbo.
+    # Algunas versiones de iqoptionapi lanzan un hilo Digital que puede
+    # fallar con None en get_digital_underlying_list_data().
+    # Lo desactivamos para que no interfiera con las entradas binarias.
     def _no_digital_underlying():
         return {"underlying": []}
 
@@ -483,36 +483,59 @@ def candle_message(candle, number):
 
 def binary_asset_status(iq, pair):
     """
-    Comprueba si el activo está disponible para opciones binarias
-    antes de intentar iq.buy().
+    Comprueba Binary/Turbo sin llamar get_all_open_time().
 
-    get_all_open_time() es una consulta pesada, por eso se ejecuta
-    solamente cuando la estrategia genera una señal.
+    get_all_open_time() tambien consulta Digital y otros mercados y es una
+    llamada pesada; en esta version solo necesitamos Binary/Turbo.
     """
     try:
-        all_assets = iq.get_all_open_time() or {}
+        data = iq.get_all_init_v2()
+
+        if not isinstance(data, dict):
+            return False, "IQ Option no devolvio datos Binary/Turbo"
 
         states = []
+        active_id = None
 
         for mode in ("turbo", "binary"):
-            mode_data = all_assets.get(mode, {})
-            asset = mode_data.get(pair)
+            mode_data = data.get(mode, {})
+            actives = mode_data.get("actives", {})
 
-            if isinstance(asset, dict):
-                states.append(
-                    (
-                        mode,
-                        bool(asset.get("open", False)),
-                    )
-                )
+            if not isinstance(actives, dict):
+                continue
+
+            for aid, active in actives.items():
+                if not isinstance(active, dict):
+                    continue
+
+                name = str(active.get("name", ""))
+                name = name.split(".", 1)[-1]
+
+                if name != pair:
+                    continue
+
+                try:
+                    active_id = int(aid)
+                except (TypeError, ValueError):
+                    active_id = aid
+
+                # buy() usa OP_code.ACTIVES[pair]. Actualizamos el codigo
+                # directamente desde la respuesta Binary/Turbo.
+                OP_code.ACTIVES[pair] = active_id
+
+                enabled = bool(active.get("enabled", False))
+                suspended = bool(active.get("is_suspended", False))
+                is_open = enabled and not suspended
+
+                states.append((mode, is_open))
 
         if not states:
-            return False, "EURUSD no aparece en turbo/binary"
+            return False, f"{pair} no aparece en Binary/Turbo"
 
         opened = [mode for mode, is_open in states if is_open]
 
         if opened:
-            return True, f"activo abierto en {', '.join(opened)}"
+            return True, f"{pair} abierto en {', '.join(opened)}"
 
         details = ", ".join(
             f"{mode}={'ABIERTO' if is_open else 'CERRADO'}"
@@ -522,13 +545,10 @@ def binary_asset_status(iq, pair):
 
     except Exception as e:
         logging.exception(
-            "No se pudo comprobar disponibilidad de %s",
+            "No se pudo comprobar disponibilidad Binary/Turbo de %s",
             pair,
         )
-        return False, (
-            f"no se pudo comprobar disponibilidad: "
-            f"{type(e).__name__}: {e}"
-        )
+        return False, f"error disponibilidad: {type(e).__name__}: {e}"
 
 
 def wait_binary_asset(iq, pair, attempts=2, delay=0.35):
@@ -561,32 +581,8 @@ def wait_binary_asset(iq, pair, attempts=2, delay=0.35):
 
 
 def check_binary_availability(iq, pair):
-    """Refresca activos y comprueba Binary/Turbo antes de comprar."""
-    try:
-        assets = iq.get_all_open_time() or {}
-        states = []
-
-        for mode in ("turbo", "binary"):
-            info = assets.get(mode, {}).get(pair)
-            if isinstance(info, dict):
-                states.append((mode, bool(info.get("open", False))))
-
-        if not states:
-            return False, f"{pair} no aparece en binary/turbo"
-
-        opened = [mode for mode, is_open in states if is_open]
-
-        if opened:
-            return True, f"{pair} abierto en {', '.join(opened)}"
-
-        return False, ", ".join(
-            f"{mode}={'ABIERTO' if is_open else 'CERRADO'}"
-            for mode, is_open in states
-        )
-
-    except Exception as e:
-        logging.exception("Error comprobando disponibilidad Binary de %s", pair)
-        return False, f"error comprobando activo: {type(e).__name__}: {e}"
+    """Comprueba Binary/Turbo sin consultar Digital."""
+    return binary_asset_status(iq, pair)
 
 
 def execute_binary_order(iq, pair, signal, amount, expiration):
@@ -654,16 +650,14 @@ def main():
     tg(
         "🟢 Bot iniciado\n"
         f"Par: {PAIR}\n"
-        "Mercado: EURUSD normal (NO OTC)\n"
+        "Mercado: EURUSD-OTC\n"
         "Temporalidad: M1\n"
         "Estrategia: REVERSIÓN\n"
         f"Expiración: {EXPIRATION} minuto\n"
         f"Importe: {AMOUNT:.0f} USD\n"
         "Indicadores: ninguno\n"
         "S/R: no\n"
-        "Rechazo: no\n"
-        "Digital: desactivado\n"
-        "Mercado de entrada: Binary/Turbo"
+        "Rechazo: no"
     )
 
     while True:
