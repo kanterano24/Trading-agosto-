@@ -5,6 +5,8 @@ import os
 import time
 import re
 import requests
+import json
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from datetime import datetime
 
 from iqoptionapi.stable_api import IQ_Option
@@ -23,6 +25,8 @@ PASSWORD = os.getenv("IQ_PASSWORD", "")
 TOKEN = os.getenv("TELEGRAM_TOKEN", "")
 CHAT = os.getenv("TELEGRAM_CHAT_ID", "")
 POLL = max(0.5, float(os.getenv("POLL_SECONDS", "1")))
+API_PORT = int(os.getenv("PORT", "8080"))
+CANDLES_API_KEY = os.getenv("CANDLES_API_KEY", "")
 
 logging.basicConfig(
     level=logging.INFO,
@@ -194,6 +198,89 @@ def tg(msg):
         return False
 
 
+
+class CandlesAPIHandler(BaseHTTPRequestHandler):
+    def _authorized(self):
+        # Si no se configura clave, el endpoint queda accesible.
+        # En Railway se recomienda configurar CANDLES_API_KEY.
+        if not CANDLES_API_KEY:
+            return True
+
+        auth = self.headers.get("Authorization", "")
+        return auth == f"Bearer {CANDLES_API_KEY}"
+
+    def _send_json(self, status, payload):
+        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        if self.path.split("?", 1)[0] == "/health":
+            self._send_json(200, {"ok": True, "service": "EURUSD candles"})
+            return
+
+        if self.path.split("?", 1)[0] != "/candles":
+            self._send_json(404, {"ok": False, "error": "not found"})
+            return
+
+        if not self._authorized():
+            self._send_json(401, {"ok": False, "error": "unauthorized"})
+            return
+
+        candles = []
+        for c in received_candles[-COUNT:]:
+            candles.append({
+                "number": c.get("number"),
+                "timestamp": c.get("timestamp"),
+                "time": c.get("time_text"),
+                "pair": PAIR,
+                "timeframe": "M1",
+                "color": c.get("color"),
+                "open": c.get("open"),
+                "close": c.get("close"),
+                "high": c.get("high"),
+                "low": c.get("low"),
+                "range": c.get("range"),
+                "body": c.get("body"),
+                "lower_wick": c.get("lower_wick"),
+                "upper_wick": c.get("upper_wick"),
+            })
+
+        self._send_json(200, {
+            "ok": True,
+            "pair": PAIR,
+            "timeframe": "M1",
+            "count": len(candles),
+            "candles": candles,
+        })
+
+    def log_message(self, format, *args):
+        logging.info("HTTP %s - %s", self.address_string(), format % args)
+
+
+def start_candles_api():
+    server = ThreadingHTTPServer(("0.0.0.0", API_PORT), CandlesAPIHandler)
+
+    import threading
+    thread = threading.Thread(
+        target=server.serve_forever,
+        name="candles-api",
+        daemon=True,
+    )
+    thread.start()
+
+    logging.info(
+        "API de velas disponible en puerto %s | /health | /candles",
+        API_PORT,
+    )
+    return server
+
+
+
 def connect():
     if not EMAIL or not PASSWORD:
         raise RuntimeError("Faltan IQ_EMAIL/IQ_PASSWORD en Railway")
@@ -274,6 +361,7 @@ def candle_message(candle, number):
 
 
 def main():
+    start_candles_api()
     iq = connect_retry()
     last_candle = None
     candle_number = 0
