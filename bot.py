@@ -1,4 +1,4 @@
-"""Bot EURUSD M1: REVERSIÓN sobre EURUSD normal (no OTC).
+"""Bot EURUSD-OTC M1: REVERSIÓN sobre EURUSD-OTC.
 
 - Obtiene únicamente velas M1 cerradas desde IQ Option.
 - Envía cada vela cerrada a Telegram.
@@ -20,7 +20,7 @@ from iqoptionapi.stable_api import IQ_Option
 from strategy import normalize_candles, analyze_market
 
 
-PAIR = "EURUSD"
+PAIR = "EURUSD-OTC"
 TF = 60
 COUNT = 200
 EXPIRATION = 1
@@ -84,11 +84,11 @@ def tg(msg):
 OPENAPI_SPEC = {
     "openapi": "3.0.1",
     "info": {
-        "title": "EURUSD Candles API",
+        "title": "EURUSD-OTC Candles API",
         "version": "1.0.0",
         "description": (
             "API de solo lectura para consultar las velas M1 "
-            "cerradas de EURUSD."
+            "cerradas de EURUSD-OTC."
         ),
     },
     "servers": [
@@ -114,7 +114,7 @@ OPENAPI_SPEC = {
                 "summary": "Obtiene las velas M1 cerradas",
                 "description": (
                     "Devuelve el historial actual de velas M1 "
-                    "cerradas de EURUSD."
+                    "cerradas de EURUSD-OTC."
                 ),
                 "security": [
                     {"bearerAuth": []}
@@ -470,6 +470,164 @@ def candle_message(candle, number):
     )
 
 
+def binary_asset_status(iq, pair):
+    """
+    Comprueba si el activo está disponible para opciones binarias
+    antes de intentar iq.buy().
+
+    get_all_open_time() es una consulta pesada, por eso se ejecuta
+    solamente cuando la estrategia genera una señal.
+    """
+    try:
+        all_assets = iq.get_all_open_time() or {}
+
+        states = []
+
+        for mode in ("turbo", "binary"):
+            mode_data = all_assets.get(mode, {})
+            asset = mode_data.get(pair)
+
+            if isinstance(asset, dict):
+                states.append(
+                    (
+                        mode,
+                        bool(asset.get("open", False)),
+                    )
+                )
+
+        if not states:
+            return False, "EURUSD no aparece en turbo/binary"
+
+        opened = [mode for mode, is_open in states if is_open]
+
+        if opened:
+            return True, f"activo abierto en {', '.join(opened)}"
+
+        details = ", ".join(
+            f"{mode}={'ABIERTO' if is_open else 'CERRADO'}"
+            for mode, is_open in states
+        )
+        return False, details
+
+    except Exception as e:
+        logging.exception(
+            "No se pudo comprobar disponibilidad de %s",
+            pair,
+        )
+        return False, (
+            f"no se pudo comprobar disponibilidad: "
+            f"{type(e).__name__}: {e}"
+        )
+
+
+def wait_binary_asset(iq, pair, attempts=2, delay=0.35):
+    """
+    Comprueba disponibilidad inmediatamente antes de la entrada.
+    Si el activo está cerrado/no disponible, NO llama iq.buy().
+    """
+    last_reason = "sin respuesta"
+
+    for attempt in range(1, attempts + 1):
+        is_open, reason = binary_asset_status(iq, pair)
+        last_reason = reason
+
+        logging.info(
+            "Disponibilidad %s | intento=%d/%d | abierta=%s | %s",
+            pair,
+            attempt,
+            attempts,
+            is_open,
+            reason,
+        )
+
+        if is_open:
+            return True, reason
+
+        if attempt < attempts:
+            time.sleep(delay)
+
+    return False, last_reason
+
+
+def check_binary_availability(iq, pair):
+    """Refresca activos y comprueba Binary/Turbo antes de comprar."""
+    try:
+        assets = iq.get_all_open_time() or {}
+        states = []
+
+        for mode in ("turbo", "binary"):
+            info = assets.get(mode, {}).get(pair)
+            if isinstance(info, dict):
+                states.append((mode, bool(info.get("open", False))))
+
+        if not states:
+            return False, f"{pair} no aparece en binary/turbo"
+
+        opened = [mode for mode, is_open in states if is_open]
+
+        if opened:
+            return True, f"{pair} abierto en {', '.join(opened)}"
+
+        return False, ", ".join(
+            f"{mode}={'ABIERTO' if is_open else 'CERRADO'}"
+            for mode, is_open in states
+        )
+
+    except Exception as e:
+        logging.exception("Error comprobando disponibilidad Binary de %s", pair)
+        return False, f"error comprobando activo: {type(e).__name__}: {e}"
+
+
+def execute_binary_order(iq, pair, signal, amount, expiration):
+    """
+    Intenta la entrada hasta 3 veces.
+    Si IQ Option devuelve 'asset is not available', refresca el estado
+    del activo y vuelve a intentar inmediatamente.
+    """
+    action = signal.lower()
+    last_response = None
+
+    for attempt in range(1, 4):
+        is_open, status = check_binary_availability(iq, pair)
+
+        logging.info(
+            "PRE-ORDEN %s | intento=%d/3 | signal=%s | disponible=%s | %s",
+            pair, attempt, signal, is_open, status,
+        )
+
+        if not is_open:
+            last_response = f"Activo no disponible: {status}"
+        else:
+            try:
+                iq.change_balance("PRACTICE")
+                ok, oid = iq.buy(
+                    amount,
+                    pair,
+                    action,
+                    expiration,
+                )
+
+                if ok:
+                    return True, oid
+
+                last_response = str(oid)
+
+                if "asset is not available" not in last_response.lower():
+                    return False, last_response
+
+            except Exception as e:
+                last_response = f"{type(e).__name__}: {e}"
+                logging.exception(
+                    "Excepción enviando BUY %s | intento=%d/3",
+                    pair, attempt,
+                )
+
+        if attempt < 3:
+            time.sleep(0.25)
+
+    return False, last_response or "sin respuesta de IQ Option"
+
+
 def main():
     global received_candles
 
@@ -485,7 +643,7 @@ def main():
     tg(
         "🟢 Bot iniciado\n"
         f"Par: {PAIR}\n"
-        "Mercado: EURUSD normal (NO OTC)\n"
+        "Mercado: EURUSD-OTC\n"
         "Temporalidad: M1\n"
         "Estrategia: REVERSIÓN\n"
         f"Expiración: {EXPIRATION} minuto\n"
@@ -544,12 +702,11 @@ def main():
                 res["signal"] in ("CALL", "PUT")
                 and ENABLE_TRADES
             ):
-                iq.change_balance("PRACTICE")
-
-                ok, oid = iq.buy(
-                    AMOUNT,
+                ok, oid = execute_binary_order(
+                    iq,
                     PAIR,
-                    res["signal"].lower(),
+                    res["signal"],
+                    AMOUNT,
                     EXPIRATION,
                 )
 
@@ -564,12 +721,12 @@ def main():
                 )
 
                 tg(
-                    f'{"🧪 Orden enviada" if ok else "⚠️ Orden rechazada"}\n'
-                    f"Par: {PAIR}\n"
-                    f"Dirección: {res['signal']}\n"
-                    f"Importe: {AMOUNT:.0f} USD\n"
-                    f"Expiración: {EXPIRATION} minuto\n"
-                    f"Motivo: {res['reason']}\n"
+                    f'{"🧪 Orden enviada" if ok else "⚠️ Orden rechazada"}\\n'
+                    f"Par: {PAIR}\\n"
+                    f"Dirección: {res['signal']}\\n"
+                    f"Importe: {AMOUNT:.0f} USD\\n"
+                    f"Expiración: {EXPIRATION} minuto\\n"
+                    f"Motivo: {res['reason']}\\n"
                     f"ID/respuesta: {oid}"
                 )
 
