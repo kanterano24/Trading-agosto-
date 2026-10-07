@@ -3,6 +3,7 @@
 import logging
 import os
 import time
+import re
 import requests
 from datetime import datetime
 
@@ -30,6 +31,138 @@ logging.basicConfig(
 
 sess = requests.Session()
 tg_last = 0.0
+
+
+tg_update_offset = 0
+received_candles = []
+received_candle_stamps = set()
+
+
+def parse_telegram_candles(update):
+    """Extrae velas EURUSD de mensajes del grupo con el formato actual."""
+    global received_candles
+
+    try:
+        message = update.get("message") or update.get("channel_post") or {}
+        msg = message.get("text", "") or ""
+        if "🕯️ VELA M1 CERRADA" not in msg or "Par: EURUSD" not in msg:
+            return []
+
+        blocks = re.split(r"(?=🕯️ VELA M1 CERRADA)", msg)
+        parsed = []
+
+        for block in blocks:
+            if "🕯️ VELA M1 CERRADA" not in block:
+                continue
+
+            def val(pattern):
+                m = re.search(pattern, block, re.MULTILINE)
+                return float(m.group(1)) if m else None
+
+            m_num = re.search(r"🕯️ VELA M1 CERRADA #(\d+)", block)
+            m_time = re.search(r"Hora apertura:\s*(.+)", block)
+            m_color = re.search(r"Color:\s*(.+)", block)
+
+            if not (m_num and m_time and m_color):
+                continue
+
+            o = val(r"Apertura:\s*([0-9.eE+-]+)")
+            cl = val(r"Cierre:\s*([0-9.eE+-]+)")
+            hi = val(r"Máximo:\s*([0-9.eE+-]+)")
+            lo = val(r"Mínimo:\s*([0-9.eE+-]+)")
+            rng = val(r"Rango:\s*([0-9.eE+-]+)")
+            body = val(r"Cuerpo:\s*([0-9.eE+-]+)")
+            lw = val(r"Mecha inferior:\s*([0-9.eE+-]+)")
+            uw = val(r"Mecha superior:\s*([0-9.eE+-]+)")
+
+            if None in (o, cl, hi, lo):
+                continue
+
+            try:
+                stamp = int(datetime.strptime(
+                    m_time.group(1).strip(), "%Y-%m-%d %H:%M:%S"
+                ).timestamp())
+            except ValueError:
+                continue
+
+            color_txt = m_color.group(1).strip().upper()
+            color = (
+                "green" if color_txt == "VERDE"
+                else "red" if color_txt == "ROJA"
+                else "doji"
+            )
+
+            parsed.append({
+                "number": int(m_num.group(1)),
+                "timestamp": stamp,
+                "time_text": m_time.group(1).strip(),
+                "open": o,
+                "close": cl,
+                "high": hi,
+                "low": lo,
+                "min": lo,
+                "max": hi,
+                "range": rng if rng is not None else hi - lo,
+                "body": body if body is not None else abs(cl - o),
+                "lower_wick": lw if lw is not None else min(o, cl) - lo,
+                "upper_wick": uw if uw is not None else hi - max(o, cl),
+                "color": color,
+            })
+
+        return parsed
+
+    except Exception:
+        logging.exception("Error procesando mensaje de Telegram")
+        return []
+
+
+def poll_telegram_candles():
+    """Lee mensajes nuevos del grupo mediante getUpdates."""
+    global tg_update_offset
+
+    if not TOKEN:
+        return []
+
+    try:
+        r = sess.get(
+            f"https://api.telegram.org/bot{TOKEN}/getUpdates",
+            params={
+                "offset": tg_update_offset,
+                "timeout": 1,
+                "allowed_updates": '["message","channel_post"]',
+            },
+            timeout=5,
+        )
+        r.raise_for_status()
+        data = r.json()
+
+        if not data.get("ok"):
+            return []
+
+        new_candles = []
+
+        for update in data.get("result", []):
+            tg_update_offset = max(
+                tg_update_offset, int(update.get("update_id", 0)) + 1
+            )
+
+            for candle in parse_telegram_candles(update):
+                stamp = candle["timestamp"]
+                if stamp not in received_candle_stamps:
+                    received_candle_stamps.add(stamp)
+                    received_candles.append(candle)
+                    new_candles.append(candle)
+
+        # Mantener solo el historial necesario para la estrategia.
+        received_candles[:] = sorted(
+            received_candles, key=lambda x: x["timestamp"]
+        )[-COUNT:]
+
+        return new_candles
+
+    except Exception:
+        logging.exception("Error recibiendo mensajes de Telegram")
+        return []
 
 
 def tg(msg):
@@ -145,6 +278,9 @@ def main():
     last_candle = None
     candle_number = 0
 
+    # Inicializa el offset sin ejecutar operaciones con mensajes antiguos.
+    poll_telegram_candles()
+
     tg(
         "🟢 Bot iniciado\n"
         f"Par: {PAIR}\n"
@@ -163,27 +299,34 @@ def main():
             if not iq.check_connect():
                 iq = connect_retry()
 
-            cs, now = get_candles(iq)
+            # Las velas para la estrategia llegan desde los mensajes
+            # de Telegram del grupo.
+            new_candles = poll_telegram_candles()
 
-            if len(cs) < 4:
-                logging.info("Esperando historial M1: %d/4", len(cs))
+            if not new_candles:
                 time.sleep(POLL)
                 continue
 
-            stamp = cs[-1]["timestamp"]
+            for new_candle in new_candles:
+                cs = list(received_candles)
 
-            # Solo procesa una vez cada vela cerrada.
-            if stamp == last_candle:
-                time.sleep(POLL)
-                continue
+                if len(cs) < 4:
+                    logging.info(
+                        "Esperando velas recibidas de Telegram: %d/4",
+                        len(cs)
+                    )
+                    continue
 
-            last_candle = stamp
-            candle_number += 1
+                stamp = new_candle["timestamp"]
 
-            # Enviar SIEMPRE los datos completos de cada nueva vela cerrada.
-            tg(candle_message(cs[-1], candle_number))
+                # Solo procesa una vez cada vela cerrada.
+                if stamp == last_candle:
+                    continue
 
-            res = analyze_market(cs)
+                last_candle = stamp
+                candle_number = new_candle["number"]
+
+                res = analyze_market(cs)
 
             logging.info(
                 "%s señal=%s | motivo=%s",
