@@ -22,6 +22,9 @@ from strategy import normalize_candles, analyze_market
 
 
 PAIR = "EURUSD-OTC"
+PAIRS = []
+MAX_OTC_PAIRS = 50
+PAIR_REFRESH_SECONDS = 300.0
 TF = 60
 COUNT = 200
 EXPIRATION = 1
@@ -35,7 +38,7 @@ EMAIL = os.getenv("IQ_EMAIL", "")
 PASSWORD = os.getenv("IQ_PASSWORD", "")
 TOKEN = os.getenv("TELEGRAM_TOKEN", "")
 CHAT = os.getenv("TELEGRAM_CHAT_ID", "")
-POLL = max(0.5, float(os.getenv("POLL_SECONDS", "1")))
+POLL = max(0.20, float(os.getenv("POLL_SECONDS", "0.20")))
 
 API_PORT = int(os.getenv("PORT", "8080"))
 CANDLES_API_KEY = os.getenv("CANDLES_API_KEY", "")
@@ -377,7 +380,7 @@ def connect_retry():
             delay = min(delay * 2, 60)
 
 
-def get_candles(iq):
+def get_candles(iq, pair):
     """Obtiene únicamente velas M1 ya cerradas desde IQ Option."""
     try:
         now = int(iq.get_server_timestamp())
@@ -385,7 +388,7 @@ def get_candles(iq):
         now = int(time.time())
 
     raw = iq.get_candles(
-        PAIR,
+        pair,
         TF,
         COUNT + 20,
         now,
@@ -483,93 +486,78 @@ def candle_message(candle, number):
 
 def binary_asset_status(iq, pair):
     """
-    Comprueba Binary/Turbo sin llamar get_all_open_time().
+    Comprueba exclusivamente TURBO.
 
-    get_all_open_time() tambien consulta Digital y otros mercados y es una
-    llamada pesada; en esta version solo necesitamos Binary/Turbo.
+    TURBO es el mercado de opciones binarias que admite expiraciones
+    de 1 a 5 minutos en iqoptionapi; por eso un par que no este abierto
+    en TURBO queda bloqueado para analisis y entrada de 1 minuto.
     """
     try:
         data = iq.get_all_init_v2()
 
         if not isinstance(data, dict):
-            return False, "IQ Option no devolvio datos Binary/Turbo"
+            return False, f"{pair} sin datos Binary/Turbo"
 
-        states = []
-        active_id = None
+        mode_data = data.get("turbo", {})
+        actives = mode_data.get("actives", {})
 
-        for mode in ("turbo", "binary"):
-            mode_data = data.get(mode, {})
-            actives = mode_data.get("actives", {})
+        if not isinstance(actives, dict):
+            return False, f"{pair} sin datos TURBO"
 
-            if not isinstance(actives, dict):
+        for aid, active in actives.items():
+            if not isinstance(active, dict):
                 continue
 
-            for aid, active in actives.items():
-                if not isinstance(active, dict):
-                    continue
+            name = str(active.get("name", ""))
+            parts = name.split(".")
+            name = parts[-1] if parts else name
 
-                name = str(active.get("name", ""))
-                name = name.split(".", 1)[-1]
+            if name != pair:
+                continue
 
-                if name != pair:
-                    continue
+            try:
+                active_id = int(aid)
+            except (TypeError, ValueError):
+                active_id = aid
 
-                try:
-                    active_id = int(aid)
-                except (TypeError, ValueError):
-                    active_id = aid
+            OP_code.ACTIVES[pair] = active_id
 
-                # buy() usa OP_code.ACTIVES[pair]. Actualizamos el codigo
-                # directamente desde la respuesta Binary/Turbo.
-                OP_code.ACTIVES[pair] = active_id
+            enabled = bool(active.get("enabled", False))
+            suspended = bool(active.get("is_suspended", False))
+            is_open = enabled and not suspended
 
-                enabled = bool(active.get("enabled", False))
-                suspended = bool(active.get("is_suspended", False))
-                is_open = enabled and not suspended
+            if is_open:
+                return True, f"{pair} abierto en TURBO | expiracion 1m disponible"
 
-                states.append((mode, is_open))
+            return False, f"{pair} TURBO cerrado/suspendido"
 
-        if not states:
-            return False, f"{pair} no aparece en Binary/Turbo"
-
-        opened = [mode for mode, is_open in states if is_open]
-
-        if opened:
-            return True, f"{pair} abierto en {', '.join(opened)}"
-
-        details = ", ".join(
-            f"{mode}={'ABIERTO' if is_open else 'CERRADO'}"
-            for mode, is_open in states
-        )
-        return False, details
+        return False, f"{pair} no aparece en TURBO; 1m bloqueado"
 
     except Exception as e:
         logging.exception(
-            "No se pudo comprobar disponibilidad Binary/Turbo de %s",
+            "No se pudo comprobar TURBO de %s",
             pair,
         )
-        return False, f"error disponibilidad: {type(e).__name__}: {e}"
+        return False, f"error disponibilidad 1m: {type(e).__name__}: {e}"
 
 
 def wait_binary_asset(iq, pair, attempts=2, delay=0.35):
-    """
-    Comprueba disponibilidad inmediatamente antes de la entrada.
-    Si el activo está cerrado/no disponible, NO llama iq.buy().
-    """
+    """Comprueba TURBO inmediatamente antes de una entrada de 1 minuto."""
     last_reason = "sin respuesta"
 
     for attempt in range(1, attempts + 1):
         is_open, reason = binary_asset_status(iq, pair)
-        last_reason = reason
 
         logging.info(
-            "Disponibilidad %s | intento=%d/%d | abierta=%s | %s",
+            "Disponibilidad 1m %s | intento=%d/%d | abierta=%s | %s",
             pair,
             attempt,
             attempts,
             is_open,
             reason,
         )
+
+        last_reason = reason
 
         if is_open:
             return True, reason
@@ -581,9 +569,69 @@ def wait_binary_asset(iq, pair, attempts=2, delay=0.35):
 
 
 def check_binary_availability(iq, pair):
-    """Comprueba Binary/Turbo sin consultar Digital."""
+    """Comprueba exclusivamente disponibilidad TURBO para expiracion 1m."""
     return binary_asset_status(iq, pair)
 
+
+def discover_otc_1m_pairs(iq):
+    """
+    Descubre hasta 50 pares OTC abiertos en TURBO.
+    Solo estos pares se analizan y pueden recibir entradas de 1 minuto.
+    """
+    try:
+        data = iq.get_all_init_v2()
+
+        if not isinstance(data, dict):
+            logging.warning("No se recibieron datos de inicializacion")
+            return []
+
+        turbo = data.get("turbo", {})
+        actives = turbo.get("actives", {})
+
+        if not isinstance(actives, dict):
+            return []
+
+        found = []
+
+        for aid, active in actives.items():
+            if not isinstance(active, dict):
+                continue
+
+            name = str(active.get("name", ""))
+            parts = name.split(".")
+            pair = parts[-1] if parts else name
+
+            if not pair.endswith("-OTC"):
+                continue
+
+            enabled = bool(active.get("enabled", False))
+            suspended = bool(active.get("is_suspended", False))
+
+            if not enabled or suspended:
+                continue
+
+            try:
+                active_id = int(aid)
+            except (TypeError, ValueError):
+                active_id = aid
+
+            OP_code.ACTIVES[pair] = active_id
+            found.append(pair)
+
+        pairs = sorted(set(found))[:MAX_OTC_PAIRS]
+
+        logging.info(
+            "Pares OTC con expiracion 1m disponibles: %d/%d | %s",
+            len(pairs),
+            MAX_OTC_PAIRS,
+            ", ".join(pairs),
+        )
+
+        return pairs
+
+    except Exception:
+        logging.exception("Error actualizando pares OTC de 1 minuto")
+        return []
 
 def execute_binary_order(iq, pair, signal, amount, expiration):
     """
@@ -636,7 +684,7 @@ def execute_binary_order(iq, pair, signal, amount, expiration):
 
 
 def main():
-    global received_candles
+    global received_candles, PAIR, PAIRS
 
     # IMPORTANTE:
     # Este bot NO llama getUpdates.
@@ -644,104 +692,195 @@ def main():
     start_candles_api()
 
     iq = connect_retry()
-    last_candle = None
-    candle_number = 0
+    last_candles = {}
+    candle_numbers = {}
+    last_pair_refresh = 0.0
+    last_minute = None
+
+    PAIRS = discover_otc_1m_pairs(iq)
 
     tg(
         "🟢 Bot iniciado\n"
-        f"Par: {PAIR}\n"
-        "Mercado: EURUSD-OTC\n"
+        f"Pares OTC analizados: hasta {MAX_OTC_PAIRS}\n"
+        f"Pares disponibles 1m: {len(PAIRS)}\n"
         "Temporalidad: M1\n"
-        "Estrategia: REVERSIÓN\n"
+        "Estrategia: REVERSIÓN POR AGOTAMIENTO DE IMPULSO\n"
         f"Expiración: {EXPIRATION} minuto\n"
         f"Importe: {AMOUNT:.0f} USD\n"
         "Indicadores: ninguno\n"
         "S/R: no\n"
-        "Rechazo: no"
+        "Rechazo: no\n"
+        "Actualización de pares: cada 5 minutos"
     )
 
     while True:
         try:
             if not iq.check_connect():
                 iq = connect_retry()
+                PAIRS = discover_otc_1m_pairs(iq)
+                last_pair_refresh = time.monotonic()
+                last_minute = None
 
-            cs, now = get_candles(iq)
+            now_mono = time.monotonic()
 
-            if len(cs) < 4:
-                logging.info(
-                    "Esperando historial M1: %d/4",
-                    len(cs),
+            # Actualiza la lista de pares exactamente cada 5 minutos.
+            if now_mono - last_pair_refresh >= PAIR_REFRESH_SECONDS:
+                refreshed = discover_otc_1m_pairs(iq)
+
+                if refreshed:
+                    PAIRS = refreshed
+                    tg(
+                        f"🔄 Pares OTC actualizados\n"
+                        f"Disponibles con expiración 1m: {len(PAIRS)}\n"
+                        f"Analizando: {', '.join(PAIRS)}"
+                    )
+                else:
+                    logging.warning(
+                        "Actualizacion sin pares validos; se conserva la lista anterior"
+                    )
+
+                last_pair_refresh = now_mono
+
+            if not PAIRS:
+                logging.warning(
+                    "No hay pares OTC con expiracion 1m disponibles; "
+                    "analisis y entradas bloqueados"
                 )
                 time.sleep(POLL)
                 continue
 
-            # Mantener todo el historial actual disponible en /candles.
-            received_candles = build_candle_api_history(cs)
+            # Procesa cada vela M1 cerrada una sola vez.
+            server_now = int(iq.get_server_timestamp())
+            current_minute = server_now - server_now % TF
 
-            stamp = cs[-1]["timestamp"]
-
-            # Solo procesa una vez cada vela cerrada.
-            if stamp == last_candle:
+            if current_minute == last_minute:
                 time.sleep(POLL)
                 continue
 
-            last_candle = stamp
-            candle_number += 1
+            last_minute = current_minute
 
-            # Enviar cada nueva vela cerrada al grupo.
-            tg(
-                candle_message(
-                    cs[-1],
-                    candle_number,
-                )
-            )
+            for pair in list(PAIRS):
+                try:
+                    # Verificacion final: si el par ya no tiene TURBO/1m,
+                    # se bloquean tanto el analisis como la entrada.
+                    is_open, availability_reason = binary_asset_status(
+                        iq,
+                        pair,
+                    )
 
-            res = analyze_market(cs)
+                    if not is_open:
+                        logging.info(
+                            "%s | ANALISIS BLOQUEADO | %s",
+                            pair,
+                            availability_reason,
+                        )
+                        continue
 
-            logging.info(
-                "%s señal=%s | motivo=%s",
-                PAIR,
-                res["signal"],
-                res["reason"],
-            )
+                    cs, _ = get_candles(iq, pair)
 
-            if (
-                res["signal"] in ("CALL", "PUT")
-                and ENABLE_TRADES
-            ):
-                ok, oid = execute_binary_order(
-                    iq,
-                    PAIR,
-                    res["signal"],
-                    AMOUNT,
-                    EXPIRATION,
-                )
+                    if len(cs) < 4:
+                        logging.info(
+                            "%s | Esperando historial M1: %d/4",
+                            pair,
+                            len(cs),
+                        )
+                        continue
 
-                logging.info(
-                    "%s señal=%s | orden=%s | ok=%s | "
-                    "respuesta=%s",
-                    PAIR,
-                    res["signal"],
-                    res["signal"],
-                    ok,
-                    oid,
-                )
+                    stamp = cs[-1]["timestamp"]
 
-                tg(
-                    f'{"🧪 Orden enviada" if ok else "⚠️ Orden rechazada"}\\n'
-                    f"Par: {PAIR}\\n"
-                    f"Dirección: {res['signal']}\\n"
-                    f"Importe: {AMOUNT:.0f} USD\\n"
-                    f"Expiración: {EXPIRATION} minuto\\n"
-                    f"Motivo: {res['reason']}\\n"
-                    f"ID/respuesta: {oid}"
-                )
+                    if stamp == last_candles.get(pair):
+                        continue
 
-            tg(
-                f"📈 {PAIR} M1\n"
-                f"Señal: {res['signal']}\n"
-                f"Motivo: {res['reason']}"
-            )
+                    last_candles[pair] = stamp
+                    candle_numbers[pair] = candle_numbers.get(pair, 0) + 1
+
+                    # Mantener la API apuntando al ultimo par procesado,
+                    # conservando el formato original del endpoint.
+                    PAIR = pair
+                    received_candles = build_candle_api_history(cs)
+
+                    tg(
+                        candle_message(
+                            cs[-1],
+                            candle_numbers[pair],
+                        )
+                    )
+
+                    res = analyze_market(cs)
+
+                    logging.info(
+                        "%s señal=%s | motivo=%s",
+                        pair,
+                        res["signal"],
+                        res["reason"],
+                    )
+
+                    # La entrada queda bloqueada si el par no tiene 1m
+                    # disponible justo antes de enviar la orden.
+                    if (
+                        res["signal"] in ("CALL", "PUT")
+                        and ENABLE_TRADES
+                    ):
+                        is_open, availability_reason = wait_binary_asset(
+                            iq,
+                            pair,
+                        )
+
+                        if not is_open:
+                            logging.info(
+                                "%s | ENTRADA BLOQUEADA | %s",
+                                pair,
+                                availability_reason,
+                            )
+                            tg(
+                                f"⛔ Entrada bloqueada\n"
+                                f"Par: {pair}\n"
+                                f"Motivo: {availability_reason}\n"
+                                f"Expiración requerida: {EXPIRATION} minuto"
+                            )
+                        else:
+                            ok, oid = execute_binary_order(
+                                iq,
+                                pair,
+                                res["signal"],
+                                AMOUNT,
+                                EXPIRATION,
+                            )
+
+                            logging.info(
+                                "%s señal=%s | orden=%s | ok=%s | respuesta=%s",
+                                pair,
+                                res["signal"],
+                                res["signal"],
+                                ok,
+                                oid,
+                            )
+
+                            tg(
+                                f'{"🧪 Orden enviada" if ok else "⚠️ Orden rechazada"}\n'
+                                f"Par: {pair}\n"
+                                f"Dirección: {res['signal']}\n"
+                                f"Importe: {AMOUNT:.0f} USD\n"
+                                f"Expiración: {EXPIRATION} minuto\n"
+                                f"Motivo: {res['reason']}\n"
+                                f"ID/respuesta: {oid}"
+                            )
+
+                    tg(
+                        f"📈 {pair} M1\n"
+                        f"Señal: {res['signal']}\n"
+                        f"Motivo: {res['reason']}"
+                    )
+
+                except Exception as e:
+                    logging.exception(
+                        "Error procesando %s",
+                        pair,
+                    )
+                    tg(
+                        f"⚠️ Error procesando {pair}: "
+                        f"{type(e).__name__}: {e}"
+                    )
 
         except Exception as e:
             logging.exception("Error de ciclo")
@@ -753,8 +892,14 @@ def main():
             try:
                 if not iq.check_connect():
                     iq = connect_retry()
+                    PAIRS = discover_otc_1m_pairs(iq)
+                    last_pair_refresh = time.monotonic()
+                    last_minute = None
             except Exception:
                 iq = connect_retry()
+                PAIRS = discover_otc_1m_pairs(iq)
+                last_pair_refresh = time.monotonic()
+                last_minute = None
 
         time.sleep(POLL)
 
