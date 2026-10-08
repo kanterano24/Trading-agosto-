@@ -10,6 +10,7 @@
 import json
 import logging
 import os
+import queue
 import threading
 import time
 from datetime import datetime
@@ -51,37 +52,126 @@ logging.basicConfig(
 sess = requests.Session()
 tg_last = 0.0
 
+# Telegram se procesa en segundo plano para que enviar mensajes nunca retrase
+# el análisis ni la entrada de las operaciones.
+TG_MIN_INTERVAL = max(1.05, float(os.getenv("TG_MIN_INTERVAL", "1.10")))
+TG_RETRY_MAX = max(1, int(os.getenv("TG_RETRY_MAX", "3")))
+TG_QUEUE_MAX = max(100, int(os.getenv("TG_QUEUE_MAX", "500")))
+TG_429_LOG_COOLDOWN = max(10.0, float(os.getenv("TG_429_LOG_COOLDOWN", "30")))
+TG_QUEUE = queue.Queue(maxsize=TG_QUEUE_MAX)
+TG_LAST_429_LOG = 0.0
+TG_WORKER_STARTED = False
+TG_WORKER_LOCK = threading.Lock()
+
 # Historial actual que queda expuesto por /candles.
 received_candles = []
 
 
-def tg(msg):
-    """Envía mensajes al grupo. NO usa getUpdates."""
-    global tg_last
+def _telegram_worker():
+    """Emisor único y lento; respeta Telegram sin bloquear el bot."""
+    global tg_last, TG_LAST_429_LOG
 
+    while True:
+        msg = TG_QUEUE.get()
+        try:
+            if not TOKEN or not CHAT:
+                continue
+
+            for attempt in range(1, TG_RETRY_MAX + 1):
+                wait = TG_MIN_INTERVAL - (time.monotonic() - tg_last)
+                if wait > 0:
+                    time.sleep(wait)
+
+                try:
+                    r = sess.post(
+                        f"https://api.telegram.org/bot{TOKEN}/sendMessage",
+                        data={
+                            "chat_id": CHAT,
+                            "text": msg,
+                            "disable_web_page_preview": True,
+                        },
+                        timeout=15,
+                    )
+
+                    if r.status_code == 429:
+                        try:
+                            payload = r.json()
+                        except ValueError:
+                            payload = {}
+
+                        retry_after = payload.get("parameters", {}).get("retry_after", 2)
+                        try:
+                            retry_after = max(1.0, float(retry_after))
+                        except (TypeError, ValueError):
+                            retry_after = 2.0
+
+                        if time.monotonic() - TG_LAST_429_LOG >= TG_429_LOG_COOLDOWN:
+                            logging.warning(
+                                "Telegram 429: limite alcanzado; esperando %.1fs",
+                                retry_after,
+                            )
+                            TG_LAST_429_LOG = time.monotonic()
+
+                        if attempt >= TG_RETRY_MAX:
+                            logging.warning(
+                                "Telegram: se descarta el mensaje después de %d reintentos por 429",
+                                TG_RETRY_MAX,
+                            )
+                            break
+
+                        time.sleep(retry_after + 0.25)
+                        continue
+
+                    r.raise_for_status()
+                    payload = r.json()
+                    if not payload.get("ok"):
+                        logging.warning("Telegram rechazo mensaje: %s", payload)
+
+                    tg_last = time.monotonic()
+                    break
+
+                except requests.RequestException as exc:
+                    if attempt >= TG_RETRY_MAX:
+                        logging.warning("Telegram no disponible: %s", exc)
+                        break
+                    time.sleep(min(2.0 * attempt, 5.0))
+        finally:
+            TG_QUEUE.task_done()
+
+
+def _ensure_telegram_worker():
+    global TG_WORKER_STARTED
+
+    if TG_WORKER_STARTED or not TOKEN or not CHAT:
+        return
+
+    with TG_WORKER_LOCK:
+        if TG_WORKER_STARTED:
+            return
+
+        thread = threading.Thread(
+            target=_telegram_worker,
+            name="telegram-sender",
+            daemon=True,
+        )
+        thread.start()
+        TG_WORKER_STARTED = True
+
+
+def tg(msg):
+    """Encola el mensaje y retorna inmediatamente; nunca bloquea el trading."""
     if not TOKEN or not CHAT:
         return False
 
+    _ensure_telegram_worker()
+
     try:
-        wait = 1.2 - (time.monotonic() - tg_last)
-        if wait > 0:
-            time.sleep(wait)
-
-        r = sess.post(
-            f"https://api.telegram.org/bot{TOKEN}/sendMessage",
-            data={"chat_id": CHAT, "text": msg},
-            timeout=15,
-        )
-        r.raise_for_status()
-
-        if not r.json().get("ok"):
-            raise RuntimeError(str(r.json()))
-
-        tg_last = time.monotonic()
+        TG_QUEUE.put_nowait(str(msg))
         return True
-
-    except Exception:
-        logging.exception("Error Telegram")
+    except queue.Full:
+        # Si Telegram está temporalmente atrasado, no sacrificamos el ciclo
+        # de mercado. Se descarta únicamente el mensaje de menor prioridad.
+        logging.warning("Cola Telegram llena; mensaje omitido")
         return False
 
 
@@ -498,10 +588,9 @@ def binary_asset_status(iq, pair):
         if not isinstance(data, dict):
             return False, f"{pair} sin datos Binary/Turbo"
 
-        mode_data = data.get("turbo", {})
-        actives = mode_data.get("actives", {})
+        actives = _get_turbo_actives(data)
 
-        if not isinstance(actives, dict):
+        if not isinstance(actives, dict) or not actives:
             return False, f"{pair} sin datos TURBO"
 
         for aid, active in actives.items():
@@ -573,22 +662,56 @@ def check_binary_availability(iq, pair):
     return binary_asset_status(iq, pair)
 
 
+def _get_turbo_actives(data):
+    """Obtiene actives TURBO de las variantes de respuesta de iqoptionapi."""
+    if not isinstance(data, dict):
+        return {}
+
+    candidates = [
+        data.get("turbo"),
+        data.get("result", {}).get("turbo") if isinstance(data.get("result"), dict) else None,
+    ]
+
+    for turbo in candidates:
+        if not isinstance(turbo, dict):
+            continue
+        actives = turbo.get("actives")
+        if isinstance(actives, dict):
+            return actives
+
+    return {}
+
+
+def _active_pair_name(active):
+    """Normaliza el nombre del activo recibido por IQ Option."""
+    if not isinstance(active, dict):
+        return ""
+
+    name = str(active.get("name", "")).strip()
+    if not name:
+        return ""
+
+    # IQ Option puede devolver nombres como TURBO.EURUSD-OTC,
+    # binary.EURUSD-OTC o con otros prefijos separados por '.'.
+    return name.split(".")[-1]
+
+
 def discover_otc_1m_pairs(iq):
     """
-    Descubre hasta 50 pares OTC abiertos en TURBO.
-    Solo estos pares se analizan y pueden recibir entradas de 1 minuto.
+    Descubre hasta 50 pares OTC que estén ABIERTOS en TURBO.
+
+    TURBO es el modo que admite expiraciones cortas de 1 a 5 minutos.
+    Por eso un par que no esté abierto/sin suspendido en TURBO queda
+    fuera de la lista: no se analiza y no se permite una entrada de 1m.
     """
     try:
         data = iq.get_all_init_v2()
+        actives = _get_turbo_actives(data)
 
-        if not isinstance(data, dict):
-            logging.warning("No se recibieron datos de inicializacion")
-            return []
-
-        turbo = data.get("turbo", {})
-        actives = turbo.get("actives", {})
-
-        if not isinstance(actives, dict):
+        if not actives:
+            logging.warning(
+                "IQ Option no devolvio actives TURBO en get_all_init_v2()"
+            )
             return []
 
         found = []
@@ -597,9 +720,7 @@ def discover_otc_1m_pairs(iq):
             if not isinstance(active, dict):
                 continue
 
-            name = str(active.get("name", ""))
-            parts = name.split(".")
-            pair = parts[-1] if parts else name
+            pair = _active_pair_name(active)
 
             if not pair.endswith("-OTC"):
                 continue
@@ -621,10 +742,10 @@ def discover_otc_1m_pairs(iq):
         pairs = sorted(set(found))[:MAX_OTC_PAIRS]
 
         logging.info(
-            "Pares OTC con expiracion 1m disponibles: %d/%d | %s",
+            "Pares OTC TURBO/1m encontrados: %d/%d | %s",
             len(pairs),
             MAX_OTC_PAIRS,
-            ", ".join(pairs),
+            ", ".join(pairs) if pairs else "NINGUNO",
         )
 
         return pairs
@@ -692,6 +813,7 @@ def main():
     start_candles_api()
 
     iq = connect_retry()
+    _ensure_telegram_worker()
     last_candles = {}
     candle_numbers = {}
     last_pair_refresh = 0.0
@@ -759,20 +881,17 @@ def main():
 
             last_minute = current_minute
 
+            # Una sola consulta de activos por minuto mantiene actualizado el
+            # bloqueo 1m sin hacer 50 llamadas get_all_init_v2 por ciclo.
+            available_1m = set(discover_otc_1m_pairs(iq))
+
             for pair in list(PAIRS):
                 try:
-                    # Verificacion final: si el par ya no tiene TURBO/1m,
-                    # se bloquean tanto el analisis como la entrada.
-                    is_open, availability_reason = binary_asset_status(
-                        iq,
-                        pair,
-                    )
-
-                    if not is_open:
+                    # Si el par ya no está abierto en TURBO/1m, no se analiza.
+                    if pair not in available_1m:
                         logging.info(
-                            "%s | ANALISIS BLOQUEADO | %s",
+                            "%s | ANALISIS BLOQUEADO | sin expiracion 1m disponible",
                             pair,
-                            availability_reason,
                         )
                         continue
 
@@ -799,11 +918,9 @@ def main():
                     PAIR = pair
                     received_candles = build_candle_api_history(cs)
 
-                    tg(
-                        candle_message(
-                            cs[-1],
-                            candle_numbers[pair],
-                        )
+                    candle_text = candle_message(
+                        cs[-1],
+                        candle_numbers[pair],
                     )
 
                     res = analyze_market(cs)
@@ -814,6 +931,8 @@ def main():
                         res["signal"],
                         res["reason"],
                     )
+
+                    order_text = ""
 
                     # La entrada queda bloqueada si el par no tiene 1m
                     # disponible justo antes de enviar la orden.
@@ -832,9 +951,8 @@ def main():
                                 pair,
                                 availability_reason,
                             )
-                            tg(
-                                f"⛔ Entrada bloqueada\n"
-                                f"Par: {pair}\n"
+                            order_text = (
+                                "\n\n⛔ ENTRADA BLOQUEADA\n"
                                 f"Motivo: {availability_reason}\n"
                                 f"Expiración requerida: {EXPIRATION} minuto"
                             )
@@ -856,20 +974,24 @@ def main():
                                 oid,
                             )
 
-                            tg(
-                                f'{"🧪 Orden enviada" if ok else "⚠️ Orden rechazada"}\n'
-                                f"Par: {pair}\n"
+                            order_text = (
+                                f'\n\n{"🧪 ORDEN ENVIADA" if ok else "⚠️ ORDEN RECHAZADA"}\n'
                                 f"Dirección: {res['signal']}\n"
                                 f"Importe: {AMOUNT:.0f} USD\n"
                                 f"Expiración: {EXPIRATION} minuto\n"
-                                f"Motivo: {res['reason']}\n"
                                 f"ID/respuesta: {oid}"
                             )
 
+                    # Un solo mensaje por par y por cierre M1. Esto conserva
+                    # los datos de la vela y la señal, pero evita duplicar
+                    # mensajes y alcanzar el límite de Telegram con 50 pares.
                     tg(
-                        f"📈 {pair} M1\n"
-                        f"Señal: {res['signal']}\n"
-                        f"Motivo: {res['reason']}"
+                        candle_text
+                        + "\n\n📈 Señal: "
+                        + res["signal"]
+                        + "\n"
+                        + res["reason"]
+                        + order_text
                     )
 
                 except Exception as e:
@@ -877,17 +999,14 @@ def main():
                         "Error procesando %s",
                         pair,
                     )
-                    tg(
-                        f"⚠️ Error procesando {pair}: "
-                        f"{type(e).__name__}: {e}"
-                    )
+                    # El error queda en Railway; no se reenvía cada excepción a
+                    # Telegram para evitar otra ráfaga cuando varios pares fallen.
 
         except Exception as e:
             logging.exception("Error de ciclo")
 
-            tg(
-                f"⚠️ Error: {type(e).__name__}: {e}"
-            )
+            # El error principal queda registrado en Railway. Telegram no se usa
+            # para notificar cada error de ciclo porque podría generar un 429.
 
             try:
                 if not iq.check_connect():
