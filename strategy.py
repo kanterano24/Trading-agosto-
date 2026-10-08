@@ -181,9 +181,13 @@ def _reversal_signal(c):
         third,
     )
 
+    # La reversión PUT no puede ser simplemente una vela roja.
+    # Debe cerrar por debajo de la apertura de la tercera vela verde,
+    # demostrando que el impulso alcista realmente perdió el control.
     put_reversal = (
         reversal["color"] == "red"
         and reversal["body"] > 0
+        and reversal["close"] < third["open"]
     )
 
     if bullish_impulse and put_reversal:
@@ -198,9 +202,13 @@ def _reversal_signal(c):
         third,
     )
 
+    # La reversión CALL no puede ser simplemente una vela verde.
+    # Debe cerrar por encima de la apertura de la tercera vela roja,
+    # demostrando que el impulso bajista realmente perdió el control.
     call_reversal = (
         reversal["color"] == "green"
         and reversal["body"] > 0
+        and reversal["close"] > third["open"]
     )
 
     if bearish_impulse and call_reversal:
