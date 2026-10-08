@@ -29,7 +29,7 @@ PAIR_REFRESH_SECONDS = 300.0
 TF = 60
 COUNT = 200
 EXPIRATION = 2
-AMOUNT = 353.0
+AMOUNT = 463.0
 
 ENABLE_TRADES = os.getenv("ENABLE_TRADES", "true").lower() in (
     "1", "true", "yes", "si"
