@@ -29,7 +29,7 @@ PAIR_REFRESH_SECONDS = 300.0
 TF = 60
 COUNT = 200
 EXPIRATION = 1
-AMOUNT = 3.0
+AMOUNT = 600.0
 
 ENABLE_TRADES = os.getenv("ENABLE_TRADES", "true").lower() in (
     "1", "true", "yes", "si"
@@ -40,6 +40,11 @@ PASSWORD = os.getenv("IQ_PASSWORD", "")
 TOKEN = os.getenv("TELEGRAM_TOKEN", "")
 CHAT = os.getenv("TELEGRAM_CHAT_ID", "")
 POLL = max(0.20, float(os.getenv("POLL_SECONDS", "0.20")))
+
+# Entrada estrictamente en la apertura de la nueva vela M1.
+# Si el precio ya se separó de la apertura o pasó la ventana, NO entra.
+OPENING_WINDOW_SECONDS = max(0.10, float(os.getenv("OPENING_WINDOW_SECONDS", "1.0")))
+OPENING_PRICE_TOLERANCE = float(os.getenv("OPENING_PRICE_TOLERANCE", "1e-10"))
 
 API_PORT = int(os.getenv("PORT", "8080"))
 CANDLES_API_KEY = os.getenv("CANDLES_API_KEY", "")
@@ -754,6 +759,63 @@ def discover_otc_1m_pairs(iq):
         logging.exception("Error actualizando pares OTC de 1 minuto")
         return []
 
+def price_at_candle_open(iq, pair):
+    """
+    Verifica la condición estricta de entrada:
+    - estamos dentro de la ventana inicial de la vela M1;
+    - el precio actual coincide con la apertura de esa vela.
+
+    Si cualquiera de las dos condiciones falla, la entrada queda bloqueada.
+    """
+    try:
+        server_now = int(iq.get_server_timestamp())
+        candle_start = server_now - server_now % TF
+        elapsed = server_now - candle_start
+
+        if elapsed > OPENING_WINDOW_SECONDS:
+            return False, (
+                f"fuera de apertura M1: {elapsed:.0f}s desde apertura "
+                f"(máximo {OPENING_WINDOW_SECONDS:.2f}s)"
+            )
+
+        raw = iq.get_candles(pair, TF, 2, server_now) or []
+        if not raw:
+            return False, "no se pudo obtener la vela M1 actual"
+
+        current = None
+        for candle in reversed(raw):
+            try:
+                start = int(candle.get("from", 0))
+            except (TypeError, ValueError):
+                continue
+            if start == candle_start:
+                current = candle
+                break
+
+        if current is None:
+            return False, "no se encontró la vela M1 actual"
+
+        opening_price = float(current["open"])
+        current_price = float(current["close"])
+        difference = abs(current_price - opening_price)
+
+        if difference > OPENING_PRICE_TOLERANCE:
+            return False, (
+                f"precio ya no está en apertura: "
+                f"open={opening_price} actual={current_price} "
+                f"diferencia={difference}"
+            )
+
+        return True, (
+            f"precio en apertura M1: {opening_price} "
+            f"(t={elapsed:.0f}s)"
+        )
+
+    except Exception as exc:
+        logging.exception("Error comprobando apertura M1 de %s", pair)
+        return False, f"error comprobando apertura: {type(exc).__name__}: {exc}"
+
+
 def execute_binary_order(iq, pair, signal, amount, expiration):
     """
     Intenta la entrada hasta 3 veces.
@@ -764,6 +826,18 @@ def execute_binary_order(iq, pair, signal, amount, expiration):
     last_response = None
 
     for attempt in range(1, 4):
+        # La disponibilidad del activo no es suficiente: la orden solo puede
+        # enviarse si el precio sigue exactamente en la apertura de la M1.
+        at_open, opening_status = price_at_candle_open(iq, pair)
+
+        logging.info(
+            "APERTURA M1 %s | intento=%d/3 | permitido=%s | %s",
+            pair, attempt, at_open, opening_status,
+        )
+
+        if not at_open:
+            return False, f"ENTRADA BLOQUEADA: {opening_status}"
+
         is_open, status = check_binary_availability(iq, pair)
 
         logging.info(
@@ -957,13 +1031,28 @@ def main():
                                 f"Expiración requerida: {EXPIRATION} minuto"
                             )
                         else:
-                            ok, oid = execute_binary_order(
-                                iq,
-                                pair,
-                                res["signal"],
-                                AMOUNT,
-                                EXPIRATION,
+                            # Última comprobación: si el precio se movió aunque
+                            # sea antes de enviar la orden, no se ejecuta.
+                            at_open, opening_status = price_at_candle_open(
+                                iq, pair
                             )
+
+                            if not at_open:
+                                logging.info(
+                                    "%s | ENTRADA BLOQUEADA | %s",
+                                    pair,
+                                    opening_status,
+                                )
+                                ok = False
+                                oid = f"ENTRADA BLOQUEADA: {opening_status}"
+                            else:
+                                ok, oid = execute_binary_order(
+                                    iq,
+                                    pair,
+                                    res["signal"],
+                                    AMOUNT,
+                                    EXPIRATION,
+                                )
 
                             logging.info(
                                 "%s señal=%s | orden=%s | ok=%s | respuesta=%s",
