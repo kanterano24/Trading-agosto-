@@ -1,285 +1,146 @@
-"""Estrategia de REVERSIÓN por 3 velas claras + reversión.
-Solo precio sobre velas M1 cerradas.
-Sin indicadores, sin soporte/resistencia y sin lógica OTC.
-
-Lógica:
-- PUT: 3 velas verdes claras consecutivas y después una vela roja de reversión.
-- CALL: 3 velas rojas claras consecutivas y después una vela verde de reversión.
-- La señal se confirma al cerrar la vela de reversión.
-- bot.py ejecuta la operación en la siguiente M1.
+"""Estrategia: estructura + RSI + agotamiento/reversion.
+Solo velas M1 cerradas. Sin S/R ni rechazo.
+PUT: estructura alcista + RSI sobrecomprado girando abajo + patron.
+CALL: estructura bajista + RSI sobrevendido girando arriba + patron.
+Objetivo de expiracion: 2 minutos.
 """
+
+RSI_PERIOD = 14
+RSI_OVERBOUGHT = 70.0
+RSI_OVERSOLD = 30.0
+EXPIRATION = 2
 
 
 def normalize_candles(raw):
     out = []
-
     for c in raw or []:
         try:
             ts = int(c.get("from", c.get("at", c.get("timestamp", 0))))
-            o = float(c["open"])
-            cl = float(c["close"])
+            o = float(c["open"]); cl = float(c["close"])
             lo = float(c.get("min", c.get("low", min(o, cl))))
             hi = float(c.get("max", c.get("high", max(o, cl))))
-
-            if ts > 0 and hi >= max(o, cl) and lo <= min(o, cl):
-                body = abs(cl - o)
-                rng = max(hi - lo, 0.0)
-                lower_wick = min(o, cl) - lo
-                upper_wick = hi - max(o, cl)
-
-                color = (
-                    "green"
-                    if cl > o
-                    else "red"
-                    if cl < o
-                    else "doji"
-                )
-
-                out.append({
-                    "timestamp": ts,
-                    "open": o,
-                    "close": cl,
-                    "min": lo,
-                    "max": hi,
-                    "high": hi,
-                    "low": lo,
-                    "body": body,
-                    "range": rng,
-                    "lower_wick": lower_wick,
-                    "upper_wick": upper_wick,
-                    "color": color,
-                })
-
+            if ts <= 0 or hi < max(o, cl) or lo > min(o, cl):
+                continue
+            body = abs(cl - o); rng = max(hi - lo, 0.0)
+            out.append({
+                "timestamp": ts, "open": o, "close": cl,
+                "min": lo, "max": hi, "high": hi, "low": lo,
+                "body": body, "range": rng,
+                "lower_wick": min(o, cl) - lo,
+                "upper_wick": hi - max(o, cl),
+                "color": "green" if cl > o else "red" if cl < o else "doji",
+            })
         except (KeyError, TypeError, ValueError):
             continue
-
-    dedup = {
-        c["timestamp"]: c
-        for c in sorted(out, key=lambda x: x["timestamp"])
-    }
-
-    return list(dedup.values())
+    return list({x["timestamp"]: x for x in sorted(out, key=lambda z: z["timestamp"])}.values())
 
 
 def describe_history(raw):
     c = normalize_candles(raw)
-
-    g = sum(x["color"] == "green" for x in c)
-    r = sum(x["color"] == "red" for x in c)
-
-    return {
-        "count": len(c),
-        "greens": g,
-        "reds": r,
-        "dojis": len(c) - g - r,
-    }
+    return {"count": len(c), "greens": sum(x["color"] == "green" for x in c),
+            "reds": sum(x["color"] == "red" for x in c),
+            "dojis": sum(x["color"] == "doji" for x in c)}
 
 
 def format_candle(i, c):
     x = normalize_candles([c])
+    if not x: return f"{i}: inválida"
+    a = x[0]; color = "V" if a["color"] == "green" else "R" if a["color"] == "red" else "D"
+    return (f"{i}: {color} O={a['open']} C={a['close']} H={a['high']} L={a['low']} "
+            f"Rango={a['range']} Cuerpo={a['body']} MechaInf={a['lower_wick']} MechaSup={a['upper_wick']}")
 
-    if not x:
-        return f"{i}: inválida"
 
-    a = x[0]
-
-    color = (
-        "V"
-        if a["color"] == "green"
-        else "R"
-        if a["color"] == "red"
-        else "D"
-    )
-
-    return (
-        f"{i}: {color} "
-        f"O={a['open']} C={a['close']} "
-        f"H={a['high']} L={a['low']} "
-        f"Rango={a['range']} Cuerpo={a['body']} "
-        f"MechaInf={a['lower_wick']} MechaSup={a['upper_wick']}"
-    )
+def _rsi_values(candles, period=RSI_PERIOD):
+    closes = [float(x["close"]) for x in candles]
+    if len(closes) < period + 1: return []
+    gains=[]; losses=[]
+    for i in range(1, len(closes)):
+        d=closes[i]-closes[i-1]; gains.append(max(d,0.0)); losses.append(max(-d,0.0))
+    ag=sum(gains[:period])/period; al=sum(losses[:period])/period
+    values=[None]*period
+    values.append(100.0 if al == 0 else 100.0-(100.0/(1.0+ag/al)))
+    for i in range(period, len(gains)):
+        ag=((ag*(period-1))+gains[i])/period
+        al=((al*(period-1))+losses[i])/period
+        values.append(100.0 if al == 0 else 100.0-(100.0/(1.0+ag/al)))
+    return values
 
 
 def _is_clear(c):
-    """
-    Define una vela clara únicamente por su estructura de precio.
-
-    Una vela es clara cuando:
-    - no es doji;
-    - su cuerpo representa al menos el 50% de todo su rango.
-
-    No se utilizan indicadores ni niveles externos.
-    """
-    if c["color"] == "doji":
-        return False
-
-    if c["range"] <= 0:
-        return False
-
-    return c["body"] / c["range"] >= 0.50
+    return c["color"] != "doji" and c["range"] > 0 and c["body"] / c["range"] >= 0.50
 
 
-def _three_bullish_candles(a, b, c):
-    """
-    Tres velas verdes claras con avance de precio.
-    """
-    return (
-        a["color"] == "green"
-        and b["color"] == "green"
-        and c["color"] == "green"
-        and _is_clear(a)
-        and _is_clear(b)
-        and _is_clear(c)
-        and b["close"] > a["close"]
-        and c["close"] > b["close"]
-    )
+def _bullish_structure(a,b,c):
+    return b["high"]>a["high"] and c["high"]>b["high"] and b["low"]>a["low"] and c["low"]>b["low"]
 
 
-def _three_bearish_candles(a, b, c):
-    """
-    Tres velas rojas claras con avance bajista.
-    """
-    return (
-        a["color"] == "red"
-        and b["color"] == "red"
-        and c["color"] == "red"
-        and _is_clear(a)
-        and _is_clear(b)
-        and _is_clear(c)
-        and b["close"] < a["close"]
-        and c["close"] < b["close"]
-    )
+def _bearish_structure(a,b,c):
+    return b["high"]<a["high"] and c["high"]<b["high"] and b["low"]<a["low"] and c["low"]<b["low"]
 
 
-def _bullish_exhaustion(first, second, third):
-    """
-    Agotamiento alcista usando únicamente precio.
-
-    La tercera vela todavía es verde, pero pierde fuerza: su cuerpo es
-    menor que el de la segunda vela y aparece una mecha superior
-    significativa.
-    """
-    if third["range"] <= 0 or second["body"] <= 0:
-        return False
-
-    body_is_smaller = third["body"] < second["body"]
-    upper_wick_present = (third["upper_wick"] / third["range"]) >= 0.20
-
-    return body_is_smaller and upper_wick_present
+def _three_green(a,b,c):
+    return (a["color"]==b["color"]==c["color"]=="green" and _is_clear(a) and _is_clear(b) and _is_clear(c)
+            and b["close"]>a["close"] and c["close"]>b["close"])
 
 
-def _bearish_exhaustion(first, second, third):
-    """
-    Agotamiento bajista usando únicamente precio.
-
-    La tercera vela todavía es roja, pero pierde fuerza: su cuerpo es
-    menor que el de la segunda vela y aparece una mecha inferior
-    significativa.
-    """
-    if third["range"] <= 0 or second["body"] <= 0:
-        return False
-
-    body_is_smaller = third["body"] < second["body"]
-    lower_wick_present = (third["lower_wick"] / third["range"]) >= 0.20
-
-    return body_is_smaller and lower_wick_present
+def _three_red(a,b,c):
+    return (a["color"]==b["color"]==c["color"]=="red" and _is_clear(a) and _is_clear(b) and _is_clear(c)
+            and b["close"]<a["close"] and c["close"]<b["close"])
 
 
-def _real_put_reversal(third, reversal):
-    """Reversión bajista real, no un simple retroceso."""
-    if not _is_clear(reversal):
-        return False
-
-    return (
-        reversal["color"] == "red"
-        and reversal["close"] < third["open"]
-    )
+def _bullish_exhaustion(second, third):
+    return (third["range"]>0 and second["body"]>0 and third["body"]<second["body"]
+            and third["upper_wick"]/third["range"]>=0.20)
 
 
-def _real_call_reversal(third, reversal):
-    """Reversión alcista real, no un simple retroceso."""
-    if not _is_clear(reversal):
-        return False
-
-    return (
-        reversal["color"] == "green"
-        and reversal["close"] > third["open"]
-    )
+def _bearish_exhaustion(second, third):
+    return (third["range"]>0 and second["body"]>0 and third["body"]<second["body"]
+            and third["lower_wick"]/third["range"]>=0.20)
 
 
-def _reversal_signal(c):
-    """
-    Patrón completo basado únicamente en precio:
+def _rsi_confirmation(candles, direction):
+    v=_rsi_values(candles)
+    if len(v)<len(candles): return False,None,None
+    previous,current=v[-2],v[-1]
+    if previous is None or current is None: return False,current,previous
+    if direction=="PUT": return previous>=RSI_OVERBOUGHT and current<previous,current,previous
+    return previous<=RSI_OVERSOLD and current>previous,current,previous
 
-    PUT:  3 verdes claras + agotamiento de la tercera + roja clara
-          que cierra por debajo de la apertura de la tercera.
 
-    CALL: 3 rojas claras + agotamiento de la tercera + verde clara
-          que cierra por encima de la apertura de la tercera.
-    """
-    if len(c) < 4:
-        return "NEUTRAL"
-
-    first = c[-4]
-    second = c[-3]
-    third = c[-2]
-    reversal = c[-1]
-
-    bullish_impulse = _three_bullish_candles(first, second, third)
-    bullish_exhaustion = _bullish_exhaustion(first, second, third)
-    put_reversal = _real_put_reversal(third, reversal)
-
-    if bullish_impulse and bullish_exhaustion and put_reversal:
-        return "PUT"
-
-    bearish_impulse = _three_bearish_candles(first, second, third)
-    bearish_exhaustion = _bearish_exhaustion(first, second, third)
-    call_reversal = _real_call_reversal(third, reversal)
-
-    if bearish_impulse and bearish_exhaustion and call_reversal:
-        return "CALL"
-
-    return "NEUTRAL"
+def _signal(c):
+    if len(c)<RSI_PERIOD+2: return "NEUTRAL",None,None
+    a,b,t,r=c[-4],c[-3],c[-2],c[-1]
+    put_rsi,rc,rp=_rsi_confirmation(c,"PUT")
+    if (_bullish_structure(a,b,t) and _three_green(a,b,t)
+        and _bullish_exhaustion(b,t) and r["color"]=="red" and _is_clear(r)
+        and r["close"]<t["open"] and put_rsi):
+        return "PUT",rc,rp
+    call_rsi,rc,rp=_rsi_confirmation(c,"CALL")
+    if (_bearish_structure(a,b,t) and _three_red(a,b,t)
+        and _bearish_exhaustion(b,t) and r["color"]=="green" and _is_clear(r)
+        and r["close"]>t["open"] and call_rsi):
+        return "CALL",rc,rp
+    return "NEUTRAL",rc,rp
 
 
 def analyze_market(raw):
-    c = normalize_candles(raw)
-
-    if len(c) < 4:
-        return {
-            "signal": "NO SIGNAL",
-            "bias": "NEUTRAL",
-            "call_score": 0,
-            "put_score": 0,
-            "reason": f"historial insuficiente {len(c)}/4",
-        }
-
-    signal = _reversal_signal(c)
-
-    if signal == "PUT":
-        reason = (
-            "PUT | 3 velas verdes claras + agotamiento alcista "
-            "(tercera pierde cuerpo y muestra mecha superior) + "
-            "vela roja clara con reversión real | entrada en la siguiente M1"
-        )
-
-    elif signal == "CALL":
-        reason = (
-            "CALL | 3 velas rojas claras + agotamiento bajista "
-            "(tercera pierde cuerpo y muestra mecha inferior) + "
-            "vela verde clara con reversión real | entrada en la siguiente M1"
-        )
-
+    c=normalize_candles(raw)
+    if len(c)<RSI_PERIOD+2:
+        return {"signal":"NO SIGNAL","bias":"NEUTRAL","call_score":0,"put_score":0,
+                "expiration":EXPIRATION,"reason":f"historial insuficiente: {len(c)} velas"}
+    signal,rc,rp=_signal(c)
+    if signal=="PUT":
+        reason=(f"PUT | estructura alcista + agotamiento/reversion + RSI sobrecompra girando abajo "
+                f"({rp:.2f}->{rc:.2f}) | expiracion objetivo: {EXPIRATION} minutos")
+    elif signal=="CALL":
+        reason=(f"CALL | estructura bajista + agotamiento/reversion + RSI sobreventa girando arriba "
+                f"({rp:.2f}->{rc:.2f}) | expiracion objetivo: {EXPIRATION} minutos")
     else:
-        reason = (
-            "sin patrón confirmado: se requieren 3 velas claras del mismo sentido, "
-            "agotamiento de la tercera y una vela contraria clara con reversión real"
-        )
-
-    return {
-        "signal": signal if signal in ("CALL", "PUT") else "NO SIGNAL",
-        "bias": signal if signal in ("CALL", "PUT") else "NEUTRAL",
-        "call_score": 1 if signal == "CALL" else 0,
-        "put_score": 1 if signal == "PUT" else 0,
-        "reason": reason,
-    }
+        rsi="RSI no disponible" if rc is None else f"RSI {rp:.2f}->{rc:.2f}" if rp is not None else f"RSI actual {rc:.2f}"
+        reason=("sin patron confirmado: se requiere estructura, agotamiento/reversion y RSI en zona extrema "
+                f"mostrando cambio de direccion | {rsi}")
+    return {"signal":signal if signal in ("CALL","PUT") else "NO SIGNAL",
+            "bias":signal if signal in ("CALL","PUT") else "NEUTRAL",
+            "call_score":1 if signal=="CALL" else 0,
+            "put_score":1 if signal=="PUT" else 0,
+            "expiration":EXPIRATION,"reason":reason}
