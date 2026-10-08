@@ -151,18 +151,71 @@ def _three_bearish_candles(a, b, c):
     )
 
 
+def _bullish_exhaustion(first, second, third):
+    """
+    Agotamiento alcista usando únicamente precio.
+
+    La tercera vela todavía es verde, pero pierde fuerza: su cuerpo es
+    menor que el de la segunda vela y aparece una mecha superior
+    significativa.
+    """
+    if third["range"] <= 0 or second["body"] <= 0:
+        return False
+
+    body_is_smaller = third["body"] < second["body"]
+    upper_wick_present = (third["upper_wick"] / third["range"]) >= 0.20
+
+    return body_is_smaller and upper_wick_present
+
+
+def _bearish_exhaustion(first, second, third):
+    """
+    Agotamiento bajista usando únicamente precio.
+
+    La tercera vela todavía es roja, pero pierde fuerza: su cuerpo es
+    menor que el de la segunda vela y aparece una mecha inferior
+    significativa.
+    """
+    if third["range"] <= 0 or second["body"] <= 0:
+        return False
+
+    body_is_smaller = third["body"] < second["body"]
+    lower_wick_present = (third["lower_wick"] / third["range"]) >= 0.20
+
+    return body_is_smaller and lower_wick_present
+
+
+def _real_put_reversal(third, reversal):
+    """Reversión bajista real, no un simple retroceso."""
+    if not _is_clear(reversal):
+        return False
+
+    return (
+        reversal["color"] == "red"
+        and reversal["close"] < third["open"]
+    )
+
+
+def _real_call_reversal(third, reversal):
+    """Reversión alcista real, no un simple retroceso."""
+    if not _is_clear(reversal):
+        return False
+
+    return (
+        reversal["color"] == "green"
+        and reversal["close"] > third["open"]
+    )
+
+
 def _reversal_signal(c):
     """
-    Busca exclusivamente:
+    Patrón completo basado únicamente en precio:
 
-    PUT:
-        verde clara -> verde clara -> verde clara -> roja.
+    PUT:  3 verdes claras + agotamiento de la tercera + roja clara
+          que cierra por debajo de la apertura de la tercera.
 
-    CALL:
-        roja clara -> roja clara -> roja clara -> verde.
-
-    La cuarta vela es la reversión y debe estar cerrada.
-    No se exige S/R, rechazo, indicadores ni otros filtros.
+    CALL: 3 rojas claras + agotamiento de la tercera + verde clara
+          que cierra por encima de la apertura de la tercera.
     """
     if len(c) < 4:
         return "NEUTRAL"
@@ -172,46 +225,18 @@ def _reversal_signal(c):
     third = c[-2]
     reversal = c[-1]
 
-    # ---------------------------------------------------------
-    # 3 VELAS VERDES CLARAS + REVERSIÓN ROJA = PUT
-    # ---------------------------------------------------------
-    bullish_impulse = _three_bullish_candles(
-        first,
-        second,
-        third,
-    )
+    bullish_impulse = _three_bullish_candles(first, second, third)
+    bullish_exhaustion = _bullish_exhaustion(first, second, third)
+    put_reversal = _real_put_reversal(third, reversal)
 
-    # La reversión PUT no puede ser simplemente una vela roja.
-    # Debe cerrar por debajo de la apertura de la tercera vela verde,
-    # demostrando que el impulso alcista realmente perdió el control.
-    put_reversal = (
-        reversal["color"] == "red"
-        and reversal["body"] > 0
-        and reversal["close"] < third["open"]
-    )
-
-    if bullish_impulse and put_reversal:
+    if bullish_impulse and bullish_exhaustion and put_reversal:
         return "PUT"
 
-    # ---------------------------------------------------------
-    # 3 VELAS ROJAS CLARAS + REVERSIÓN VERDE = CALL
-    # ---------------------------------------------------------
-    bearish_impulse = _three_bearish_candles(
-        first,
-        second,
-        third,
-    )
+    bearish_impulse = _three_bearish_candles(first, second, third)
+    bearish_exhaustion = _bearish_exhaustion(first, second, third)
+    call_reversal = _real_call_reversal(third, reversal)
 
-    # La reversión CALL no puede ser simplemente una vela verde.
-    # Debe cerrar por encima de la apertura de la tercera vela roja,
-    # demostrando que el impulso bajista realmente perdió el control.
-    call_reversal = (
-        reversal["color"] == "green"
-        and reversal["body"] > 0
-        and reversal["close"] > third["open"]
-    )
-
-    if bearish_impulse and call_reversal:
+    if bearish_impulse and bearish_exhaustion and call_reversal:
         return "CALL"
 
     return "NEUTRAL"
@@ -233,22 +258,22 @@ def analyze_market(raw):
 
     if signal == "PUT":
         reason = (
-            "PUT | 3 velas verdes claras consecutivas "
-            "con avance alcista + vela roja de reversión cerrada | "
-            "entrada en la siguiente M1"
+            "PUT | 3 velas verdes claras + agotamiento alcista "
+            "(tercera pierde cuerpo y muestra mecha superior) + "
+            "vela roja clara con reversión real | entrada en la siguiente M1"
         )
 
     elif signal == "CALL":
         reason = (
-            "CALL | 3 velas rojas claras consecutivas "
-            "con avance bajista + vela verde de reversión cerrada | "
-            "entrada en la siguiente M1"
+            "CALL | 3 velas rojas claras + agotamiento bajista "
+            "(tercera pierde cuerpo y muestra mecha inferior) + "
+            "vela verde clara con reversión real | entrada en la siguiente M1"
         )
 
     else:
         reason = (
-            "sin patrón confirmado: se requieren 3 velas claras "
-            "del mismo sentido y una vela contraria de reversión"
+            "sin patrón confirmado: se requieren 3 velas claras del mismo sentido, "
+            "agotamiento de la tercera y una vela contraria clara con reversión real"
         )
 
     return {
