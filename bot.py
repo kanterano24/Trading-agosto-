@@ -1,4 +1,4 @@
-"""Bot EURUSD-OTC M1: REVERSIÓN sobre EURUSD-OTC.
+"""Bot OTC M1: ejecuta señales confirmadas en la siguiente vela M1.
 
 - Obtiene únicamente velas M1 cerradas desde IQ Option.
 - Envía cada vela cerrada a Telegram.
@@ -24,14 +24,14 @@ from strategy import normalize_candles, analyze_market
 
 PAIR = "EURUSD-OTC"
 PAIRS = []
-MAX_OTC_PAIRS = max(1, min(3, int(os.getenv("MAX_OTC_PAIRS", "3"))))
+MAX_OTC_PAIRS = max(1, min(50, int(os.getenv("MAX_OTC_PAIRS", "50"))))
 PAIR_REFRESH_SECONDS = 300.0
 TF = 60
 COUNT = 200
 EXPIRATION = 1
 # Importe predeterminado: mínimo habitual de IQ Option.
 # Si Railway tiene AMOUNT configurado, esa variable prevalece.
-AMOUNT = float(os.getenv("AMOUNT", "5"))
+AMOUNT = float(os.getenv("AMOUNT", "1"))
 if AMOUNT <= 0:
     raise ValueError("AMOUNT debe ser mayor que 0")
 
@@ -866,7 +866,7 @@ def main():
         "Estrategia: acción del precio, 4 velas cerradas\n"
         "PUT: roja + 2 verdes fuertes rompen máximos + roja confirma\n"
         "CALL: verde + 2 rojas fuertes rompen mínimos + verde confirma\n"
-        f"Entrada objetivo: segundo 59 | Expiración: {EXPIRATION} minuto\n"
+        f"Entrada: primera detección de la siguiente vela M1 | Expiración: {EXPIRATION} minuto\n"
         f"Importe por operación: {AMOUNT:g}\n"
         "Indicadores: ninguno | S/R: no | Rechazo: no"
     )
@@ -927,17 +927,18 @@ def main():
                         continue
 
                     second = int(server_now - current["timestamp"])
-                    # Evaluar solo durante el segundo 59 de la vela M1 actual.
-                    if second < 59 or second >= TF:
-                        continue
-
                     candle_stamp = current["timestamp"]
+
+                    # La estrategia usa las últimas 4 velas CERRADAS; cuando aparece
+                    # una nueva vela M1, la señal corresponde a esta vela actual.
+                    # No esperar al segundo 59: eso ejecutaría casi al cierre, no en
+                    # la siguiente M1. Cada par se evalúa/ejecuta una sola vez por vela.
                     if last_evaluated_candle.get(pair) == candle_stamp:
                         continue
                     last_evaluated_candle[pair] = candle_stamp
 
-                    # La estrategia trabaja con las últimas 4 velas CERRADAS.
-                    # La vela actual es la vela en la que se intenta ejecutar la entrada.
+                    # Evita ejecutar una señal antigua si IQ Option entregó velas
+                    # desfasadas: la vela de entrada esperada debe ser la actual.
                     setup_candles = closed[-4:]
                     res = analyze_market(setup_candles)
                     sequence_text = "-".join(
@@ -951,7 +952,13 @@ def main():
 
                     order_text = ""
                     if res["signal"] in ("CALL", "PUT"):
-                        if last_order_candle.get(pair) == candle_stamp:
+                        expected_entry_stamp = res.get("entry_candle_timestamp")
+                        if expected_entry_stamp != candle_stamp:
+                            order_text = (
+                                "\n⛔ ENTRADA BLOQUEADA: la señal no corresponde a la vela M1 actual."
+                                f"\nVela esperada: {expected_entry_stamp}; vela actual: {candle_stamp}."
+                            )
+                        elif last_order_candle.get(pair) == candle_stamp:
                             order_text = "\n⛔ Orden duplicada bloqueada para esta vela."
                         elif not ENABLE_TRADES:
                             order_text = "\n🧪 Señal detectada; operaciones desactivadas."
@@ -979,7 +986,7 @@ def main():
                         current, pair, state="ACTUAL / VELA DE ENTRADA (EN FORMACIÓN)"
                     )
                     telegram_reports.append(
-                        f"⏱️ EVALUACIÓN M1 | segundo {second}\n"
+                        f"⏱️ EVALUACIÓN M1 | vela actual, segundo {second}\n"
                         f"Par: {pair}\nSecuencia analizada: {sequence_text}\n"
                         f"Señal: {res['signal']}\nMotivo: {res['reason']}\n\n"
                         f"📚 CUATRO VELAS CERRADAS UTILIZADAS\n{setup_text}\n\n"
