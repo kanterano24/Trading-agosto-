@@ -24,12 +24,16 @@ from strategy import normalize_candles, analyze_market
 
 PAIR = "EURUSD-OTC"
 PAIRS = []
-MAX_OTC_PAIRS = 6
+MAX_OTC_PAIRS = 50
 PAIR_REFRESH_SECONDS = 300.0
 TF = 60
 COUNT = 200
 EXPIRATION = 1
-AMOUNT = float(os.getenv("AMOUNT", "1000"))
+# Importe predeterminado: mínimo habitual de IQ Option.
+# Si Railway tiene AMOUNT configurado, esa variable prevalece.
+AMOUNT = float(os.getenv("AMOUNT", "1"))
+if AMOUNT <= 0:
+    raise ValueError("AMOUNT debe ser mayor que 0")
 
 ENABLE_TRADES = os.getenv("ENABLE_TRADES", "true").lower() in (
     "1", "true", "yes", "si"
@@ -746,12 +750,28 @@ def discover_otc_1m_pairs(iq):
         return []
 
 def execute_binary_order(iq, pair, signal, amount, expiration):
-    """Envía una sola orden para evitar reintentos que la retrasen fuera del segundo 59."""
+    """Envía una sola orden y explica claramente los rechazos por saldo insuficiente."""
     try:
+        if amount <= 0:
+            return False, "Importe inválido: AMOUNT debe ser mayor que 0"
+        # Este bot trabaja en cuenta de práctica; no cambia a REAL.
         iq.change_balance("PRACTICE")
         ok, response = iq.buy(amount, pair, signal.lower(), expiration)
+        response_text = str(response)
+        if not ok and "insufficient funds" in response_text.lower():
+            return False, (
+                "Saldo insuficiente en la cuenta PRACTICE para el importe "
+                f"{amount:g}. Reduce AMOUNT en Railway (por ejemplo, a 1) "
+                "o verifica el saldo disponible de práctica."
+            )
         return bool(ok), response
     except Exception as exc:
+        response_text = str(exc)
+        if "insufficient funds" in response_text.lower():
+            return False, (
+                "Saldo insuficiente en la cuenta PRACTICE. Reduce AMOUNT en "
+                "Railway (por ejemplo, a 1) o verifica el saldo disponible."
+            )
         logging.exception("Error enviando orden %s %s", pair, signal)
         return False, f"{type(exc).__name__}: {exc}"
 
