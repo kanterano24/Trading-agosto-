@@ -24,14 +24,14 @@ from strategy import normalize_candles, analyze_market
 
 PAIR = "EURUSD-OTC"
 PAIRS = []
-MAX_OTC_PAIRS = max(1, min(50, int(os.getenv("MAX_OTC_PAIRS", "50"))))
+MAX_OTC_PAIRS = max(1, min(3, int(os.getenv("MAX_OTC_PAIRS", "3"))))
 PAIR_REFRESH_SECONDS = 300.0
 TF = 60
 COUNT = 200
-EXPIRATION = 3
+EXPIRATION = 1
 # Importe predeterminado: mínimo habitual de IQ Option.
 # Si Railway tiene AMOUNT configurado, esa variable prevalece.
-AMOUNT = float(os.getenv("AMOUNT", "290"))
+AMOUNT = float(os.getenv("AMOUNT", "5"))
 if AMOUNT <= 0:
     raise ValueError("AMOUNT debe ser mayor que 0")
 
@@ -64,6 +64,7 @@ TG_QUEUE_MAX = max(100, int(os.getenv("TG_QUEUE_MAX", "500")))
 TG_429_LOG_COOLDOWN = max(10.0, float(os.getenv("TG_429_LOG_COOLDOWN", "30")))
 TG_QUEUE = queue.Queue(maxsize=TG_QUEUE_MAX)
 TG_LAST_429_LOG = 0.0
+TG_LAST_QUEUE_LOG = 0.0
 TG_WORKER_STARTED = False
 TG_WORKER_LOCK = threading.Lock()
 
@@ -163,19 +164,43 @@ def _ensure_telegram_worker():
 
 
 def tg(msg):
-    """Encola el mensaje y retorna inmediatamente; nunca bloquea el trading."""
+    """Encola sin bloquear el trading; protege alertas importantes si se llena."""
+    global TG_LAST_QUEUE_LOG
     if not TOKEN or not CHAT:
         return False
 
     _ensure_telegram_worker()
+    message = str(msg)
+    critical = any(marker in message.upper() for marker in (
+        "ORDEN ENVIADA", "ORDEN RECHAZADA", "DIRECCIÓN:", "DIRECCION:",
+        "ENTRADA BLOQUEADA", "ERROR", "⚠️"
+    ))
 
     try:
-        TG_QUEUE.put_nowait(str(msg))
+        TG_QUEUE.put_nowait(message)
         return True
     except queue.Full:
-        # Si Telegram está temporalmente atrasado, no sacrificamos el ciclo
-        # de mercado. Se descarta únicamente el mensaje de menor prioridad.
-        logging.warning("Cola Telegram llena; mensaje omitido")
+        # No bloquear el análisis de los 50 pares. Si es una alerta de operación,
+        # libera un lugar descartando el mensaje más antiguo; los mensajes de
+        # rutina nuevos se omiten mientras Telegram esté saturado.
+        if critical:
+            try:
+                TG_QUEUE.get_nowait()
+                TG_QUEUE.task_done()
+            except queue.Empty:
+                pass
+            try:
+                TG_QUEUE.put_nowait(message)
+                return True
+            except queue.Full:
+                pass
+
+        now = time.monotonic()
+        if now - TG_LAST_QUEUE_LOG >= TG_429_LOG_COOLDOWN:
+            logging.warning(
+                "Cola Telegram llena; se omiten mensajes rutinarios y se priorizan alertas de operación"
+            )
+            TG_LAST_QUEUE_LOG = now
         return False
 
 
@@ -539,34 +564,75 @@ def build_candle_api_history(candles):
     return result
 
 
-def candle_message(candle, number):
-    dt = datetime.fromtimestamp(
-        candle["timestamp"]
-    ).strftime("%Y-%m-%d %H:%M:%S")
-
-    color = {
-        "green": "VERDE",
-        "red": "ROJA",
-        "doji": "DOJI",
-    }.get(
-        candle["color"],
-        candle["color"].upper(),
+def _color_label(color):
+    return {"green": "VERDE", "red": "ROJA", "doji": "DOJI"}.get(
+        color, str(color).upper()
     )
 
+
+def _fmt_price(value):
+    """Formato compacto sin perder precisión útil del precio."""
+    try:
+        return f"{float(value):.10g}"
+    except (TypeError, ValueError):
+        return str(value)
+
+
+def candle_detail(candle, pair, number=None, state="CERRADA"):
+    """Detalle completo de una vela: OHLC, rango, cuerpo y ambas mechas."""
+    dt = datetime.fromtimestamp(int(candle["timestamp"])).strftime("%Y-%m-%d %H:%M:%S")
+    title_number = f" #{number}" if number is not None else ""
+    candle_range = candle.get("range", candle["high"] - candle["low"])
+    body = candle.get("body", abs(candle["close"] - candle["open"]))
+    lower = candle.get("lower_wick", min(candle["open"], candle["close"]) - candle["low"])
+    upper = candle.get("upper_wick", candle["high"] - max(candle["open"], candle["close"]))
     return (
-        f"🕯️ VELA M1 CERRADA #{number}\n"
-        f"Par: {PAIR}\n"
-        f"Hora apertura: {dt}\n"
-        f"Color: {color}\n"
-        f"Apertura: {candle['open']}\n"
-        f"Cierre: {candle['close']}\n"
-        f"Máximo: {candle['high']}\n"
-        f"Mínimo: {candle['low']}\n"
-        f"Rango: {candle['range']}\n"
-        f"Cuerpo: {candle['body']}\n"
-        f"Mecha inferior: {candle['lower_wick']}\n"
-        f"Mecha superior: {candle['upper_wick']}"
+        f"🕯️ VELA M1 {state}{title_number}\n"
+        f"Par: {pair}\nHora apertura: {dt}\n"
+        f"Color actual: {_color_label(candle.get('color', 'desconocido'))}\n"
+        f"Apertura: {_fmt_price(candle['open'])} | Cierre: {_fmt_price(candle['close'])}\n"
+        f"Máximo: {_fmt_price(candle['high'])} | Mínimo: {_fmt_price(candle['low'])}\n"
+        f"Rango: {_fmt_price(candle_range)} | Cuerpo: {_fmt_price(body)}\n"
+        f"Mecha inferior: {_fmt_price(lower)}\nMecha superior: {_fmt_price(upper)}"
     )
+
+
+def candle_message(candle, number, pair=None):
+    """Compatibilidad con mensajes anteriores, ahora con par explícito."""
+    return candle_detail(candle, pair or PAIR, number=number, state="CERRADA")
+
+
+def _candle_summary(candle, index):
+    """Resumen detallado de una vela usada por la estrategia."""
+    color = {"green": "V", "red": "R", "doji": "D"}.get(candle.get("color"), "?")
+    return (
+        f"V{index}={color} O:{_fmt_price(candle['open'])} C:{_fmt_price(candle['close'])} "
+        f"H:{_fmt_price(candle['high'])} L:{_fmt_price(candle['low'])} "
+        f"cuerpo:{_fmt_price(candle.get('body', 0))} "
+        f"rango:{_fmt_price(candle.get('range', 0))} "
+        f"mechaInf:{_fmt_price(candle.get('lower_wick', 0))} "
+        f"mechaSup:{_fmt_price(candle.get('upper_wick', 0))}"
+    )
+
+
+def send_telegram_batches(reports, title="📊 REPORTE DE ANÁLISIS"):
+    """Agrupa informes de muchos pares para evitar una inundación de Telegram."""
+    if not reports:
+        return
+    max_chars = max(2500, min(3500, int(os.getenv("TG_BATCH_MAX_CHARS", "3500"))))
+    chunks = []
+    current = title + "\n"
+    for report in reports:
+        report = str(report).strip()
+        addition = report + "\n\n"
+        if len(current) + len(addition) > max_chars and current.strip() != title:
+            chunks.append(current.rstrip())
+            current = title + " (continuación)\n"
+        current += addition
+    if current.strip() != title:
+        chunks.append(current.rstrip())
+    for chunk in chunks:
+        tg(chunk)
 
 
 def binary_asset_status(iq, pair):
@@ -797,9 +863,9 @@ def main():
         f"Pares OTC configurados: hasta {MAX_OTC_PAIRS}\n"
         f"Pares disponibles al iniciar: {len(PAIRS)}\n"
         "Temporalidad: M1\n"
-        "Estrategia: secuencia exacta de 4 velas\n"
-        "CALL: VERDE-ROJA-ROJA-VERDE\n"
-        "PUT: ROJA-VERDE-VERDE-ROJA\n"
+        "Estrategia: acción del precio, 4 velas cerradas\n"
+        "PUT: roja + 2 verdes fuertes rompen máximos + roja confirma\n"
+        "CALL: verde + 2 rojas fuertes rompen mínimos + verde confirma\n"
         f"Entrada objetivo: segundo 59 | Expiración: {EXPIRATION} minuto\n"
         f"Importe por operación: {AMOUNT:g}\n"
         "Indicadores: ninguno | S/R: no | Rechazo: no"
@@ -834,6 +900,10 @@ def main():
                 time.sleep(POLL)
                 continue
 
+            # Se agrupan los informes del ciclo para enviar varias velas por mensaje
+            # y evitar que Telegram se sature cuando se analizan hasta 50 pares.
+            telegram_reports = []
+
             # Cada ciclo revisa todos los pares descubiertos, no solo EURUSD-OTC.
             # La disponibilidad cambia; discover_otc_1m_pairs filtra activos TURBO abiertos.
             for pair in list(PAIRS):
@@ -848,10 +918,12 @@ def main():
                     closed_stamp = closed[-1]["timestamp"]
                     if last_closed_stamp.get(pair) != closed_stamp:
                         last_closed_stamp[pair] = closed_stamp
-                        tg(candle_message(closed[-1], len(closed)) +
-                           "\n\n📚 Historial cerrado actualizado: " + str(len(closed)) + " velas")
+                        telegram_reports.append(
+                            candle_message(closed[-1], len(closed), pair=pair)
+                            + f"\nHistorial cerrado disponible: {len(closed)} velas"
+                        )
 
-                    if current is None or len(closed) < 3:
+                    if current is None or len(closed) < 4:
                         continue
 
                     second = int(server_now - current["timestamp"])
@@ -864,7 +936,10 @@ def main():
                         continue
                     last_evaluated_candle[pair] = candle_stamp
 
-                    res = analyze_market(closed[-3:] + [current])
+                    # La estrategia trabaja con las últimas 4 velas CERRADAS.
+                    # La vela actual es la vela en la que se intenta ejecutar la entrada.
+                    setup_candles = closed[-4:]
+                    res = analyze_market(setup_candles)
                     sequence_text = "-".join(
                         {"green": "V", "red": "R", "doji": "D"}.get(x, "?")
                         for x in res.get("sequence", [])
@@ -893,15 +968,33 @@ def main():
                                 f"\nID/respuesta: {oid}"
                             )
 
-                    tg(
-                        f"⏱️ Evaluación segundo {second} de la vela M1\n"
-                        f"Par: {pair}\nSecuencia: {sequence_text}\n"
-                        f"Señal: {res['signal']}\n{res['reason']}" + order_text
+                    # En Telegram se informa cada evaluación, incluso NO SIGNAL,
+                    # incluyendo las 4 velas cerradas usadas por la estrategia y
+                    # la vela M1 actual (vela en la que se intenta entrar).
+                    setup_text = "\n".join(
+                        _candle_summary(candle, idx)
+                        for idx, candle in enumerate(setup_candles, start=1)
+                    )
+                    entry_candle_text = candle_detail(
+                        current, pair, state="ACTUAL / VELA DE ENTRADA (EN FORMACIÓN)"
+                    )
+                    telegram_reports.append(
+                        f"⏱️ EVALUACIÓN M1 | segundo {second}\n"
+                        f"Par: {pair}\nSecuencia analizada: {sequence_text}\n"
+                        f"Señal: {res['signal']}\nMotivo: {res['reason']}\n\n"
+                        f"📚 CUATRO VELAS CERRADAS UTILIZADAS\n{setup_text}\n\n"
+                        f"🎯 VELA EN LA QUE SE INTENTA LA ENTRADA\n{entry_candle_text}"
+                        + ("\n" + order_text.strip() if order_text else "\nOperación: no ejecutada (sin señal).")
                     )
 
                 except Exception:
                     logging.exception("Error procesando el par %s", pair)
                     continue
+
+            # Un lote por ciclo (dividido en mensajes seguros para Telegram).
+            # Esto reduce drásticamente el número de envíos frente a 50 mensajes
+            # individuales por cada vela/par.
+            send_telegram_batches(telegram_reports)
 
         except Exception:
             logging.exception("Error de ciclo principal")
