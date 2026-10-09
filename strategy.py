@@ -1,25 +1,30 @@
-"""Estrategia M1 de acción del precio: ruptura fuerte + continuación + confirmación.
+"""Estrategia M1 de acción del precio: ruptura fuerte + confirmación + entrada siguiente.
 
 PUT (4 velas CERRADAS, en orden cronológico):
-  1) Roja.
-  2) Verde fuerte: cierra por encima del máximo de la roja anterior.
-  3) Verde fuerte: cierra por encima del máximo de la verde anterior.
-  4) Roja de confirmación.
-  La entrada PUT se intenta en la vela M1 siguiente, en el segundo 59.
+  1) Roja inicial.
+  2) Verde fuerte que cierra por encima del máximo de la roja inicial.
+  3) Verde fuerte que cierra por encima del máximo de la verde anterior.
+  4) Roja de confirmación bajista: cierra por debajo del mínimo de la tercera vela.
+  -> Señal PUT para ejecutar en la vela M1 siguiente.
 
-CALL (inverso):
-  1) Verde.
-  2) Roja fuerte: cierra por debajo del mínimo de la verde anterior.
-  3) Roja fuerte: cierra por debajo del mínimo de la roja anterior.
-  4) Verde de confirmación.
-  La entrada CALL se intenta en la vela M1 siguiente, en el segundo 59.
+CALL (patrón inverso):
+  1) Verde inicial.
+  2) Roja fuerte que cierra por debajo del mínimo de la verde inicial.
+  3) Roja fuerte que cierra por debajo del mínimo de la roja anterior.
+  4) Verde de confirmación alcista: cierra por encima del máximo de la tercera vela.
+  -> Señal CALL para ejecutar en la vela M1 siguiente.
 
 No utiliza indicadores, soportes/resistencias ni reglas de rechazo.
+La función analiza únicamente velas cerradas. El bot principal debe programar
+la orden en la siguiente vela; esta función no controla el reloj ni envía órdenes.
 """
 
-# Proporción mínima del rango total que debe ocupar el cuerpo para considerar
-# una vela "fuerte". 0.50 significa que el cuerpo es al menos el 50 % del rango.
 MIN_BODY_RANGE_RATIO = 0.50
+
+
+def _is_finite(value):
+    """Comprueba que un número sea finito sin dependencias externas."""
+    return value == value and value not in (float("inf"), float("-inf"))
 
 
 def normalize_candles(raw):
@@ -34,7 +39,7 @@ def normalize_candles(raw):
             high = float(candle.get("max", candle.get("high", max(open_price, close_price))))
 
             values = (open_price, close_price, low, high)
-            if ts <= 0 or not all(map(_is_finite, values)):
+            if ts <= 0 or not all(_is_finite(v) for v in values):
                 continue
             if high < max(open_price, close_price) or low > min(open_price, close_price):
                 continue
@@ -63,11 +68,6 @@ def normalize_candles(raw):
     return list(deduplicated.values())
 
 
-def _is_finite(value):
-    """Comprueba números finitos sin depender de librerías externas."""
-    return value == value and value not in (float("inf"), float("-inf"))
-
-
 def describe_history(raw):
     candles = normalize_candles(raw)
     greens = sum(c["color"] == "green" for c in candles)
@@ -94,82 +94,66 @@ def format_candle(index, candle):
 
 
 def _strong(candle):
-    """Una vela tiene fuerza si su cuerpo ocupa al menos el 50 % de su rango."""
+    """True cuando el cuerpo ocupa al menos el 50 % del rango de la vela."""
     candle_range = candle["range"]
-    if candle_range <= 0:
-        return False
-    return candle["body"] / candle_range >= MIN_BODY_RANGE_RATIO
+    return candle_range > 0 and candle["body"] / candle_range >= MIN_BODY_RANGE_RATIO
 
 
 def analyze_market(raw):
-    """Evalúa las últimas cuatro velas cerradas; la entrada es en la M1 siguiente.
-
-    PUT: R, G fuerte que rompe el máximo de R, G fuerte que rompe el máximo
-    de la G previa, R confirmatoria.
-    CALL: G, R fuerte que rompe el mínimo de G, R fuerte que rompe el mínimo
-    de la R previa, G confirmatoria.
-    """
+    """Analiza las últimas cuatro velas cerradas y señala entrada en la siguiente M1."""
     candles = normalize_candles(raw)
     if len(candles) < 4:
-        sequence = [c["color"] for c in candles]
         return {
             "signal": "NO SIGNAL",
             "bias": "NEUTRAL",
             "call_score": 0,
             "put_score": 0,
             "reason": f"Historial insuficiente: {len(candles)}/4 velas cerradas",
-            "sequence": sequence,
+            "sequence": [c["color"] for c in candles],
+            "sequence_text": "-".join("V" if c["color"] == "green" else "R" if c["color"] == "red" else "D" for c in candles),
+            "entry_timing": "NEXT_M1",
         }
 
     c1, c2, c3, c4 = candles[-4:]
     sequence = [c["color"] for c in (c1, c2, c3, c4)]
-    sequence_labels = ["V" if x == "green" else "R" if x == "red" else "D" for x in sequence]
+    sequence_text = "-".join("V" if color == "green" else "R" if color == "red" else "D" for color in sequence)
 
-    # PUT: impulso alcista de dos velas fuertes que supera máximos previos,
-    # seguido de una vela roja de confirmación.
+    # PUT: dos rupturas alcistas fuertes y luego confirmación bajista real.
     put_setup = (
         c1["color"] == "red"
-        and c2["color"] == "green"
-        and _strong(c2)
-        and c2["close"] > c1["high"]
-        and c3["color"] == "green"
-        and _strong(c3)
-        and c3["close"] > c2["high"]
-        and c4["color"] == "red"
+        and c2["color"] == "green" and _strong(c2) and c2["close"] > c1["high"]
+        and c3["color"] == "green" and _strong(c3) and c3["close"] > c2["high"]
+        and c4["color"] == "red" and c4["close"] < c3["low"]
     )
 
-    # CALL: patrón exactamente inverso.
+    # CALL: patrón inverso con confirmación alcista real.
     call_setup = (
         c1["color"] == "green"
-        and c2["color"] == "red"
-        and _strong(c2)
-        and c2["close"] < c1["low"]
-        and c3["color"] == "red"
-        and _strong(c3)
-        and c3["close"] < c2["low"]
-        and c4["color"] == "green"
+        and c2["color"] == "red" and _strong(c2) and c2["close"] < c1["low"]
+        and c3["color"] == "red" and _strong(c3) and c3["close"] < c2["low"]
+        and c4["color"] == "green" and c4["close"] > c3["high"]
     )
 
     if put_setup:
         signal = "PUT"
         reason = (
-            "PUT confirmado: roja inicial + verde fuerte rompe máximo anterior + "
-            "segunda verde fuerte rompe máximo de la verde previa + roja confirmatoria. "
-            "Entrada en la siguiente M1 (segundo 59)."
+            "PUT confirmado: roja inicial; dos velas verdes fuertes rompen máximos consecutivos; "
+            "la cuarta vela roja confirma continuidad bajista al cerrar por debajo del mínimo "
+            "de la tercera. Ejecutar en la siguiente vela M1."
         )
     elif call_setup:
         signal = "CALL"
         reason = (
-            "CALL confirmado: verde inicial + roja fuerte rompe mínimo anterior + "
-            "segunda roja fuerte rompe mínimo de la roja previa + verde confirmatoria. "
-            "Entrada en la siguiente M1 (segundo 59)."
+            "CALL confirmado: verde inicial; dos velas rojas fuertes rompen mínimos consecutivos; "
+            "la cuarta vela verde confirma continuidad alcista al cerrar por encima del máximo "
+            "de la tercera. Ejecutar en la siguiente vela M1."
         )
     else:
         signal = "NO SIGNAL"
         reason = (
-            "No cumple la secuencia completa: se exigen dos velas de ruptura con "
-            f"cuerpo >= {MIN_BODY_RANGE_RATIO:.0%} del rango y cierre más allá del "
-            "máximo/mínimo previo, más la vela contraria de confirmación."
+            "Sin entrada: se requieren cuatro velas cerradas, dos rupturas con cuerpo >= "
+            f"{MIN_BODY_RANGE_RATIO:.0%} del rango y una vela final que confirme con cierre "
+            "más allá del extremo de la tercera vela. La entrada, si aparece señal, es en la siguiente M1."
         )
 
     return {
@@ -179,6 +163,9 @@ def analyze_market(raw):
         "put_score": int(signal == "PUT"),
         "reason": reason,
         "sequence": sequence,
-        "sequence_text": "-".join(sequence_labels),
+        "sequence_text": sequence_text,
         "strong_body_ratio_min": MIN_BODY_RANGE_RATIO,
+        "entry_timing": "NEXT_M1",
+        "confirmation_candle_timestamp": c4["timestamp"],
+        "entry_candle_timestamp": c4["timestamp"] + 60,
     }
