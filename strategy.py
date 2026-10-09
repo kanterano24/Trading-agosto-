@@ -1,92 +1,73 @@
-"""Estrategia M1 basada únicamente en una secuencia exacta de 4 velas.
+"""Estrategia M1 por secuencia exacta de cuatro velas, sin indicadores.
 
-CALL:
-    VERDE - ROJA - ROJA - VERDE
-
-PUT:
-    ROJA - VERDE - VERDE - ROJA
-
-La cuarta vela es la vela actual en formación. El bot solo permite la
-entrada en el segundo 59 de esa cuarta vela.
-Sin indicadores, sin S/R y sin rechazo.
+CALL: VERDE - ROJA - ROJA - VERDE
+PUT:  ROJA - VERDE - VERDE - ROJA
+La cuarta vela puede estar en formación. El bot debe invocar la señal
+únicamente durante el segundo 59 de esa vela.
 """
 
 
 def normalize_candles(raw):
+    """Normaliza velas IQ Option y elimina timestamps duplicados."""
     out = []
     for c in raw or []:
         try:
             ts = int(c.get("from", c.get("at", c.get("timestamp", 0))))
             o = float(c["open"])
-            cl = float(c["close"])
-            lo = float(c.get("min", c.get("low", min(o, cl))))
-            hi = float(c.get("max", c.get("high", max(o, cl))))
-            if ts > 0 and hi >= max(o, cl) and lo <= min(o, cl):
-                body = abs(cl - o)
-                rng = max(hi - lo, 0.0)
-                lower_wick = min(o, cl) - lo
-                upper_wick = hi - max(o, cl)
-                color = "green" if cl > o else "red" if cl < o else "doji"
-                out.append({
-                    "timestamp": ts, "open": o, "close": cl,
-                    "min": lo, "max": hi, "high": hi, "low": lo,
-                    "body": body, "range": rng,
-                    "lower_wick": lower_wick, "upper_wick": upper_wick,
-                    "color": color,
-                })
-        except (KeyError, TypeError, ValueError):
+            close = float(c["close"])
+            low = float(c.get("min", c.get("low", min(o, close))))
+            high = float(c.get("max", c.get("high", max(o, close))))
+            if ts <= 0 or high < max(o, close) or low > min(o, close):
+                continue
+            body = abs(close - o)
+            candle_range = max(0.0, high - low)
+            color = "green" if close > o else "red" if close < o else "doji"
+            out.append({
+                "timestamp": ts, "open": o, "close": close,
+                "min": low, "max": high, "low": low, "high": high,
+                "body": body, "range": candle_range,
+                "lower_wick": min(o, close) - low,
+                "upper_wick": high - max(o, close), "color": color,
+            })
+        except (KeyError, TypeError, ValueError, OverflowError):
             continue
-
     dedup = {c["timestamp"]: c for c in sorted(out, key=lambda x: x["timestamp"])}
     return list(dedup.values())
 
 
 def describe_history(raw):
-    c = normalize_candles(raw)
-    g = sum(x["color"] == "green" for x in c)
-    r = sum(x["color"] == "red" for x in c)
-    return {"count": len(c), "greens": g, "reds": r, "dojis": len(c) - g - r}
+    candles = normalize_candles(raw)
+    greens = sum(c["color"] == "green" for c in candles)
+    reds = sum(c["color"] == "red" for c in candles)
+    return {"count": len(candles), "greens": greens, "reds": reds,
+            "dojis": len(candles) - greens - reds}
 
 
-def format_candle(i, c):
-    x = normalize_candles([c])
-    if not x:
+def format_candle(i, candle):
+    candles = normalize_candles([candle])
+    if not candles:
         return f"{i}: inválida"
-    a = x[0]
-    color = "V" if a["color"] == "green" else "R" if a["color"] == "red" else "D"
-    return (
-        f"{i}: {color} O={a['open']} C={a['close']} "
-        f"H={a['high']} L={a['low']} Rango={a['range']} "
-        f"Cuerpo={a['body']} MechaInf={a['lower_wick']} "
-        f"MechaSup={a['upper_wick']}"
-    )
+    c = candles[0]
+    color = {"green": "V", "red": "R", "doji": "D"}[c["color"]]
+    return (f"{i}: {color} O={c['open']} C={c['close']} H={c['high']} L={c['low']} "
+            f"Rango={c['range']} Cuerpo={c['body']} "
+            f"MechaInf={c['lower_wick']} MechaSup={c['upper_wick']}")
 
 
 def analyze_market(raw):
-    c = normalize_candles(raw)
-    if len(c) < 4:
-        return {
-            "signal": "NO SIGNAL", "bias": "NEUTRAL",
-            "call_score": 0, "put_score": 0,
-            "reason": f"historial insuficiente {len(c)}/4",
-        }
-
-    sequence = [x["color"] for x in c[-4:]]
-
+    """Analiza las últimas 4 velas recibidas en orden cronológico."""
+    candles = normalize_candles(raw)
+    if len(candles) < 4:
+        return {"signal": "NO SIGNAL", "bias": "NEUTRAL", "call_score": 0,
+                "put_score": 0, "reason": f"historial insuficiente {len(candles)}/4",
+                "sequence": [c["color"] for c in candles]}
+    sequence = [c["color"] for c in candles[-4:]]
     if sequence == ["green", "red", "red", "green"]:
-        signal = "CALL"
-        reason = "CALL | secuencia VERDE-ROJA-ROJA-VERDE | entrada en segundo 59"
+        signal, reason = "CALL", "secuencia VERDE-ROJA-ROJA-VERDE"
     elif sequence == ["red", "green", "green", "red"]:
-        signal = "PUT"
-        reason = "PUT | secuencia ROJA-VERDE-VERDE-ROJA | entrada en segundo 59"
+        signal, reason = "PUT", "secuencia ROJA-VERDE-VERDE-ROJA"
     else:
-        signal = "NO SIGNAL"
-        reason = "sin secuencia de 4 velas confirmada"
-
-    return {
-        "signal": signal,
-        "bias": signal if signal in ("CALL", "PUT") else "NEUTRAL",
-        "call_score": 1 if signal == "CALL" else 0,
-        "put_score": 1 if signal == "PUT" else 0,
-        "reason": reason,
-    }
+        signal, reason = "NO SIGNAL", "sin secuencia exacta de 4 velas"
+    return {"signal": signal, "bias": signal if signal in ("CALL", "PUT") else "NEUTRAL",
+            "call_score": int(signal == "CALL"), "put_score": int(signal == "PUT"),
+            "reason": reason, "sequence": sequence}
