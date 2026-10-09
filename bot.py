@@ -28,10 +28,10 @@ MAX_OTC_PAIRS = max(1, min(50, int(os.getenv("MAX_OTC_PAIRS", "50"))))
 PAIR_REFRESH_SECONDS = 300.0
 TF = 60
 COUNT = 200
-EXPIRATION = 1
+EXPIRATION = 2
 # Importe predeterminado: mínimo habitual de IQ Option.
 # Si Railway tiene AMOUNT configurado, esa variable prevalece.
-AMOUNT = float(os.getenv("AMOUNT", "209"))
+AMOUNT = float(os.getenv("AMOUNT", "208"))
 if AMOUNT <= 0:
     raise ValueError("AMOUNT debe ser mayor que 0")
 
