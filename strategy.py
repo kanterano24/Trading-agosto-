@@ -6,13 +6,13 @@ PUT:
   1) Vela previa verde: movimiento previo alcista.
   2) Vela de reversión roja: cierra por debajo del mínimo de la vela previa.
   3) Vela de continuidad roja: cierra por debajo del mínimo de la vela de reversión.
-  -> Señal PUT para la siguiente vela M1.
+  -> Señal CALL (invertida) para la siguiente vela M1.
 
 CALL (patrón inverso):
   1) Vela previa roja: movimiento previo bajista.
   2) Vela de reversión verde: cierra por encima del máximo de la vela previa.
   3) Vela de continuidad verde: cierra por encima del máximo de la vela de reversión.
-  -> Señal CALL para la siguiente vela M1.
+  -> Señal PUT (invertida) para la siguiente vela M1.
 """
 
 
@@ -103,14 +103,15 @@ def analyze_market(raw):
         and continuation["close"] > reversal["high"]
     )
 
+    # Entradas invertidas: la detección del patrón permanece idéntica.
     if put_setup:
-        signal = "PUT"
-        reason = ("PUT: vela previa verde; vela roja de reversión cierra bajo el mínimo previo; "
-                  "vela roja de continuidad cierra bajo el mínimo de reversión. Entrada PUT en la siguiente M1.")
-    elif call_setup:
         signal = "CALL"
-        reason = ("CALL: vela previa roja; vela verde de reversión cierra sobre el máximo previo; "
-                  "vela verde de continuidad cierra sobre el máximo de reversión. Entrada CALL en la siguiente M1.")
+        reason = ("CALL INVERTIDA: patrón de reversión y continuidad bajista detectado; "
+                  "entrada CALL en la siguiente M1.")
+    elif call_setup:
+        signal = "PUT"
+        reason = ("PUT INVERTIDA: patrón de reversión y continuidad alcista detectado; "
+                  "entrada PUT en la siguiente M1.")
     else:
         signal = "NO SIGNAL"
         reason = ("Sin entrada: se necesitan una vela previa, una vela de reversión que rompa el extremo "
