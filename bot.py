@@ -24,12 +24,12 @@ from strategy import normalize_candles, analyze_market
 
 PAIR = "EURUSD-OTC"
 PAIRS = []
-MAX_OTC_PAIRS = 50
+MAX_OTC_PAIRS = 6
 PAIR_REFRESH_SECONDS = 300.0
 TF = 60
 COUNT = 200
 EXPIRATION = 1
-AMOUNT = 1000
+AMOUNT = float(os.getenv("AMOUNT", "1000"))
 
 ENABLE_TRADES = os.getenv("ENABLE_TRADES", "true").lower() in (
     "1", "true", "yes", "si"
@@ -471,38 +471,29 @@ def connect_retry():
 
 
 def get_candles(iq, pair):
-    """Obtiene únicamente velas M1 ya cerradas desde IQ Option."""
+    """Devuelve (velas cerradas, vela actual, timestamp del servidor)."""
     try:
         now = int(iq.get_server_timestamp())
     except Exception:
         now = int(time.time())
-
-    raw = iq.get_candles(
-        pair,
-        TF,
-        COUNT + 20,
-        now,
-    ) or []
-
-    minute = now - now % TF
-    closed = []
-
-    for c in raw:
+    raw = iq.get_candles(pair, TF, COUNT + 20, now) or []
+    current_start = now - now % TF
+    closed_raw, current_raw = [], []
+    for candle in raw:
         try:
-            start = int(
-                c.get(
-                    "from",
-                    c.get("at", 0),
-                )
-            )
-
-            if start > 0 and start + TF <= minute:
-                closed.append(c)
-
+            start = int(candle.get("from", candle.get("at", candle.get("timestamp", 0))))
+            if start <= 0:
+                continue
+            if start + TF <= current_start:
+                closed_raw.append(candle)
+            elif start == current_start:
+                current_raw.append(candle)
         except (TypeError, ValueError):
-            pass
-
-    return normalize_candles(closed)[-COUNT:], now
+            continue
+    closed = normalize_candles(closed_raw)[-COUNT:]
+    current_list = normalize_candles(current_raw)
+    current = current_list[-1] if current_list else None
+    return closed, current, now
 
 
 def build_candle_api_history(candles):
@@ -755,271 +746,94 @@ def discover_otc_1m_pairs(iq):
         return []
 
 def execute_binary_order(iq, pair, signal, amount, expiration):
-    """
-    Intenta la entrada hasta 3 veces.
-    Si IQ Option devuelve 'asset is not available', refresca el estado
-    del activo y vuelve a intentar inmediatamente.
-    """
-    action = signal.lower()
-    last_response = None
-
-    for attempt in range(1, 4):
-        is_open, status = check_binary_availability(iq, pair)
-
-        logging.info(
-            "PRE-ORDEN %s | intento=%d/3 | signal=%s | disponible=%s | %s",
-            pair, attempt, signal, is_open, status,
-        )
-
-        if not is_open:
-            last_response = f"Activo no disponible: {status}"
-        else:
-            try:
-                iq.change_balance("PRACTICE")
-                ok, oid = iq.buy(
-                    amount,
-                    pair,
-                    action,
-                    expiration,
-                )
-
-                if ok:
-                    return True, oid
-
-                last_response = str(oid)
-
-                if "asset is not available" not in last_response.lower():
-                    return False, last_response
-
-            except Exception as e:
-                last_response = f"{type(e).__name__}: {e}"
-                logging.exception(
-                    "Excepción enviando BUY %s | intento=%d/3",
-                    pair, attempt,
-                )
-
-        if attempt < 3:
-            time.sleep(0.25)
-
-    return False, last_response or "sin respuesta de IQ Option"
+    """Envía una sola orden para evitar reintentos que la retrasen fuera del segundo 59."""
+    try:
+        iq.change_balance("PRACTICE")
+        ok, response = iq.buy(amount, pair, signal.lower(), expiration)
+        return bool(ok), response
+    except Exception as exc:
+        logging.exception("Error enviando orden %s %s", pair, signal)
+        return False, f"{type(exc).__name__}: {exc}"
 
 
 def main():
     global received_candles, PAIR, PAIRS
-
-    # IMPORTANTE:
-    # Este bot NO llama getUpdates.
-    # No compite con el receptor de Telegram que ya tienes.
     start_candles_api()
-
     iq = connect_retry()
     _ensure_telegram_worker()
-    last_candles = {}
-    candle_numbers = {}
-    last_pair_refresh = 0.0
-    last_minute = None
+    PAIR = os.getenv("PAIR", "EURUSD-OTC").strip() or "EURUSD-OTC"
+    PAIRS = [PAIR]  # un solo par, configurable con la variable PAIR
+    last_closed_stamp = None
+    last_entry_candle = None
+    last_order_candle = None
+    last_status_minute = None
 
-    PAIRS = discover_otc_1m_pairs(iq)
-
-    tg(
-        "🟢 Bot iniciado\n"
-        f"Pares OTC analizados: hasta {MAX_OTC_PAIRS}\n"
-        f"Pares disponibles 1m: {len(PAIRS)}\n"
-        "Temporalidad: M1\n"
-        "Estrategia: REVERSIÓN POR AGOTAMIENTO DE IMPULSO\n"
-        f"Expiración: {EXPIRATION} minuto\n"
-        f"Importe: {AMOUNT:.0f} USD\n"
-        "Indicadores: ninguno\n"
-        "S/R: no\n"
-        "Rechazo: no\n"
-        "Actualización de pares: cada 5 minutos"
-    )
+    tg("🟢 Bot iniciado\n"
+       f"Par: {PAIR}\nTemporalidad: M1\nEstrategia: secuencia exacta de 4 velas\n"
+       "CALL: VERDE-ROJA-ROJA-VERDE\nPUT: ROJA-VERDE-VERDE-ROJA\n"
+       f"Entrada: segundo 59 de la cuarta vela | Expiración: {EXPIRATION} minuto\n"
+       f"Importe: {AMOUNT:g} | Indicadores: ninguno | S/R: no | Rechazo: no")
 
     while True:
         try:
             if not iq.check_connect():
                 iq = connect_retry()
-                PAIRS = discover_otc_1m_pairs(iq)
-                last_pair_refresh = time.monotonic()
-                last_minute = None
+                last_closed_stamp = None
+                last_entry_candle = None
 
-            now_mono = time.monotonic()
+            closed, current, server_now = get_candles(iq, PAIR)
+            if closed:
+                received_candles = build_candle_api_history(closed)
+                if closed[-1]["timestamp"] != last_closed_stamp:
+                    last_closed_stamp = closed[-1]["timestamp"]
+                    tg(candle_message(closed[-1], len(closed)) +
+                       "\n\n📚 Historial cerrado actualizado: " + str(len(closed)) + " velas")
 
-            # Actualiza la lista de pares exactamente cada 5 minutos.
-            if now_mono - last_pair_refresh >= PAIR_REFRESH_SECONDS:
-                refreshed = discover_otc_1m_pairs(iq)
+            if current is None or len(closed) < 3:
+                time.sleep(POLL)
+                continue
 
-                if refreshed:
-                    PAIRS = refreshed
-                    tg(
-                        f"🔄 Pares OTC actualizados\n"
-                        f"Disponibles con expiración 1m: {len(PAIRS)}\n"
-                        f"Analizando: {', '.join(PAIRS)}"
-                    )
+            second = server_now - current["timestamp"]
+            # Solo se evalúa la secuencia cuando quedan aproximadamente 1 s.
+            if second < 59 or second >= TF:
+                time.sleep(POLL)
+                continue
+
+            candle_stamp = current["timestamp"]
+            if last_entry_candle == candle_stamp:
+                time.sleep(POLL)
+                continue
+            last_entry_candle = candle_stamp  # impide reintentos/duplicados en esta vela
+            res = analyze_market(closed[-3:] + [current])
+            sequence_text = "-".join({"green": "V", "red": "R", "doji": "D"}.get(x, "?")
+                                     for x in res.get("sequence", []))
+            logging.info("%s | segundo=%d | secuencia=%s | señal=%s | %s",
+                         PAIR, second, sequence_text, res["signal"], res["reason"])
+
+            order_text = ""
+            if res["signal"] in ("CALL", "PUT"):
+                if last_order_candle == candle_stamp:
+                    order_text = "\n⛔ Orden duplicada bloqueada para esta vela."
+                elif not ENABLE_TRADES:
+                    order_text = "\n🧪 Señal detectada; operaciones desactivadas."
                 else:
-                    logging.warning(
-                        "Actualizacion sin pares validos; se conserva la lista anterior"
-                    )
+                    # Una sola solicitud: evita que una consulta extra de disponibilidad
+                    # consuma la ventana de entrada del segundo 59.
+                    last_order_candle = candle_stamp
+                    ok, oid = execute_binary_order(iq, PAIR, res["signal"], AMOUNT, EXPIRATION)
+                    order_text = (f"\n\n{'🧪 ORDEN ENVIADA' if ok else '⚠️ ORDEN RECHAZADA'}"
+                                  f"\nDirección: {res['signal']}\nImporte: {AMOUNT:g}"
+                                  f"\nExpiración: {EXPIRATION} minuto\nID/respuesta: {oid}")
+            tg(f"⏱️ Evaluación segundo {second} de la vela M1\nPar: {PAIR}\n"
+               f"Secuencia: {sequence_text}\nSeñal: {res['signal']}\n{res['reason']}" + order_text)
 
-                last_pair_refresh = now_mono
-
-            if not PAIRS:
-                logging.warning(
-                    "No hay pares OTC con expiracion 1m disponibles; "
-                    "analisis y entradas bloqueados"
-                )
-                time.sleep(POLL)
-                continue
-
-            # Procesa cada vela M1 cerrada una sola vez.
-            server_now = int(iq.get_server_timestamp())
-            current_minute = server_now - server_now % TF
-
-            if current_minute == last_minute:
-                time.sleep(POLL)
-                continue
-
-            last_minute = current_minute
-
-            # Una sola consulta de activos por minuto mantiene actualizado el
-            # bloqueo 1m sin hacer 50 llamadas get_all_init_v2 por ciclo.
-            available_1m = set(discover_otc_1m_pairs(iq))
-
-            for pair in list(PAIRS):
-                try:
-                    # Si el par ya no está abierto en TURBO/1m, no se analiza.
-                    if pair not in available_1m:
-                        logging.info(
-                            "%s | ANALISIS BLOQUEADO | sin expiracion 1m disponible",
-                            pair,
-                        )
-                        continue
-
-                    cs, _ = get_candles(iq, pair)
-
-                    if len(cs) < 4:
-                        logging.info(
-                            "%s | Esperando historial M1: %d/4",
-                            pair,
-                            len(cs),
-                        )
-                        continue
-
-                    stamp = cs[-1]["timestamp"]
-
-                    if stamp == last_candles.get(pair):
-                        continue
-
-                    last_candles[pair] = stamp
-                    candle_numbers[pair] = candle_numbers.get(pair, 0) + 1
-
-                    # Mantener la API apuntando al ultimo par procesado,
-                    # conservando el formato original del endpoint.
-                    PAIR = pair
-                    received_candles = build_candle_api_history(cs)
-
-                    candle_text = candle_message(
-                        cs[-1],
-                        candle_numbers[pair],
-                    )
-
-                    res = analyze_market(cs)
-
-                    logging.info(
-                        "%s señal=%s | motivo=%s",
-                        pair,
-                        res["signal"],
-                        res["reason"],
-                    )
-
-                    order_text = ""
-
-                    # La entrada queda bloqueada si el par no tiene 1m
-                    # disponible justo antes de enviar la orden.
-                    if (
-                        res["signal"] in ("CALL", "PUT")
-                        and ENABLE_TRADES
-                    ):
-                        is_open, availability_reason = wait_binary_asset(
-                            iq,
-                            pair,
-                        )
-
-                        if not is_open:
-                            logging.info(
-                                "%s | ENTRADA BLOQUEADA | %s",
-                                pair,
-                                availability_reason,
-                            )
-                            order_text = (
-                                "\n\n⛔ ENTRADA BLOQUEADA\n"
-                                f"Motivo: {availability_reason}\n"
-                                f"Expiración requerida: {EXPIRATION} minuto"
-                            )
-                        else:
-                            ok, oid = execute_binary_order(
-                                iq,
-                                pair,
-                                res["signal"],
-                                AMOUNT,
-                                EXPIRATION,
-                            )
-
-                            logging.info(
-                                "%s señal=%s | orden=%s | ok=%s | respuesta=%s",
-                                pair,
-                                res["signal"],
-                                res["signal"],
-                                ok,
-                                oid,
-                            )
-
-                            order_text = (
-                                f'\n\n{"🧪 ORDEN ENVIADA" if ok else "⚠️ ORDEN RECHAZADA"}\n'
-                                f"Dirección: {res['signal']}\n"
-                                f"Importe: {AMOUNT:.0f} USD\n"
-                                f"Expiración: {EXPIRATION} minuto\n"
-                                f"ID/respuesta: {oid}"
-                            )
-
-                    # Un solo mensaje por par y por cierre M1. Esto conserva
-                    # los datos de la vela y la señal, pero evita duplicar
-                    # mensajes y alcanzar el límite de Telegram con 50 pares.
-                    tg(
-                        candle_text
-                        + "\n\n📈 Señal: "
-                        + res["signal"]
-                        + "\n"
-                        + res["reason"]
-                        + order_text
-                    )
-
-                except Exception as e:
-                    logging.exception(
-                        "Error procesando %s",
-                        pair,
-                    )
-                    # El error queda en Railway; no se reenvía cada excepción a
-                    # Telegram para evitar otra ráfaga cuando varios pares fallen.
-
-        except Exception as e:
-            logging.exception("Error de ciclo")
-
-            # El error principal queda registrado en Railway. Telegram no se usa
-            # para notificar cada error de ciclo porque podría generar un 429.
-
+        except Exception:
+            logging.exception("Error de ciclo principal")
             try:
                 if not iq.check_connect():
                     iq = connect_retry()
-                    PAIRS = discover_otc_1m_pairs(iq)
-                    last_pair_refresh = time.monotonic()
-                    last_minute = None
             except Exception:
                 iq = connect_retry()
-                PAIRS = discover_otc_1m_pairs(iq)
-                last_pair_refresh = time.monotonic()
-                last_minute = None
-
         time.sleep(POLL)
 
 
