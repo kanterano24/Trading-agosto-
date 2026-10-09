@@ -863,9 +863,9 @@ def main():
         f"Pares OTC configurados: hasta {MAX_OTC_PAIRS}\n"
         f"Pares disponibles al iniciar: {len(PAIRS)}\n"
         "Temporalidad: M1\n"
-        "Estrategia: acción del precio, 4 velas cerradas\n"
-        "PUT: roja + 2 verdes fuertes rompen máximos + roja confirma\n"
-        "CALL: verde + 2 rojas fuertes rompen mínimos + verde confirma\n"
+        "Estrategia: reversión + continuidad, solo acción del precio\n"
+        "PUT: verde previa + roja rompe mínimo + roja de continuidad rompe mínimo de reversión\n"
+        "CALL: roja previa + verde rompe máximo + verde de continuidad rompe máximo de reversión\n"
         f"Entrada: primera detección de la siguiente vela M1 | Expiración: {EXPIRATION} minuto\n"
         f"Importe por operación: {AMOUNT:g}\n"
         "Indicadores: ninguno | S/R: no | Rechazo: no"
@@ -923,23 +923,22 @@ def main():
                             + f"\nHistorial cerrado disponible: {len(closed)} velas"
                         )
 
-                    if current is None or len(closed) < 4:
+                    if current is None or len(closed) < 3:
                         continue
 
                     second = int(server_now - current["timestamp"])
                     candle_stamp = current["timestamp"]
 
-                    # La estrategia usa las últimas 4 velas CERRADAS; cuando aparece
-                    # una nueva vela M1, la señal corresponde a esta vela actual.
-                    # No esperar al segundo 59: eso ejecutaría casi al cierre, no en
-                    # la siguiente M1. Cada par se evalúa/ejecuta una sola vez por vela.
+                    # La estrategia usa 3 velas CERRADAS: previa, reversión y continuidad.
+                    # La señal corresponde a la vela actual, siguiente a la continuidad.
+                    # Cada par se evalúa/ejecuta una sola vez por vela.
                     if last_evaluated_candle.get(pair) == candle_stamp:
                         continue
                     last_evaluated_candle[pair] = candle_stamp
 
                     # Evita ejecutar una señal antigua si IQ Option entregó velas
                     # desfasadas: la vela de entrada esperada debe ser la actual.
-                    setup_candles = closed[-4:]
+                    setup_candles = closed[-3:]
                     res = analyze_market(setup_candles)
                     sequence_text = "-".join(
                         {"green": "V", "red": "R", "doji": "D"}.get(x, "?")
@@ -976,8 +975,8 @@ def main():
                             )
 
                     # En Telegram se informa cada evaluación, incluso NO SIGNAL,
-                    # incluyendo las 4 velas cerradas usadas por la estrategia y
-                    # la vela M1 actual (vela en la que se intenta entrar).
+                    # incluyendo las 3 velas cerradas (previa, reversión, continuidad)
+                    # y la vela M1 actual (vela en la que se intenta entrar).
                     setup_text = "\n".join(
                         _candle_summary(candle, idx)
                         for idx, candle in enumerate(setup_candles, start=1)
@@ -989,7 +988,7 @@ def main():
                         f"⏱️ EVALUACIÓN M1 | vela actual, segundo {second}\n"
                         f"Par: {pair}\nSecuencia analizada: {sequence_text}\n"
                         f"Señal: {res['signal']}\nMotivo: {res['reason']}\n\n"
-                        f"📚 CUATRO VELAS CERRADAS UTILIZADAS\n{setup_text}\n\n"
+                        f"📚 VELAS CERRADAS UTILIZADAS (PREVIA / REVERSIÓN / CONTINUIDAD)\n{setup_text}\n\n"
                         f"🎯 VELA EN LA QUE SE INTENTA LA ENTRADA\n{entry_candle_text}"
                         + ("\n" + order_text.strip() if order_text else "\nOperación: no ejecutada (sin señal).")
                     )
