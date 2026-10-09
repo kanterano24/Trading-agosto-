@@ -1,18 +1,15 @@
-"""Estrategia M1 de acción del precio: reversión, continuidad y entrada.
-
-La estrategia usa únicamente velas cerradas y no usa indicadores, S/R ni rechazo.
+"""Estrategia M1: vela previa + reversión cerrada; entrada en continuidad.
 
 PUT:
-  1) Vela previa verde: movimiento previo alcista.
-  2) Vela de reversión roja: cierra por debajo del mínimo de la vela previa.
-  3) Vela de continuidad roja: cierra por debajo del mínimo de la vela de reversión.
-  -> Señal CALL (invertida) para la siguiente vela M1.
+  1) Vela previa verde.
+  2) Vela de reversión roja que cierra por debajo del mínimo de la previa.
+  3) La entrada PUT se intenta en la vela M1 inmediatamente siguiente
+     a la reversión (vela de continuidad, aún en formación).
 
-CALL (patrón inverso):
-  1) Vela previa roja: movimiento previo bajista.
-  2) Vela de reversión verde: cierra por encima del máximo de la vela previa.
-  3) Vela de continuidad verde: cierra por encima del máximo de la vela de reversión.
-  -> Señal PUT (invertida) para la siguiente vela M1.
+CALL: patrón contrario: previa roja; reversión verde cierra por encima
+ del máximo previo; entrada CALL en la siguiente vela M1.
+
+Solo acción del precio. Sin indicadores, S/R ni rechazo.
 """
 
 
@@ -69,54 +66,51 @@ def format_candle(index, candle):
 
 
 def analyze_market(raw):
-    """Detecta reversión + continuidad y señala entrada en la siguiente M1."""
+    """Detecta reversión en las últimas dos velas cerradas.
+
+    La señal se ejecuta durante la vela actual, que es la vela de continuidad.
+    """
     candles = normalize_candles(raw)
-    if len(candles) < 3:
+    if len(candles) < 2:
+        sequence = [c["color"] for c in candles]
         return {
             "signal": "NO SIGNAL", "bias": "NEUTRAL", "call_score": 0,
-            "put_score": 0, "reason": f"Historial insuficiente: {len(candles)}/3 velas cerradas",
-            "sequence": [c["color"] for c in candles],
-            "sequence_text": "-".join({"green": "V", "red": "R", "doji": "D"}[c["color"]] for c in candles),
-            "entry_timing": "NEXT_M1",
+            "put_score": 0,
+            "reason": f"Historial insuficiente: {len(candles)}/2 velas cerradas",
+            "sequence": sequence,
+            "sequence_text": "-".join({"green": "V", "red": "R", "doji": "D"}[x] for x in sequence),
+            "entry_timing": "CONTINUATION_CANDLE",
+            "entry_candle_timestamp": None,
         }
 
-    previous, reversal, continuation = candles[-3:]
-    sequence = [previous["color"], reversal["color"], continuation["color"]]
-    sequence_text = "-".join({"green": "V", "red": "R", "doji": "D"}[color] for color in sequence)
+    previous, reversal = candles[-2:]
+    sequence = [previous["color"], reversal["color"]]
+    color_code = {"green": "V", "red": "R", "doji": "D"}
+    sequence_text = "-".join(color_code[x] for x in sequence)
 
-    # PUT: movimiento alcista previo, reversión bajista que rompe su mínimo,
-    # seguida por continuidad bajista que rompe el mínimo de la reversión.
     put_setup = (
         previous["color"] == "green"
         and reversal["color"] == "red"
         and reversal["close"] < previous["low"]
-        and continuation["color"] == "red"
-        and continuation["close"] < reversal["low"]
     )
-
-    # CALL: patrón inverso.
     call_setup = (
         previous["color"] == "red"
         and reversal["color"] == "green"
         and reversal["close"] > previous["high"]
-        and continuation["color"] == "green"
-        and continuation["close"] > reversal["high"]
     )
 
-    # Entradas invertidas: la detección del patrón permanece idéntica.
     if put_setup:
-        signal = "CALL"
-        reason = ("CALL INVERTIDA: patrón de reversión y continuidad bajista detectado; "
-                  "entrada CALL en la siguiente M1.")
-    elif call_setup:
         signal = "PUT"
-        reason = ("PUT INVERTIDA: patrón de reversión y continuidad alcista detectado; "
-                  "entrada PUT en la siguiente M1.")
+        reason = ("PUT: vela previa verde; reversión roja cerró por debajo del mínimo "
+                  "previo. Entrada en la vela M1 siguiente (continuidad).")
+    elif call_setup:
+        signal = "CALL"
+        reason = ("CALL: vela previa roja; reversión verde cerró por encima del máximo "
+                  "previo. Entrada en la vela M1 siguiente (continuidad).")
     else:
         signal = "NO SIGNAL"
-        reason = ("Sin entrada: se necesitan una vela previa, una vela de reversión que rompa el extremo "
-                  "anterior al cierre y una vela de continuidad del mismo color que rompa el extremo "
-                  "de la reversión al cierre.")
+        reason = ("Sin señal: se requieren dos velas cerradas; verde + reversión roja "
+                  "que cierre bajo el mínimo previo para PUT, o el patrón contrario para CALL.")
 
     return {
         "signal": signal,
@@ -126,9 +120,10 @@ def analyze_market(raw):
         "reason": reason,
         "sequence": sequence,
         "sequence_text": sequence_text,
-        "entry_timing": "NEXT_M1",
+        "entry_timing": "CONTINUATION_CANDLE",
+        "previous_candle_timestamp": previous["timestamp"],
         "reversal_candle_timestamp": reversal["timestamp"],
-        "continuation_candle_timestamp": continuation["timestamp"],
-        "confirmation_candle_timestamp": continuation["timestamp"],
-        "entry_candle_timestamp": continuation["timestamp"] + 60,
+        "confirmation_candle_timestamp": reversal["timestamp"],
+        "continuation_candle_timestamp": reversal["timestamp"] + 60,
+        "entry_candle_timestamp": reversal["timestamp"] + 60,
     }
