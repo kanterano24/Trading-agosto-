@@ -852,6 +852,7 @@ def main():
     last_closed_stamp = {}       # último cierre procesado por par
     last_evaluated_candle = {}   # evita evaluar dos veces la misma vela
     last_order_candle = {}       # evita duplicar una orden por par/vela
+    last_global_order_candle = None  # máximo una orden intentada en todo el bot por minuto M1
     last_pair_refresh = 0.0
 
     PAIRS = discover_otc_1m_pairs(iq)
@@ -957,12 +958,19 @@ def main():
                                 "\n⛔ ENTRADA BLOQUEADA: la señal no corresponde a la vela M1 actual."
                                 f"\nVela esperada: {expected_entry_stamp}; vela actual: {candle_stamp}."
                             )
+                        elif last_global_order_candle == candle_stamp:
+                            order_text = (
+                                "\n⛔ Entrada bloqueada: ya se intentó una operación "
+                                "en este minuto M1 (límite global de una por minuto)."
+                            )
                         elif last_order_candle.get(pair) == candle_stamp:
                             order_text = "\n⛔ Orden duplicada bloqueada para esta vela."
                         elif not ENABLE_TRADES:
                             order_text = "\n🧪 Señal detectada; operaciones desactivadas."
                         else:
-                            # Marca antes de enviar para evitar duplicados si la API tarda.
+                            # Reserva el minuto global ANTES de enviar la orden: incluso si
+                            # IQ Option tarda o rechaza la orden, no se intenta otra en este minuto.
+                            last_global_order_candle = candle_stamp
                             last_order_candle[pair] = candle_stamp
                             ok, oid = execute_binary_order(
                                 iq, pair, res["signal"], AMOUNT, EXPIRATION
