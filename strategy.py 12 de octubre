@@ -1,0 +1,149 @@
+"""Estrategia M1 con vela previa + vela de señal y cruce estocástico.
+
+Parámetros de la captura:
+- %K periodo 13
+- Suavizado de %K 3
+- %D periodo 3
+- Sobrecompra 80 / sobreventa 20 (niveles informativos)
+
+PUT: vela previa verde; la siguiente vela es roja y cierra por encima
+      del máximo de la vela verde; %K cruza hacia abajo de %D y K baja/D sube.
+CALL: patrón contrario: previa roja; vela verde cierra por debajo del mínimo
+       previo; %K cruza hacia arriba de %D y K sube/D baja.
+La señal se genera al cierre de la segunda vela; bot.py entra en la vela M1
+siguiente con expiración configurada allí.
+"""
+from math import isfinite
+
+STOCH_K_PERIOD = 13
+STOCH_K_SMOOTH = 3
+STOCH_D_PERIOD = 3
+STOCH_OVERBOUGHT = 80.0
+STOCH_OVERSOLD = 20.0
+
+
+def normalize_candles(raw):
+    out = []
+    for candle in raw or []:
+        try:
+            ts = int(candle.get("from", candle.get("at", candle.get("timestamp", 0))))
+            op = float(candle["open"])
+            close = float(candle["close"])
+            low = float(candle.get("min", candle.get("low", min(op, close))))
+            high = float(candle.get("max", candle.get("high", max(op, close))))
+            if ts <= 0 or not all(isfinite(x) for x in (op, close, low, high)):
+                continue
+            if low > min(op, close) or high < max(op, close) or low > high:
+                continue
+            out.append({
+                "timestamp": ts, "open": op, "close": close,
+                "min": low, "max": high, "low": low, "high": high,
+                "range": high-low, "body": abs(close-op),
+                "lower_wick": min(op, close)-low,
+                "upper_wick": high-max(op, close),
+                "color": "green" if close > op else "red" if close < op else "doji",
+            })
+        except (KeyError, TypeError, ValueError, OverflowError):
+            continue
+    unique = {c["timestamp"]: c for c in sorted(out, key=lambda x: x["timestamp"])}
+    return list(unique.values())
+
+
+def _sma(values, period):
+    if len(values) < period:
+        return None
+    return sum(values[-period:]) / period
+
+
+def stochastic(candles):
+    """Retorna valores K suavizado y D para cada vela; None mientras falte historial."""
+    raw_k = []
+    for i, candle in enumerate(candles):
+        if i + 1 < STOCH_K_PERIOD:
+            raw_k.append(None)
+            continue
+        window = candles[i + 1 - STOCH_K_PERIOD:i + 1]
+        highest = max(c["high"] for c in window)
+        lowest = min(c["low"] for c in window)
+        raw_k.append(50.0 if highest == lowest else 100.0 * (candle["close"] - lowest) / (highest - lowest))
+
+    smooth_k = []
+    for i in range(len(raw_k)):
+        section = raw_k[max(0, i - STOCH_K_SMOOTH + 1):i + 1]
+        smooth_k.append(None if len(section) < STOCH_K_SMOOTH or any(v is None for v in section) else sum(section) / STOCH_K_SMOOTH)
+    d_values = []
+    for i in range(len(smooth_k)):
+        section = smooth_k[max(0, i - STOCH_D_PERIOD + 1):i + 1]
+        d_values.append(None if len(section) < STOCH_D_PERIOD or any(v is None for v in section) else sum(section) / STOCH_D_PERIOD)
+    return smooth_k, d_values
+
+
+def describe_history(raw):
+    candles = normalize_candles(raw)
+    greens = sum(c["color"] == "green" for c in candles)
+    reds = sum(c["color"] == "red" for c in candles)
+    return {"count": len(candles), "greens": greens, "reds": reds, "dojis": len(candles)-greens-reds}
+
+
+def format_candle(index, candle):
+    c_list = normalize_candles([candle])
+    if not c_list:
+        return f"{index}: inválida"
+    c = c_list[0]
+    color = {"green":"V", "red":"R", "doji":"D"}[c["color"]]
+    return (f"{index}: {color} O={c['open']} C={c['close']} H={c['high']} L={c['low']} "
+            f"Rango={c['range']} Cuerpo={c['body']} MechaInf={c['lower_wick']} MechaSup={c['upper_wick']}")
+
+
+def analyze_market(raw):
+    candles = normalize_candles(raw)
+    base = {
+        "signal": "NO SIGNAL", "bias": "NEUTRAL", "call_score": 0, "put_score": 0,
+        "sequence": [], "sequence_text": "", "entry_timing": "NEXT_M1_CANDLE",
+        "entry_candle_timestamp": None, "stoch_k": None, "stoch_d": None,
+        "reason": "Historial insuficiente para calcular el estocástico y evaluar las velas.",
+    }
+    if len(candles) < STOCH_K_PERIOD + STOCH_K_SMOOTH + STOCH_D_PERIOD:
+        base["reason"] = f"Historial insuficiente para estocástico K={STOCH_K_PERIOD}, suavizado={STOCH_K_SMOOTH}, D={STOCH_D_PERIOD}: {len(candles)} velas."
+        return base
+
+    k_values, d_values = stochastic(candles)
+    idx = len(candles) - 1
+    previous, signal_candle = candles[-2], candles[-1]
+    k_now, d_now = k_values[idx], d_values[idx]
+    k_prev, d_prev = k_values[idx-1], d_values[idx-1]
+    sequence = [previous["color"], signal_candle["color"]]
+    codes = {"green":"V", "red":"R", "doji":"D"}
+    base.update({
+        "sequence": sequence,
+        "sequence_text": "-".join(codes[x] for x in sequence),
+        "stoch_k": k_now, "stoch_d": d_now,
+        "stoch_k_previous": k_prev, "stoch_d_previous": d_prev,
+        "previous_candle_timestamp": previous["timestamp"],
+        "reversal_candle_timestamp": signal_candle["timestamp"],
+        "entry_candle_timestamp": signal_candle["timestamp"] + 60,
+    })
+    if None in (k_now, d_now, k_prev, d_prev):
+        base["reason"] = "Estocástico aún no disponible para las dos últimas velas."
+        return base
+
+    # Cruce confirmado en el cierre: PUT exige K cruzando debajo de D,
+    # K descendente y D ascendente. CALL exige el cruce inverso.
+    cross_down = k_prev >= d_prev and k_now < d_now and k_now < k_prev and d_now > d_prev
+    cross_up = k_prev <= d_prev and k_now > d_now and k_now > k_prev and d_now < d_prev
+
+    put_setup = (previous["color"] == "green" and signal_candle["color"] == "red"
+                 and signal_candle["close"] > previous["high"] and cross_down)
+    call_setup = (previous["color"] == "red" and signal_candle["color"] == "green"
+                  and signal_candle["close"] < previous["low"] and cross_up)
+
+    if put_setup:
+        base.update(signal="PUT", bias="PUT", put_score=1,
+                    reason="PUT: previa verde; vela roja cerró por encima del máximo previo; %K cruzó hacia abajo de %D, con K descendiendo y D ascendiendo. Entrada en la siguiente M1.")
+    elif call_setup:
+        base.update(signal="CALL", bias="CALL", call_score=1,
+                    reason="CALL: previa roja; vela verde cerró por debajo del mínimo previo; %K cruzó hacia arriba de %D, con K ascendiendo y D descendiendo. Entrada en la siguiente M1.")
+    else:
+        base["reason"] = (f"Sin señal: patrón de velas y cruce estocástico no coinciden. "
+                           f"K={k_now:.2f}, D={d_now:.2f}; cruce↓={cross_down}, cruce↑={cross_up}.")
+    return base
