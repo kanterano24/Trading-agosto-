@@ -129,25 +129,34 @@ except ModuleNotFoundError as exc:
             result["reason"] = "Estocástico aún no disponible."
             return result
 
-        # CALL: K cruza hacia arriba de D mientras ambas líneas permanecen en sobreventa.
-        cross_up_oversold = (k_prev <= d_prev and k_now > d_now and k_now > k_prev
-                             and k_prev <= STOCH_OVERSOLD and d_prev <= STOCH_OVERSOLD
-                             and k_now <= STOCH_OVERSOLD and d_now <= STOCH_OVERSOLD)
-        # PUT: K cruza hacia abajo de D mientras ambas líneas permanecen en sobrecompra.
-        cross_down_overbought = (k_prev >= d_prev and k_now < d_now and k_now < k_prev
-                                 and k_prev >= STOCH_OVERBOUGHT and d_prev >= STOCH_OVERBOUGHT
-                                 and k_now >= STOCH_OVERBOUGHT and d_now >= STOCH_OVERBOUGHT)
+        # LÓGICA EXACTA SOLICITADA (igual a strategy.py):
+        # PUT: K azul cruza HACIA ARRIBA el nivel de sobrecompra 80 y la vela cierra roja.
+        k_crosses_overbought_up = (k_prev <= STOCH_OVERBOUGHT and k_now > STOCH_OVERBOUGHT)
+        # CALL: D roja cruza HACIA ABAJO el nivel de sobreventa 20 y la vela cierra verde.
+        d_crosses_oversold_down = (d_prev >= STOCH_OVERSOLD and d_now < STOCH_OVERSOLD)
 
-        if cross_up_oversold and candle["color"] == "green":
-            result.update(signal="CALL", bias="CALL", call_score=1,
-                          reason=f"CALL: cruce K↑ sobre D en sobreventa (20), vela verde. K={k_now:.2f}, D={d_now:.2f}. Entrada en la segunda vela posterior a la señal.")
-        elif cross_down_overbought and candle["color"] == "red":
-            result.update(signal="PUT", bias="PUT", put_score=1,
-                          reason=f"PUT: cruce K↓ bajo D en sobrecompra (80), vela roja. K={k_now:.2f}, D={d_now:.2f}. Entrada en la segunda vela posterior a la señal.")
+        if k_crosses_overbought_up and candle["color"] == "red":
+            result.update(
+                signal="PUT", bias="PUT", put_score=1,
+                reason=(f"PUT: K azul cruza hacia arriba el nivel 80 y la vela cerrada es roja. "
+                        f"K={k_prev:.2f}->{k_now:.2f}; D={d_prev:.2f}->{d_now:.2f}. "
+                        "Esperar una vela completa y entrar en la siguiente.")
+            )
+        elif d_crosses_oversold_down and candle["color"] == "green":
+            result.update(
+                signal="CALL", bias="CALL", call_score=1,
+                reason=(f"CALL: D roja cruza hacia abajo el nivel 20 y la vela cerrada es verde. "
+                        f"K={k_prev:.2f}->{k_now:.2f}; D={d_prev:.2f}->{d_now:.2f}. "
+                        "Esperar una vela completa y entrar en la siguiente.")
+            )
         else:
-            result["reason"] = (f"Sin señal: cruce en zona extrema y color correcto no coinciden. "
-                                 f"Color={candle['color']}, K={k_now:.2f}, D={d_now:.2f}, "
-                                 f"CALL={cross_up_oversold}, PUT={cross_down_overbought}.")
+            result["reason"] = (
+                f"Sin señal: se exige PUT si K cruza 80 hacia arriba y la vela es roja; "
+                f"CALL si D cruza 20 hacia abajo y la vela es verde. "
+                f"Color={candle['color']}; K={k_prev:.2f}->{k_now:.2f}; "
+                f"D={d_prev:.2f}->{d_now:.2f}; K cruza 80 arriba={k_crosses_overbought_up}; "
+                f"D cruza 20 abajo={d_crosses_oversold_down}."
+            )
         return result
 
 
@@ -157,10 +166,10 @@ MAX_OTC_PAIRS = max(1, min(3, int(os.getenv("MAX_OTC_PAIRS", "3"))))
 PAIR_REFRESH_SECONDS = 300.0
 TF = 60
 COUNT = 200
-EXPIRATION = 5
+EXPIRATION = 2
 # Importe predeterminado: mínimo habitual de IQ Option.
 # Si Railway tiene AMOUNT configurado, esa variable prevalece.
-AMOUNT = float(os.getenv("AMOUNT", "1"))
+AMOUNT = float(os.getenv("AMOUNT", "4"))
 if AMOUNT <= 0:
     raise ValueError("AMOUNT debe ser mayor que 0")
 
