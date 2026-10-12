@@ -19,19 +19,19 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import requests
 from iqoptionapi.stable_api import IQ_Option
 from iqoptionapi import constants as OP_code
-from strategy import normalize_candles, analyze_market
+from strategy import normalize_candles, analyze_market, STOCH_K_PERIOD, STOCH_K_SMOOTH, STOCH_D_PERIOD, STOCH_OVERBOUGHT, STOCH_OVERSOLD
 
 
 PAIR = "EURUSD-OTC"
 PAIRS = []
-MAX_OTC_PAIRS = max(1, min(50, int(os.getenv("MAX_OTC_PAIRS", "50"))))
+MAX_OTC_PAIRS = max(1, min(3, int(os.getenv("MAX_OTC_PAIRS", "3"))))
 PAIR_REFRESH_SECONDS = 300.0
 TF = 60
 COUNT = 200
-EXPIRATION = 1
+EXPIRATION = 5
 # Importe predeterminado: mínimo habitual de IQ Option.
 # Si Railway tiene AMOUNT configurado, esa variable prevalece.
-AMOUNT = float(os.getenv("AMOUNT", "1"))
+AMOUNT = float(os.getenv("AMOUNT", "3"))
 if AMOUNT <= 0:
     raise ValueError("AMOUNT debe ser mayor que 0")
 
@@ -677,18 +677,18 @@ def binary_asset_status(iq, pair):
             is_open = enabled and not suspended
 
             if is_open:
-                return True, f"{pair} abierto en TURBO | expiracion 1m disponible"
+                return True, f"{pair} abierto en TURBO | expiracion 5m disponible"
 
             return False, f"{pair} TURBO cerrado/suspendido"
 
-        return False, f"{pair} no aparece en TURBO; 1m bloqueado"
+        return False, f"{pair} no aparece en TURBO; 5m bloqueado"
 
     except Exception as e:
         logging.exception(
             "No se pudo comprobar TURBO de %s",
             pair,
         )
-        return False, f"error disponibilidad 1m: {type(e).__name__}: {e}"
+        return False, f"error disponibilidad 5m: {type(e).__name__}: {e}"
 
 
 def wait_binary_asset(iq, pair, attempts=2, delay=0.35):
@@ -719,7 +719,7 @@ def wait_binary_asset(iq, pair, attempts=2, delay=0.35):
 
 
 def check_binary_availability(iq, pair):
-    """Comprueba exclusivamente disponibilidad TURBO para expiracion 1m."""
+    """Comprueba exclusivamente disponibilidad TURBO para expiracion 5m."""
     return binary_asset_status(iq, pair)
 
 
@@ -853,6 +853,7 @@ def main():
     last_evaluated_candle = {}   # evita evaluar dos veces la misma vela
     last_order_candle = {}       # evita duplicar una orden por par/vela
     last_global_order_candle = None  # máximo una orden intentada en todo el bot por minuto M1
+    pending_signals = {}  # señales confirmadas que esperan su vela de entrada programada
     last_pair_refresh = 0.0
 
     PAIRS = discover_otc_1m_pairs(iq)
@@ -863,11 +864,12 @@ def main():
         "🟢 Bot iniciado\n"
         f"Pares OTC configurados: hasta {MAX_OTC_PAIRS}\n"
         f"Pares disponibles al iniciar: {len(PAIRS)}\n"
-        "Temporalidad: M1\n"
-        "Estrategia: reversión confirmada + entrada en vela de continuidad\n"
-        "PUT: previa verde; reversión roja cierra bajo el mínimo previo\n"
-        "CALL: previa roja; reversión verde cierra sobre el máximo previo\n"
-        f"Entrada: durante la siguiente vela M1 (continuidad) | Expiración: {EXPIRATION} minuto\n"
+        "Temporalidad de análisis: M1\n"
+        "Estrategia: cruce estocástico en zona extrema + color de vela\n"
+        "CALL: K cruza arriba de D en sobreventa 20 y vela verde\n"
+        "PUT: K cruza abajo de D en sobrecompra 80 y vela roja\n"
+        f"Estocástico: K={STOCH_K_PERIOD}, suavizado={STOCH_K_SMOOTH}, D={STOCH_D_PERIOD}, niveles={STOCH_OVERSOLD}/{STOCH_OVERBOUGHT}\n"
+        f"Entrada: segunda vela posterior a la señal M1 | Expiración: {EXPIRATION} minutos\n"
         f"Importe por operación: {AMOUNT:g}\n"
         "Indicadores: ninguno | S/R: no | Rechazo: no"
     )
@@ -924,81 +926,74 @@ def main():
                             + f"\nHistorial cerrado disponible: {len(closed)} velas"
                         )
 
-                    if current is None or len(closed) < 2:
+                    if current is None or len(closed) < 30:
                         continue
 
                     second = int(server_now - current["timestamp"])
                     candle_stamp = current["timestamp"]
-
-                    # La estrategia usa 2 velas CERRADAS: previa y reversión.
-                    # La vela actual es la vela de continuidad y de entrada.
-                    # Cada par se evalúa/ejecuta una sola vez por vela.
                     if last_evaluated_candle.get(pair) == candle_stamp:
                         continue
                     last_evaluated_candle[pair] = candle_stamp
 
-                    # Evita ejecutar una señal antigua si IQ Option entregó velas
-                    # desfasadas: la vela de entrada esperada debe ser la actual.
-                    setup_candles = closed[-2:]
-                    res = analyze_market(setup_candles)
-                    sequence_text = "-".join(
-                        {"green": "V", "red": "R", "doji": "D"}.get(x, "?")
-                        for x in res.get("sequence", [])
-                    )
-                    logging.info(
-                        "%s | segundo=%d | secuencia=%s | señal=%s | %s",
-                        pair, second, sequence_text, res["signal"], res["reason"]
-                    )
-
+                    # Primero ejecuta una señal pendiente en la segunda vela posterior
+                    # a la vela de señal: señal S, espera el cierre de S+1, entra en S+2.
+                    pending = pending_signals.get(pair)
                     order_text = ""
-                    if res["signal"] in ("CALL", "PUT"):
-                        expected_entry_stamp = res.get("entry_candle_timestamp")
-                        if expected_entry_stamp != candle_stamp:
-                            order_text = (
-                                "\n⛔ ENTRADA BLOQUEADA: la señal no corresponde a la vela M1 actual."
-                                f"\nVela esperada: {expected_entry_stamp}; vela actual: {candle_stamp}."
-                            )
-                        elif last_global_order_candle == candle_stamp:
-                            order_text = (
-                                "\n⛔ Entrada bloqueada: ya se intentó una operación "
-                                "en este minuto M1 (límite global de una por minuto)."
-                            )
-                        elif last_order_candle.get(pair) == candle_stamp:
-                            order_text = "\n⛔ Orden duplicada bloqueada para esta vela."
+                    if pending and pending.get("entry_candle_timestamp") == candle_stamp:
+                        if last_global_order_candle == candle_stamp:
+                            order_text = "⛔ Entrada bloqueada: ya se intentó una operación global en este minuto M1."
                         elif not ENABLE_TRADES:
-                            order_text = "\n🧪 Señal detectada; operaciones desactivadas."
+                            order_text = "🧪 Señal pendiente válida; operaciones desactivadas."
                         else:
-                            # Reserva el minuto global ANTES de enviar la orden: incluso si
-                            # IQ Option tarda o rechaza la orden, no se intenta otra en este minuto.
                             last_global_order_candle = candle_stamp
                             last_order_candle[pair] = candle_stamp
-                            ok, oid = execute_binary_order(
-                                iq, pair, res["signal"], AMOUNT, EXPIRATION
-                            )
+                            ok, oid = execute_binary_order(iq, pair, pending["signal"], AMOUNT, EXPIRATION)
                             order_text = (
-                                f"\n\n{'🧪 ORDEN ENVIADA' if ok else '⚠️ ORDEN RECHAZADA'}"
-                                f"\nPar: {pair}\nDirección: {res['signal']}"
-                                f"\nImporte: {AMOUNT:g}\nExpiración: {EXPIRATION} minuto"
-                                f"\nID/respuesta: {oid}"
+                                f"{'🧪 ORDEN ENVIADA' if ok else '⚠️ ORDEN RECHAZADA'}\n"
+                                f"Par: {pair}\nDirección: {pending['signal']}\nImporte: {AMOUNT:g}\n"
+                                f"Expiración: {EXPIRATION} minutos\nID/respuesta: {oid}"
+                            )
+                        pending_signals.pop(pair, None)
+                        telegram_reports.append(
+                            f"🎯 EJECUCIÓN PROGRAMADA\nPar: {pair}\nSeñal original: {pending['signal']}\n"
+                            f"Vela de señal: {pending['signal_candle_timestamp']}\n"
+                            f"Vela de entrada: {candle_stamp}\n{order_text}"
+                        )
+                    elif pending and candle_stamp > pending.get("entry_candle_timestamp", 0):
+                        # Si se perdió la apertura programada, no se persigue una entrada tardía.
+                        pending_signals.pop(pair, None)
+                        telegram_reports.append(f"⛔ Señal caducada en {pair}: pasó la vela programada; no se persigue la entrada.")
+
+                    # La señal se calcula solo sobre velas cerradas. Al confirmarse en S,
+                    # se programa entrada en S+2; S+1 debe cerrar primero.
+                    res = analyze_market(closed)
+                    sequence_text = res.get("sequence_text", "")
+                    logging.info("%s | segundo=%d | estocástico K=%s D=%s | señal=%s | %s",
+                                 pair, second, res.get("stoch_k"), res.get("stoch_d"), res["signal"], res["reason"])
+
+                    signal_stamp = res.get("signal_candle_timestamp")
+                    if res["signal"] in ("CALL", "PUT") and signal_stamp == closed[-1]["timestamp"]:
+                        # Evita volver a registrar la misma señal si el ciclo se repite.
+                        existing = pending_signals.get(pair)
+                        if not existing or existing.get("signal_candle_timestamp") != signal_stamp:
+                            pending_signals[pair] = {
+                                "signal": res["signal"],
+                                "signal_candle_timestamp": signal_stamp,
+                                "entry_candle_timestamp": signal_stamp + 2 * TF,
+                                "reason": res["reason"],
+                            }
+                            telegram_reports.append(
+                                f"📌 SEÑAL ESTOCÁSTICA CONFIRMADA\nPar: {pair}\nSeñal: {res['signal']}\n"
+                                f"Vela señal cerrada: {signal_stamp}\nK={res.get('stoch_k'):.2f} | D={res.get('stoch_d'):.2f}\n"
+                                f"Entrada programada: {signal_stamp + 2 * TF} (segunda vela posterior)\n{res['reason']}"
                             )
 
-                    # En Telegram se informa cada evaluación, incluso NO SIGNAL,
-                    # incluyendo las 3 velas cerradas (previa, reversión, continuidad)
-                    # y la vela M1 actual (vela en la que se intenta entrar).
-                    setup_text = "\n".join(
-                        _candle_summary(candle, idx)
-                        for idx, candle in enumerate(setup_candles, start=1)
-                    )
-                    entry_candle_text = candle_detail(
-                        current, pair, state="ACTUAL / VELA DE ENTRADA (EN FORMACIÓN)"
-                    )
+                    # Reporte de vela cerrada y valores del estocástico, sin mensajes por cada polling.
                     telegram_reports.append(
-                        f"⏱️ EVALUACIÓN M1 | vela actual, segundo {second}\n"
-                        f"Par: {pair}\nSecuencia analizada: {sequence_text}\n"
-                        f"Señal: {res['signal']}\nMotivo: {res['reason']}\n\n"
-                        f"📚 VELAS CERRADAS UTILIZADAS (PREVIA / REVERSIÓN)\n{setup_text}\n\n"
-                        f"🎯 VELA DE CONTINUIDAD / ENTRADA\n{entry_candle_text}"
-                        + ("\n" + order_text.strip() if order_text else "\nOperación: no ejecutada (sin señal).")
+                        f"📊 ANÁLISIS M1 | {pair}\nVela cerrada: {closed[-1]['timestamp']}\n"
+                        f"Color: {closed[-1]['color']} | Cierre: {_fmt_price(closed[-1]['close'])}\n"
+                        f"Estocástico K={res.get('stoch_k')} D={res.get('stoch_d')}\n"
+                        f"Señal: {res['signal']}\nMotivo: {res['reason']}"
                     )
 
                 except Exception:
