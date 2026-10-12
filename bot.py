@@ -19,7 +19,142 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import requests
 from iqoptionapi.stable_api import IQ_Option
 from iqoptionapi import constants as OP_code
-from strategy import normalize_candles, analyze_market, STOCH_K_PERIOD, STOCH_K_SMOOTH, STOCH_D_PERIOD, STOCH_OVERBOUGHT, STOCH_OVERSOLD
+# Importa strategy.py desde el mismo directorio. Si Railway no incluye ese archivo,
+# usa una implementación integrada equivalente para que bot.py pueda arrancar.
+try:
+    from strategy import (
+        normalize_candles, analyze_market,
+        STOCH_K_PERIOD, STOCH_K_SMOOTH, STOCH_D_PERIOD,
+        STOCH_OVERBOUGHT, STOCH_OVERSOLD,
+    )
+except ModuleNotFoundError as import_error:
+    if import_error.name != "strategy":
+        raise
+    from math import isfinite
+
+    logging.warning(
+        "No se encontró strategy.py; se utilizará la estrategia estocástica integrada en bot.py."
+    )
+
+    STOCH_K_PERIOD = 13
+    STOCH_K_SMOOTH = 3
+    STOCH_D_PERIOD = 3
+    STOCH_OVERBOUGHT = 80.0
+    STOCH_OVERSOLD = 20.0
+    TIMEFRAME_SECONDS = 60
+
+    def normalize_candles(raw):
+        normalized = []
+        for candle in raw or []:
+            try:
+                ts = int(candle.get("from", candle.get("at", candle.get("timestamp", 0))))
+                op = float(candle["open"])
+                close = float(candle["close"])
+                low = float(candle.get("min", candle.get("low", min(op, close))))
+                high = float(candle.get("max", candle.get("high", max(op, close))))
+                if ts <= 0 or not all(isfinite(v) for v in (op, close, low, high)):
+                    continue
+                if low > min(op, close) or high < max(op, close) or low > high:
+                    continue
+                normalized.append({
+                    "timestamp": ts, "open": op, "close": close,
+                    "min": low, "max": high, "low": low, "high": high,
+                    "range": high - low, "body": abs(close - op),
+                    "lower_wick": min(op, close) - low,
+                    "upper_wick": high - max(op, close),
+                    "color": "green" if close > op else "red" if close < op else "doji",
+                })
+            except (KeyError, TypeError, ValueError, OverflowError):
+                continue
+        unique = {c["timestamp"]: c for c in sorted(normalized, key=lambda x: x["timestamp"])}
+        return list(unique.values())
+
+    def _stochastic(candles):
+        raw_k = []
+        for i, candle in enumerate(candles):
+            if i + 1 < STOCH_K_PERIOD:
+                raw_k.append(None)
+                continue
+            window = candles[i + 1 - STOCH_K_PERIOD:i + 1]
+            highest = max(c["high"] for c in window)
+            lowest = min(c["low"] for c in window)
+            raw_k.append(50.0 if highest == lowest else
+                         100.0 * (candle["close"] - lowest) / (highest - lowest))
+        smooth_k = []
+        for i in range(len(raw_k)):
+            section = raw_k[max(0, i - STOCH_K_SMOOTH + 1):i + 1]
+            smooth_k.append(
+                None if len(section) < STOCH_K_SMOOTH or any(v is None for v in section)
+                else sum(section) / STOCH_K_SMOOTH
+            )
+        d_values = []
+        for i in range(len(smooth_k)):
+            section = smooth_k[max(0, i - STOCH_D_PERIOD + 1):i + 1]
+            d_values.append(
+                None if len(section) < STOCH_D_PERIOD or any(v is None for v in section)
+                else sum(section) / STOCH_D_PERIOD
+            )
+        return smooth_k, d_values
+
+    def analyze_market(raw):
+        candles = normalize_candles(raw)
+        result = {
+            "signal": "NO SIGNAL", "bias": "NEUTRAL", "call_score": 0, "put_score": 0,
+            "sequence": [], "sequence_text": "", "entry_timing": "SIGNAL_PLUS_2_M1",
+            "signal_candle_timestamp": None, "entry_candle_timestamp": None,
+            "stoch_k": None, "stoch_d": None, "stoch_k_previous": None,
+            "stoch_d_previous": None,
+            "reason": "Historial insuficiente para calcular el estocástico.",
+        }
+        minimum = STOCH_K_PERIOD + STOCH_K_SMOOTH + STOCH_D_PERIOD
+        if len(candles) < minimum:
+            result["reason"] = f"Historial insuficiente para estocástico: {len(candles)}/{minimum} velas."
+            return result
+        k_values, d_values = _stochastic(candles)
+        idx = len(candles) - 1
+        candle = candles[idx]
+        k_now, d_now = k_values[idx], d_values[idx]
+        k_prev, d_prev = k_values[idx - 1], d_values[idx - 1]
+        result.update({
+            "sequence": [candle["color"]],
+            "sequence_text": {"green": "V", "red": "R", "doji": "D"}.get(candle["color"], "?"),
+            "stoch_k": k_now, "stoch_d": d_now,
+            "stoch_k_previous": k_prev, "stoch_d_previous": d_prev,
+            "signal_candle_timestamp": candle["timestamp"],
+            "entry_candle_timestamp": candle["timestamp"] + 2 * TIMEFRAME_SECONDS,
+            "signal_candle_color": candle["color"],
+        })
+        if None in (k_now, d_now, k_prev, d_prev):
+            result["reason"] = "Estocástico aún no disponible."
+            return result
+        cross_up_oversold = (
+            k_prev <= d_prev and k_now > d_now and k_now > k_prev
+            and k_prev <= STOCH_OVERSOLD and d_prev <= STOCH_OVERSOLD
+            and k_now <= STOCH_OVERSOLD and d_now <= STOCH_OVERSOLD
+        )
+        cross_down_overbought = (
+            k_prev >= d_prev and k_now < d_now and k_now < k_prev
+            and k_prev >= STOCH_OVERBOUGHT and d_prev >= STOCH_OVERBOUGHT
+            and k_now >= STOCH_OVERBOUGHT and d_now >= STOCH_OVERBOUGHT
+        )
+        if cross_up_oversold and candle["color"] == "green":
+            result.update(
+                signal="CALL", bias="CALL", call_score=1,
+                reason=f"CALL: cruce K↑ sobre D en sobreventa (20), vela verde. K={k_now:.2f}, D={d_now:.2f}. Entrada en la segunda vela posterior a la señal."
+            )
+        elif cross_down_overbought and candle["color"] == "red":
+            result.update(
+                signal="PUT", bias="PUT", put_score=1,
+                reason=f"PUT: cruce K↓ bajo D en sobrecompra (80), vela roja. K={k_now:.2f}, D={d_now:.2f}. Entrada en la segunda vela posterior a la señal."
+            )
+        else:
+            result["reason"] = (
+                f"Sin señal: cruce en zona extrema y color correcto no coinciden. "
+                f"Color={candle['color']}, K={k_now:.2f}, D={d_now:.2f}, "
+                f"CALL={cross_up_oversold}, PUT={cross_down_overbought}."
+            )
+        return result
+
 
 
 PAIR = "EURUSD-OTC"
@@ -31,7 +166,7 @@ COUNT = 200
 EXPIRATION = 5
 # Importe predeterminado: mínimo habitual de IQ Option.
 # Si Railway tiene AMOUNT configurado, esa variable prevalece.
-AMOUNT = float(os.getenv("AMOUNT", "3"))
+AMOUNT = float(os.getenv("AMOUNT", "1"))
 if AMOUNT <= 0:
     raise ValueError("AMOUNT debe ser mayor que 0")
 
