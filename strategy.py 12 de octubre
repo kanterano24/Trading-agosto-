@@ -1,9 +1,14 @@
-"""Estrategia M1 con estocástico K=13, suavizado=3, D=3.
+"""Estrategia estocástica M1.
 
-CALL: K (azul) cruza arriba de D (roja) en sobreventa (20) y la vela
-señal cierra verde. PUT: K cruza abajo de D en sobrecompra (80) y la vela
-señal cierra roja. La entrada se programa para la segunda vela posterior
-al cierre de la vela de señal (se deja cerrar una vela intermedia).
+PUT: la línea azul %K cruza hacia arriba el nivel de sobrecompra (80),
+la vela de señal cierra roja; se deja cerrar una vela completa y se entra
+al inicio de la siguiente (dos velas después de la vela de señal).
+
+CALL: la línea roja %D cruza hacia abajo el nivel de sobreventa (20),
+la vela de señal cierra verde; se deja cerrar una vela completa y se entra
+al inicio de la siguiente (dos velas después de la vela de señal).
+
+Parámetros del indicador: K=13, suavizado K=3, D=3; niveles 80 y 20.
 """
 from math import isfinite
 
@@ -16,6 +21,7 @@ TIMEFRAME_SECONDS = 60
 
 
 def normalize_candles(raw):
+    """Normaliza velas de IQ Option u objetos equivalentes."""
     out = []
     for candle in raw or []:
         try:
@@ -36,7 +42,7 @@ def normalize_candles(raw):
                 "upper_wick": high - max(op, close),
                 "color": "green" if close > op else "red" if close < op else "doji",
             })
-        except (KeyError, TypeError, ValueError, OverflowError):
+        except (KeyError, TypeError, ValueError, OverflowError, AttributeError):
             continue
     unique = {c["timestamp"]: c for c in sorted(out, key=lambda x: x["timestamp"])}
     return list(unique.values())
@@ -52,29 +58,40 @@ def stochastic(candles):
         window = candles[i + 1 - STOCH_K_PERIOD:i + 1]
         highest = max(c["high"] for c in window)
         lowest = min(c["low"] for c in window)
-        raw_k.append(50.0 if highest == lowest else 100.0 * (candle["close"] - lowest) / (highest - lowest))
+        raw_k.append(50.0 if highest == lowest else
+                     100.0 * (candle["close"] - lowest) / (highest - lowest))
 
     smooth_k = []
     for i in range(len(raw_k)):
         section = raw_k[max(0, i - STOCH_K_SMOOTH + 1):i + 1]
-        smooth_k.append(None if len(section) < STOCH_K_SMOOTH or any(v is None for v in section)
-                        else sum(section) / STOCH_K_SMOOTH)
+        smooth_k.append(
+            None if len(section) < STOCH_K_SMOOTH or any(v is None for v in section)
+            else sum(section) / STOCH_K_SMOOTH
+        )
+
     d_values = []
     for i in range(len(smooth_k)):
         section = smooth_k[max(0, i - STOCH_D_PERIOD + 1):i + 1]
-        d_values.append(None if len(section) < STOCH_D_PERIOD or any(v is None for v in section)
-                         else sum(section) / STOCH_D_PERIOD)
+        d_values.append(
+            None if len(section) < STOCH_D_PERIOD or any(v is None for v in section)
+            else sum(section) / STOCH_D_PERIOD
+        )
     return smooth_k, d_values
 
 
 def analyze_market(raw):
+    """Analiza velas cerradas y devuelve CALL, PUT o NO SIGNAL.
+
+    La entrada se programa para la segunda vela posterior al cierre de señal:
+    se espera una vela intermedia completa.
+    """
     candles = normalize_candles(raw)
     result = {
         "signal": "NO SIGNAL", "bias": "NEUTRAL", "call_score": 0, "put_score": 0,
         "sequence": [], "sequence_text": "", "entry_timing": "SIGNAL_PLUS_2_M1",
         "signal_candle_timestamp": None, "entry_candle_timestamp": None,
-        "stoch_k": None, "stoch_d": None, "stoch_k_previous": None,
-        "stoch_d_previous": None,
+        "stoch_k": None, "stoch_d": None,
+        "stoch_k_previous": None, "stoch_d_previous": None,
         "reason": "Historial insuficiente para calcular el estocástico.",
     }
     minimum = STOCH_K_PERIOD + STOCH_K_SMOOTH + STOCH_D_PERIOD
@@ -100,23 +117,30 @@ def analyze_market(raw):
         result["reason"] = "Estocástico aún no disponible."
         return result
 
-    # CALL: K cruza hacia arriba de D mientras ambas líneas permanecen en sobreventa.
-    cross_up_oversold = (k_prev <= d_prev and k_now > d_now and k_now > k_prev
-                         and k_prev <= STOCH_OVERSOLD and d_prev <= STOCH_OVERSOLD
-                         and k_now <= STOCH_OVERSOLD and d_now <= STOCH_OVERSOLD)
-    # PUT: K cruza hacia abajo de D mientras ambas líneas permanecen en sobrecompra.
-    cross_down_overbought = (k_prev >= d_prev and k_now < d_now and k_now < k_prev
-                             and k_prev >= STOCH_OVERBOUGHT and d_prev >= STOCH_OVERBOUGHT
-                             and k_now >= STOCH_OVERBOUGHT and d_now >= STOCH_OVERBOUGHT)
+    # PUT: la línea azul K cruza hacia arriba el nivel 80 y la vela cierra roja.
+    k_crosses_overbought = k_prev <= STOCH_OVERBOUGHT and k_now > STOCH_OVERBOUGHT
 
-    if cross_up_oversold and candle["color"] == "green":
-        result.update(signal="CALL", bias="CALL", call_score=1,
-                      reason=f"CALL: cruce K↑ sobre D en sobreventa (20), vela verde. K={k_now:.2f}, D={d_now:.2f}. Entrada en la segunda vela posterior a la señal.")
-    elif cross_down_overbought and candle["color"] == "red":
-        result.update(signal="PUT", bias="PUT", put_score=1,
-                      reason=f"PUT: cruce K↓ bajo D en sobrecompra (80), vela roja. K={k_now:.2f}, D={d_now:.2f}. Entrada en la segunda vela posterior a la señal.")
+    # CALL: la línea roja D cruza hacia abajo el nivel 20 y la vela cierra verde.
+    d_crosses_oversold_down = d_prev >= STOCH_OVERSOLD and d_now < STOCH_OVERSOLD
+
+    if k_crosses_overbought and candle["color"] == "red":
+        result.update(
+            signal="PUT", bias="PUT", put_score=1,
+            reason=(f"PUT: K cruza hacia arriba sobrecompra 80; vela cerrada roja. "
+                    f"K={k_prev:.2f}->{k_now:.2f}, D={d_prev:.2f}->{d_now:.2f}. "
+                    "Esperar una vela completa y entrar en la siguiente; expiración gestionada por bot.py.")
+        )
+    elif d_crosses_oversold_down and candle["color"] == "green":
+        result.update(
+            signal="CALL", bias="CALL", call_score=1,
+            reason=(f"CALL: D cruza hacia abajo sobreventa 20; vela cerrada verde. "
+                    f"K={k_prev:.2f}->{k_now:.2f}, D={d_prev:.2f}->{d_now:.2f}. "
+                    "Esperar una vela completa y entrar en la siguiente; expiración gestionada por bot.py.")
+        )
     else:
-        result["reason"] = (f"Sin señal: cruce en zona extrema y color correcto no coinciden. "
-                             f"Color={candle['color']}, K={k_now:.2f}, D={d_now:.2f}, "
-                             f"CALL={cross_up_oversold}, PUT={cross_down_overbought}.")
+        result["reason"] = (
+            f"Sin señal: color o cruce de nivel no coincide. Color={candle['color']}; "
+            f"K={k_prev:.2f}->{k_now:.2f}; D={d_prev:.2f}->{d_now:.2f}; "
+            f"K cruza 80 arriba={k_crosses_overbought}; D cruza 20 abajo={d_crosses_oversold_down}."
+        )
     return result
