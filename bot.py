@@ -19,157 +19,22 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import requests
 from iqoptionapi.stable_api import IQ_Option
 from iqoptionapi import constants as OP_code
-try:
-    from strategy import (
-        normalize_candles, analyze_market,
-        STOCH_K_PERIOD, STOCH_K_SMOOTH, STOCH_D_PERIOD,
-        STOCH_OVERBOUGHT, STOCH_OVERSOLD,
-    )
-except ModuleNotFoundError as exc:
-    if exc.name != "strategy":
-        raise
-    # Respaldo autocontenido: permite arrancar si Railway omitió strategy.py.
-    import logging as _fallback_logging
-    _fallback_logging.warning(
-        "No se encontró strategy.py; se utilizará la estrategia estocástica integrada en bot.py. "
-        "Sube ambos archivos al mismo directorio para mantener una sola fuente de lógica."
-    )
-    from math import isfinite
+from strategy import (
+    normalize_candles, analyze_market,
+    STOCH_K_PERIOD, STOCH_K_SMOOTH, STOCH_D_PERIOD,
+    STOCH_OVERBOUGHT, STOCH_OVERSOLD,
+)
 
-    STOCH_K_PERIOD = 13
-    STOCH_K_SMOOTH = 3
-    STOCH_D_PERIOD = 3
-    STOCH_OVERBOUGHT = 80.0
-    STOCH_OVERSOLD = 20.0
-    TIMEFRAME_SECONDS = 60
-
-
-    def normalize_candles(raw):
-        out = []
-        for candle in raw or []:
-            try:
-                ts = int(candle.get("from", candle.get("at", candle.get("timestamp", 0))))
-                op = float(candle["open"])
-                close = float(candle["close"])
-                low = float(candle.get("min", candle.get("low", min(op, close))))
-                high = float(candle.get("max", candle.get("high", max(op, close))))
-                if ts <= 0 or not all(isfinite(x) for x in (op, close, low, high)):
-                    continue
-                if low > min(op, close) or high < max(op, close) or low > high:
-                    continue
-                out.append({
-                    "timestamp": ts, "open": op, "close": close,
-                    "min": low, "max": high, "low": low, "high": high,
-                    "range": high - low, "body": abs(close - op),
-                    "lower_wick": min(op, close) - low,
-                    "upper_wick": high - max(op, close),
-                    "color": "green" if close > op else "red" if close < op else "doji",
-                })
-            except (KeyError, TypeError, ValueError, OverflowError):
-                continue
-        unique = {c["timestamp"]: c for c in sorted(out, key=lambda x: x["timestamp"])}
-        return list(unique.values())
-
-
-    def stochastic(candles):
-        """Devuelve %K suavizado y %D para cada vela."""
-        raw_k = []
-        for i, candle in enumerate(candles):
-            if i + 1 < STOCH_K_PERIOD:
-                raw_k.append(None)
-                continue
-            window = candles[i + 1 - STOCH_K_PERIOD:i + 1]
-            highest = max(c["high"] for c in window)
-            lowest = min(c["low"] for c in window)
-            raw_k.append(50.0 if highest == lowest else 100.0 * (candle["close"] - lowest) / (highest - lowest))
-
-        smooth_k = []
-        for i in range(len(raw_k)):
-            section = raw_k[max(0, i - STOCH_K_SMOOTH + 1):i + 1]
-            smooth_k.append(None if len(section) < STOCH_K_SMOOTH or any(v is None for v in section)
-                            else sum(section) / STOCH_K_SMOOTH)
-        d_values = []
-        for i in range(len(smooth_k)):
-            section = smooth_k[max(0, i - STOCH_D_PERIOD + 1):i + 1]
-            d_values.append(None if len(section) < STOCH_D_PERIOD or any(v is None for v in section)
-                             else sum(section) / STOCH_D_PERIOD)
-        return smooth_k, d_values
-
-
-    def analyze_market(raw):
-        candles = normalize_candles(raw)
-        result = {
-            "signal": "NO SIGNAL", "bias": "NEUTRAL", "call_score": 0, "put_score": 0,
-            "sequence": [], "sequence_text": "", "entry_timing": "SIGNAL_PLUS_2_M1",
-            "signal_candle_timestamp": None, "entry_candle_timestamp": None,
-            "stoch_k": None, "stoch_d": None, "stoch_k_previous": None,
-            "stoch_d_previous": None,
-            "reason": "Historial insuficiente para calcular el estocástico.",
-        }
-        minimum = STOCH_K_PERIOD + STOCH_K_SMOOTH + STOCH_D_PERIOD
-        if len(candles) < minimum:
-            result["reason"] = f"Historial insuficiente para estocástico: {len(candles)}/{minimum} velas."
-            return result
-
-        k_values, d_values = stochastic(candles)
-        idx = len(candles) - 1
-        candle = candles[idx]
-        k_now, d_now = k_values[idx], d_values[idx]
-        k_prev, d_prev = k_values[idx - 1], d_values[idx - 1]
-        result.update({
-            "sequence": [candle["color"]],
-            "sequence_text": {"green": "V", "red": "R", "doji": "D"}.get(candle["color"], "?"),
-            "stoch_k": k_now, "stoch_d": d_now,
-            "stoch_k_previous": k_prev, "stoch_d_previous": d_prev,
-            "signal_candle_timestamp": candle["timestamp"],
-            "entry_candle_timestamp": candle["timestamp"] + 2 * TIMEFRAME_SECONDS,
-            "signal_candle_color": candle["color"],
-        })
-        if None in (k_now, d_now, k_prev, d_prev):
-            result["reason"] = "Estocástico aún no disponible."
-            return result
-
-        # LÓGICA EXACTA SOLICITADA (igual a strategy.py):
-        # PUT: K azul cruza HACIA ARRIBA el nivel de sobrecompra 80 y la vela cierra roja.
-        k_crosses_overbought_up = (k_prev <= STOCH_OVERBOUGHT and k_now > STOCH_OVERBOUGHT)
-        # CALL: D roja cruza HACIA ABAJO el nivel de sobreventa 20 y la vela cierra verde.
-        d_crosses_oversold_down = (d_prev >= STOCH_OVERSOLD and d_now < STOCH_OVERSOLD)
-
-        if k_crosses_overbought_up and candle["color"] == "red":
-            result.update(
-                signal="PUT", bias="PUT", put_score=1,
-                reason=(f"PUT: K azul cruza hacia arriba el nivel 80 y la vela cerrada es roja. "
-                        f"K={k_prev:.2f}->{k_now:.2f}; D={d_prev:.2f}->{d_now:.2f}. "
-                        "Esperar una vela completa y entrar en la siguiente.")
-            )
-        elif d_crosses_oversold_down and candle["color"] == "green":
-            result.update(
-                signal="CALL", bias="CALL", call_score=1,
-                reason=(f"CALL: D roja cruza hacia abajo el nivel 20 y la vela cerrada es verde. "
-                        f"K={k_prev:.2f}->{k_now:.2f}; D={d_prev:.2f}->{d_now:.2f}. "
-                        "Esperar una vela completa y entrar en la siguiente.")
-            )
-        else:
-            result["reason"] = (
-                f"Sin señal: se exige PUT si K cruza 80 hacia arriba y la vela es roja; "
-                f"CALL si D cruza 20 hacia abajo y la vela es verde. "
-                f"Color={candle['color']}; K={k_prev:.2f}->{k_now:.2f}; "
-                f"D={d_prev:.2f}->{d_now:.2f}; K cruza 80 arriba={k_crosses_overbought_up}; "
-                f"D cruza 20 abajo={d_crosses_oversold_down}."
-            )
-        return result
-
-
-PAIR = "EURUSD-OTC"
-PAIRS = []
-MAX_OTC_PAIRS = max(1, min(3, int(os.getenv("MAX_OTC_PAIRS", "3"))))
+PAIR = os.getenv("PAIR", "EURUSD-OTC").strip() or "EURUSD-OTC"
+PAIRS = [PAIR]  # Modo de análisis de un solo par, elegido por PAIR
+MAX_OTC_PAIRS = 1
 PAIR_REFRESH_SECONDS = 300.0
 TF = 60
 COUNT = 200
 EXPIRATION = 2
 # Importe predeterminado: mínimo habitual de IQ Option.
 # Si Railway tiene AMOUNT configurado, esa variable prevalece.
-AMOUNT = float(os.getenv("AMOUNT", "4"))
+AMOUNT = float(os.getenv("AMOUNT", "1"))
 if AMOUNT <= 0:
     raise ValueError("AMOUNT debe ser mayor que 0")
 
@@ -349,7 +214,7 @@ OPENAPI_SPEC = {
         "version": "1.0.0",
         "description": (
             "API de solo lectura para consultar las velas M1 "
-            "cerradas de EURUSD-OTC."
+            "cerradas del par configurado."
         ),
     },
     "servers": [
@@ -372,7 +237,7 @@ OPENAPI_SPEC = {
         "/candles": {
             "get": {
                 "operationId": "getCandles",
-                "summary": "Obtiene las velas M1 cerradas",
+                "summary": "Obtiene las velas M1 cerradas del único par configurado",
                 "description": (
                     "Devuelve el historial actual de velas M1 "
                     "cerradas de EURUSD-OTC."
@@ -735,6 +600,52 @@ def candle_detail(candle, pair, number=None, state="CERRADA"):
     )
 
 
+def candle_movement_report(candles, result, pair):
+    """Reporte único por vela cerrada con OHLC, movimiento y estocástico."""
+    candle = candles[-1]
+    previous = candles[-2] if len(candles) >= 2 else None
+    dt = datetime.fromtimestamp(int(candle["timestamp"])).strftime("%Y-%m-%d %H:%M:%S")
+    body = float(candle.get("body", abs(candle["close"] - candle["open"])))
+    candle_range = float(candle.get("range", candle["high"] - candle["low"]))
+    body_pct = (body / candle_range * 100.0) if candle_range > 0 else 0.0
+    if previous:
+        delta = float(candle["close"]) - float(previous["close"])
+        delta_pct = (delta / float(previous["close"]) * 100.0) if previous["close"] else 0.0
+        movement = (
+            f"Movimiento vs cierre anterior: {delta:+.10g} ({delta_pct:+.5f}%)\n"
+            f"Rango vs vela anterior: {candle_range:.10g} / "
+            f"{float(previous.get('range', previous['high'] - previous['low'])):.10g}\n"
+            f"Color anterior: {_color_label(previous.get('color'))}"
+        )
+    else:
+        movement = "Movimiento vs cierre anterior: sin dato (primera vela del historial)"
+
+    k = result.get("stoch_k")
+    d = result.get("stoch_d")
+    kp = result.get("stoch_k_previous")
+    dp = result.get("stoch_d_previous")
+    kd = result.get("stoch_k_delta")
+    dd = result.get("stoch_d_delta")
+    fmt = lambda x: "N/D" if x is None else f"{float(x):.2f}"
+    return (
+        f"📊 ANÁLISIS DE VELA CERRADA M1\nPar: {pair}\nHora apertura: {dt}\n"
+        f"Color: {_color_label(candle.get('color'))}\n"
+        f"Apertura: {_fmt_price(candle['open'])} | Cierre: {_fmt_price(candle['close'])}\n"
+        f"Máximo: {_fmt_price(candle['high'])} | Mínimo: {_fmt_price(candle['low'])}\n"
+        f"Rango: {_fmt_price(candle_range)} | Cuerpo: {_fmt_price(body)} ({body_pct:.1f}% del rango)\n"
+        f"Mecha inferior: {_fmt_price(candle.get('lower_wick', 0))} | "
+        f"Mecha superior: {_fmt_price(candle.get('upper_wick', 0))}\n"
+        f"{movement}\n\n"
+        f"📈 ESTOCÁSTICO K13 / suavizado 3 / D3\n"
+        f"K azul: {fmt(kp)} → {fmt(k)} (Δ {fmt(kd)})\n"
+        f"D roja: {fmt(dp)} → {fmt(d)} (Δ {fmt(dd)})\n"
+        f"Cruce K hacia arriba de 80: {'SÍ' if result.get('k_crosses_overbought_up') else 'NO'}\n"
+        f"Cruce D hacia abajo de 20: {'SÍ' if result.get('d_crosses_oversold_down') else 'NO'}\n"
+        f"SEÑAL: {result.get('signal', 'NO SIGNAL')}\n"
+        f"Motivo: {result.get('reason', 'Sin motivo')}"
+    )
+
+
 def candle_message(candle, number, pair=None):
     """Compatibilidad con mensajes anteriores, ahora con par explícito."""
     return candle_detail(candle, pair or PAIR, number=number, state="CERRADA")
@@ -983,175 +894,99 @@ def execute_binary_order(iq, pair, signal, amount, expiration):
 def main():
     global received_candles, PAIR, PAIRS
 
+    PAIRS = [PAIR]
     start_candles_api()
     iq = connect_retry()
     _ensure_telegram_worker()
 
-    last_closed_stamp = {}       # último cierre procesado por par
-    last_evaluated_candle = {}   # evita evaluar dos veces la misma vela
-    last_order_candle = {}       # evita duplicar una orden por par/vela
-    last_global_order_candle = None  # máximo una orden intentada en todo el bot por minuto M1
-    pending_signals = {}  # señales confirmadas que esperan su vela de entrada programada
-    last_pair_refresh = 0.0
-
-    PAIRS = discover_otc_1m_pairs(iq)
-    if not PAIRS:
-        tg("⚠️ No se encontraron pares OTC abiertos en TURBO. El bot seguirá intentando actualizar la lista.")
+    last_closed_stamp = None
+    last_evaluated_candle = None
+    last_global_order_candle = None
 
     tg(
-        "🟢 Bot iniciado\n"
-        f"Pares OTC configurados: hasta {MAX_OTC_PAIRS}\n"
-        f"Pares disponibles al iniciar: {len(PAIRS)}\n"
-        "Temporalidad de análisis: M1\n"
-        "Estrategia: cruce estocástico en zona extrema + color de vela\n"
-        "CALL: K cruza arriba de D en sobreventa 20 y vela verde\n"
-        "PUT: K cruza abajo de D en sobrecompra 80 y vela roja\n"
-        f"Estocástico: K={STOCH_K_PERIOD}, suavizado={STOCH_K_SMOOTH}, D={STOCH_D_PERIOD}, niveles={STOCH_OVERSOLD}/{STOCH_OVERBOUGHT}\n"
-        f"Entrada: segunda vela posterior a la señal M1 | Expiración: {EXPIRATION} minutos\n"
-        f"Importe por operación: {AMOUNT:g}\n"
-        "Indicadores: ninguno | S/R: no | Rechazo: no"
+        "🟢 BOT INICIADO | UN SOLO PAR OTC\n"
+        f"Par: {PAIR}\nTemporalidad: M1\n"
+        f"Estocástico: K={STOCH_K_PERIOD}, suavizado={STOCH_K_SMOOTH}, D={STOCH_D_PERIOD}; "
+        f"niveles 20/80\n"
+        "PUT: cruce K azul hacia arriba de 80 en vela roja del minuto :03; "
+        "la vela :04 debe cerrar roja; entrada al límite :05/:10/etc.\n"
+        "CALL: cruce D roja hacia abajo de 20 en vela verde del minuto :03; "
+        "la vela :04 debe cerrar verde; entrada al límite :05/:10/etc.\n"
+        f"Expiración: {EXPIRATION} minutos | Importe: {AMOUNT:g} | Cuenta: PRACTICE"
     )
 
     while True:
         try:
             if not iq.check_connect():
                 iq = connect_retry()
-                last_pair_refresh = 0.0
 
-            now_mono = time.monotonic()
-            if now_mono - last_pair_refresh >= PAIR_REFRESH_SECONDS:
-                refreshed = discover_otc_1m_pairs(iq)
-                if refreshed:
-                    old = set(PAIRS)
-                    PAIRS = refreshed
-                    # Elimina estados de pares que ya no están disponibles.
-                    active_set = set(PAIRS)
-                    for state in (last_closed_stamp, last_evaluated_candle, last_order_candle):
-                        for old_pair in list(state):
-                            if old_pair not in active_set:
-                                state.pop(old_pair, None)
-                    if set(PAIRS) != old:
-                        logging.info("Lista OTC actualizada: %d pares | %s", len(PAIRS), ", ".join(PAIRS))
-                        tg(f"🔄 Pares OTC actualizados: {len(PAIRS)}\n" + ", ".join(PAIRS))
-                else:
-                    logging.warning("No se pudo actualizar la lista OTC; se conserva la lista anterior")
-                last_pair_refresh = now_mono
-
-            if not PAIRS:
+            closed, current, server_now = get_candles(iq, PAIR)
+            if not closed or current is None:
                 time.sleep(POLL)
                 continue
 
-            # Se agrupan los informes del ciclo para enviar varias velas por mensaje
-            # y evitar que Telegram se sature cuando se analizan hasta 50 pares.
-            telegram_reports = []
+            received_candles = build_candle_api_history(closed)
+            current_stamp = int(current["timestamp"])
+            closed_stamp = int(closed[-1]["timestamp"])
 
-            # Cada ciclo revisa todos los pares descubiertos, no solo EURUSD-OTC.
-            # La disponibilidad cambia; discover_otc_1m_pairs filtra activos TURBO abiertos.
-            for pair in list(PAIRS):
-                try:
-                    closed, current, server_now = get_candles(iq, pair)
-                    if not closed:
-                        continue
+            # Procesar cada nueva vela M1 una sola vez.
+            if last_evaluated_candle == current_stamp:
+                time.sleep(POLL)
+                continue
+            last_evaluated_candle = current_stamp
 
-                    PAIR = pair
-                    received_candles = build_candle_api_history(closed)
+            result = analyze_market(closed, current_timestamp=current_stamp)
 
-                    closed_stamp = closed[-1]["timestamp"]
-                    if last_closed_stamp.get(pair) != closed_stamp:
-                        last_closed_stamp[pair] = closed_stamp
-                        telegram_reports.append(
-                            candle_message(closed[-1], len(closed), pair=pair)
-                            + f"\nHistorial cerrado disponible: {len(closed)} velas"
-                        )
+            # Enviar el detalle de cada vela cerrada a Telegram una sola vez.
+            if last_closed_stamp != closed_stamp:
+                last_closed_stamp = closed_stamp
+                tg(candle_movement_report(closed, result, PAIR))
 
-                    if current is None or len(closed) < 30:
-                        continue
+            logging.info(
+                "%s | vela_cerrada=%s | actual=%s | K=%s D=%s | señal=%s | %s",
+                PAIR, closed_stamp, current_stamp, result.get("stoch_k"),
+                result.get("stoch_d"), result.get("signal"), result.get("reason")
+            )
 
-                    second = int(server_now - current["timestamp"])
-                    candle_stamp = current["timestamp"]
-                    if last_evaluated_candle.get(pair) == candle_stamp:
-                        continue
-                    last_evaluated_candle[pair] = candle_stamp
-
-                    # Primero ejecuta una señal pendiente en la segunda vela posterior
-                    # a la vela de señal: señal S, espera el cierre de S+1, entra en S+2.
-                    pending = pending_signals.get(pair)
-                    order_text = ""
-                    if pending and pending.get("entry_candle_timestamp") == candle_stamp:
-                        if last_global_order_candle == candle_stamp:
-                            order_text = "⛔ Entrada bloqueada: ya se intentó una operación global en este minuto M1."
-                        elif not ENABLE_TRADES:
-                            order_text = "🧪 Señal pendiente válida; operaciones desactivadas."
-                        else:
-                            last_global_order_candle = candle_stamp
-                            last_order_candle[pair] = candle_stamp
-                            ok, oid = execute_binary_order(iq, pair, pending["signal"], AMOUNT, EXPIRATION)
-                            order_text = (
-                                f"{'🧪 ORDEN ENVIADA' if ok else '⚠️ ORDEN RECHAZADA'}\n"
-                                f"Par: {pair}\nDirección: {pending['signal']}\nImporte: {AMOUNT:g}\n"
-                                f"Expiración: {EXPIRATION} minutos\nID/respuesta: {oid}"
-                            )
-                        pending_signals.pop(pair, None)
-                        telegram_reports.append(
-                            f"🎯 EJECUCIÓN PROGRAMADA\nPar: {pair}\nSeñal original: {pending['signal']}\n"
-                            f"Vela de señal: {pending['signal_candle_timestamp']}\n"
-                            f"Vela de entrada: {candle_stamp}\n{order_text}"
-                        )
-                    elif pending and candle_stamp > pending.get("entry_candle_timestamp", 0):
-                        # Si se perdió la apertura programada, no se persigue una entrada tardía.
-                        pending_signals.pop(pair, None)
-                        telegram_reports.append(f"⛔ Señal caducada en {pair}: pasó la vela programada; no se persigue la entrada.")
-
-                    # La señal se calcula solo sobre velas cerradas. Al confirmarse en S,
-                    # se programa entrada en S+2; S+1 debe cerrar primero.
-                    res = analyze_market(closed)
-                    sequence_text = res.get("sequence_text", "")
-                    logging.info("%s | segundo=%d | estocástico K=%s D=%s | señal=%s | %s",
-                                 pair, second, res.get("stoch_k"), res.get("stoch_d"), res["signal"], res["reason"])
-
-                    signal_stamp = res.get("signal_candle_timestamp")
-                    if res["signal"] in ("CALL", "PUT") and signal_stamp == closed[-1]["timestamp"]:
-                        # Evita volver a registrar la misma señal si el ciclo se repite.
-                        existing = pending_signals.get(pair)
-                        if not existing or existing.get("signal_candle_timestamp") != signal_stamp:
-                            pending_signals[pair] = {
-                                "signal": res["signal"],
-                                "signal_candle_timestamp": signal_stamp,
-                                "entry_candle_timestamp": signal_stamp + 2 * TF,
-                                "reason": res["reason"],
-                            }
-                            telegram_reports.append(
-                                f"📌 SEÑAL ESTOCÁSTICA CONFIRMADA\nPar: {pair}\nSeñal: {res['signal']}\n"
-                                f"Vela señal cerrada: {signal_stamp}\nK={res.get('stoch_k'):.2f} | D={res.get('stoch_d'):.2f}\n"
-                                f"Entrada programada: {signal_stamp + 2 * TF} (segunda vela posterior)\n{res['reason']}"
-                            )
-
-                    # Reporte de vela cerrada y valores del estocástico, sin mensajes por cada polling.
-                    telegram_reports.append(
-                        f"📊 ANÁLISIS M1 | {pair}\nVela cerrada: {closed[-1]['timestamp']}\n"
-                        f"Color: {closed[-1]['color']} | Cierre: {_fmt_price(closed[-1]['close'])}\n"
-                        f"Estocástico K={res.get('stoch_k')} D={res.get('stoch_d')}\n"
-                        f"Señal: {res['signal']}\nMotivo: {res['reason']}"
+            # Solo ejecutar al abrir un bloque M5 exacto (:00, :05, :10...).
+            # No perseguir entradas si la consulta llegó tarde: tolerancia máxima 3 s.
+            if result.get("signal") in ("CALL", "PUT") and current_stamp % 300 == 0:
+                age = int(server_now) - current_stamp
+                if age < 0 or age > 3:
+                    tg(
+                        f"⛔ ENTRADA BLOQUEADA POR RETRASO\nPar: {PAIR}\n"
+                        f"Señal: {result['signal']}\nRetraso: {age}s. "
+                        "No se ejecutará tarde; se esperará al siguiente patrón válido."
+                    )
+                elif last_global_order_candle == current_stamp:
+                    tg("⛔ Entrada bloqueada: ya se intentó una operación en este límite M5.")
+                elif not ENABLE_TRADES:
+                    tg(
+                        f"🧪 SEÑAL VÁLIDA SIN EJECUTAR\nPar: {PAIR}\n"
+                        f"Dirección: {result['signal']}\nMotivo: ENABLE_TRADES está desactivado."
+                    )
+                else:
+                    last_global_order_candle = current_stamp
+                    ok, order_id = execute_binary_order(
+                        iq, PAIR, result["signal"], AMOUNT, EXPIRATION
+                    )
+                    tg(
+                        f"{'✅ ORDEN ENVIADA' if ok else '⚠️ ORDEN RECHAZADA'}\n"
+                        f"Par: {PAIR}\nDirección: {result['signal']}\n"
+                        f"Importe: {AMOUNT:g}\nExpiración: {EXPIRATION} minutos\n"
+                        f"Vela de cruce: {result.get('signal_candle_timestamp')}\n"
+                        f"Vela de confirmación: {result.get('confirmation_candle_timestamp')}\n"
+                        f"Vela de entrada: {current_stamp}\n"
+                        f"Motivo: {result.get('reason')}\nID/respuesta: {order_id}"
                     )
 
-                except Exception:
-                    logging.exception("Error procesando el par %s", pair)
-                    continue
-
-            # Un lote por ciclo (dividido en mensajes seguros para Telegram).
-            # Esto reduce drásticamente el número de envíos frente a 50 mensajes
-            # individuales por cada vela/par.
-            send_telegram_batches(telegram_reports)
-
         except Exception:
-            logging.exception("Error de ciclo principal")
+            logging.exception("Error del ciclo principal")
             try:
                 if not iq.check_connect():
                     iq = connect_retry()
-                    last_pair_refresh = 0.0
             except Exception:
                 iq = connect_retry()
-                last_pair_refresh = 0.0
 
         time.sleep(POLL)
 
