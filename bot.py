@@ -1,42 +1,46 @@
-"""bot.py — Analizador de velas cerradas M1 de un solo par IQ Option.
-Envía a Telegram cada nueva vela cerrada, sus medidas y sus clasificaciones.
-No usa indicadores, S/R, señales de entrada ni abre operaciones.
+"""bot.py — Bot IQ Option: análisis M1 y ejecución binaria en cuenta DEMO.
+Solo usa velas cerradas; sin indicadores técnicos, S/R ni rechazo como filtro.
+Variables requeridas: IQ_EMAIL, IQ_PASSWORD. Telegram es opcional.
 """
 
 import logging
 import os
 import time
+import threading
 from datetime import datetime, timezone
 
 import requests
 from iqoptionapi.stable_api import IQ_Option
-from strategy import normalize_candles, classify_candles, describe_history, format_candle
+from strategy import normalize_candles, classify_candles, analyze_market, describe_history
 
 PAIR = os.getenv("ANALYSIS_PAIR", "GBPUSD-OTC").strip().upper()
 TIMEFRAME = 60
-HISTORY_COUNT = max(100, int(os.getenv("CANDLE_COUNT_M1", "500")))
+HISTORY_COUNT = max(30, int(os.getenv("CANDLE_COUNT_M1", "300")))
 POLL_SECONDS = max(0.5, float(os.getenv("POLL_SECONDS", "1")))
 RETRY_SECONDS = max(5, int(os.getenv("RETRY_SECONDS", "15")))
+AMOUNT = float(os.getenv("AMOUNT", "5"))
+EXPIRATION_MINUTES = 1
+ACCOUNT_MODE = "PRACTICE"
 IQ_EMAIL = os.getenv("IQ_EMAIL", "").strip()
 IQ_PASSWORD = os.getenv("IQ_PASSWORD", "").strip()
 TG_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
 TG_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 SEND_INITIAL_HISTORY = os.getenv("SEND_INITIAL_HISTORY", "true").lower() in {"1", "true", "yes", "on"}
 SUMMARY_EVERY = max(1, int(os.getenv("SUMMARY_EVERY", "10")))
+TRADE_COOLDOWN_SECONDS = max(0, int(os.getenv("TRADE_COOLDOWN_SECONDS", "0")))
 
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO").upper(),
     format="%(asctime)s | %(levelname)s | %(message)s",
 )
-log = logging.getLogger("candle_analyzer")
+log = logging.getLogger("iqoption_m1_bot")
 
 
 def telegram_send(message):
     if not TG_TOKEN or not TG_CHAT_ID:
-        log.warning("Telegram no configurado; mensaje omitido.")
+        log.info("Telegram no configurado; mensaje omitido.")
         return False
     url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
-    # Telegram permite hasta 4096 caracteres; dejamos margen.
     chunks = []
     while len(message) > 3900:
         cut = message.rfind("\n", 0, 3900)
@@ -47,8 +51,7 @@ def telegram_send(message):
     chunks.append(message)
     for chunk in chunks:
         response = requests.post(
-            url,
-            data={"chat_id": TG_CHAT_ID, "text": chunk, "disable_web_page_preview": True},
+            url, data={"chat_id": TG_CHAT_ID, "text": chunk, "disable_web_page_preview": True},
             timeout=25,
         )
         response.raise_for_status()
@@ -66,7 +69,12 @@ def connect():
     connected, reason = iq.connect()
     if not connected:
         raise ConnectionError(f"No se pudo conectar a IQ Option: {reason}")
-    log.info("Conectado a IQ Option; par único: %s", PAIR)
+    # Forzar cuenta de práctica, nunca real.
+    if hasattr(iq, "change_balance"):
+        iq.change_balance(ACCOUNT_MODE)
+    elif hasattr(iq, "set_balance_mode"):
+        iq.set_balance_mode(ACCOUNT_MODE)
+    log.info("Conectado a IQ Option en DEMO. Par=%s, importe=%s, expiración=%s min", PAIR, AMOUNT, EXPIRATION_MINUTES)
     return iq
 
 
@@ -85,7 +93,6 @@ def get_closed_candles(iq):
     for candle in raw:
         try:
             start = int(float(candle.get("from", candle.get("at", 0))))
-            # Una vela se considera cerrada solo cuando acabó antes del minuto actual.
             if start > 0 and start + TIMEFRAME <= current_minute:
                 closed.append(candle)
         except (TypeError, ValueError, AttributeError):
@@ -93,45 +100,104 @@ def get_closed_candles(iq):
     return normalize_candles(closed)[-HISTORY_COUNT:]
 
 
-def candle_message(candle, index, total):
-    item = classify_candles([candle])[0]
-    # Para clasificaciones contextuales (continuidad, rupturas, inside/outside)
-    # se clasifica la historia completa en main y se pasa el objeto ya etiquetado.
-    return (
-        f"🕯 VELA M1 CERRADA | {PAIR}\n"
-        f"Historial: vela {index} | {total} velas recibidas\n"
-        f"{format_candle(index, item)}"
-    )
-
-
 def initial_history_message(candles):
     info = describe_history(candles)
     labels = sorted(info["label_counts"].items(), key=lambda x: (-x[1], x[0]))
     counts = "\n".join(f"• {name}: {count}" for name, count in labels[:18]) or "• Sin clasificaciones"
     return (
-        f"📚 HISTORIAL M1 INICIAL | {PAIR}\n"
-        f"Velas cerradas analizadas: {info['count']}\n"
+        f"📚 HISTORIAL M1 INICIAL | {PAIR}\nVelas cerradas: {info['count']}\n"
         f"Verdes: {info['greens']} | Rojas: {info['reds']} | Doji: {info['dojis']}\n"
-        f"Variación neta: {info['net_change']:.8f}\n"
-        f"Máximo del historial: {info['highest']}\nMínimo del historial: {info['lowest']}\n\n"
-        f"CLASIFICACIONES EN EL HISTORIAL:\n{counts}\n\n"
-        "Solo precio OHLC; sin indicadores y sin operaciones."
+        f"Variación neta: {info['net_change']:.8f}\nMáximo: {info['highest']}\nMínimo: {info['lowest']}\n\n"
+        f"CLASIFICACIONES:\n{counts}\n\nCuenta DEMO | Importe {AMOUNT} | Expiración 1 minuto."
     )
+
+
+def is_binary_open(iq):
+    """Si la API permite consultar horarios, evita enviar orden a un activo cerrado."""
+    try:
+        schedule = iq.get_all_open_time()
+        binary = schedule.get("binary", {})
+        if PAIR in binary:
+            return bool(binary[PAIR].get("open", False))
+        # Algunas versiones de la API no publican OTC en el diccionario.
+        return True
+    except Exception:
+        return True
+
+
+def place_trade(iq, direction, candle_ts, reason):
+    """Envía una orden binaria y valida la respuesta de la API."""
+    if not is_binary_open(iq):
+        msg = f"⏸ OPERACIÓN OMITIDA | {PAIR}\nEl activo binario figura cerrado."
+        telegram_send(msg)
+        log.warning(msg)
+        return False, None
+
+    action = "call" if direction == "call" else "put"
+    try:
+        success, order_id = iq.buy(AMOUNT, PAIR, action, EXPIRATION_MINUTES)
+    except Exception as exc:
+        log.exception("Error al enviar orden")
+        telegram_send(f"❌ ERROR DE ORDEN | {PAIR}\nDirección: {action.upper()}\nDetalle: {exc}")
+        return False, None
+
+    if not success:
+        telegram_send(
+            f"❌ ORDEN RECHAZADA | {PAIR}\nDirección: {action.upper()}\n"
+            f"Importe: {AMOUNT}\nExpiración: {EXPIRATION_MINUTES} minuto\n"
+            f"Respuesta API: {order_id}"
+        )
+        log.error("Orden rechazada por IQ Option: %s", order_id)
+        return False, None
+
+    opened_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    msg = (
+        f"🟢 OPERACIÓN DEMO ACEPTADA | {PAIR}\n"
+        f"Dirección: {action.upper()}\nImporte: {AMOUNT}\n"
+        f"Expiración: {EXPIRATION_MINUTES} minuto\nID: {order_id}\n"
+        f"Vela señal (UTC): {datetime.fromtimestamp(candle_ts, tz=timezone.utc):%Y-%m-%d %H:%M:%S}\n"
+        f"Enviada: {opened_at}\nClasificación: {reason}"
+    )
+    telegram_send(msg)
+    log.info("Orden aceptada: %s %s id=%s", PAIR, action.upper(), order_id)
+    return True, order_id
+
+
+def check_result(iq, order_id):
+    """Consulta el resultado si esta versión de iqoptionapi expone check_win_v4."""
+    if order_id is None or not hasattr(iq, "check_win_v4"):
+        return
+    try:
+        result = iq.check_win_v4(order_id)
+        if result is None:
+            return
+        value = float(result)
+        if value > 0:
+            status = f"GANADA (+{value:.2f})"
+        elif value < 0:
+            status = f"PERDIDA ({value:.2f})"
+        else:
+            status = "EMPATE (0.00)"
+        telegram_send(f"📊 RESULTADO DEMO | {PAIR}\nID: {order_id}\n{status}")
+    except Exception:
+        log.exception("No se pudo consultar el resultado de la operación %s", order_id)
 
 
 def main():
     iq = connect()
     telegram_send(
-        f"🟢 ANALIZADOR M1 CONECTADO\n\nPar único: {PAIR}\n"
-        f"Historial objetivo: {HISTORY_COUNT} velas cerradas\n"
-        "Clasifica fuerza, impulso/momentum, reversión, continuidad, indecisión, "
-        "doji, descanso, rechazo, ruptura, inside bar, outside bar, expansión "
-        "y compresión de rango.\n\n"
-        "Sin indicadores técnicos. Sin operaciones."
+        f"🟢 BOT IQ OPTION INICIADO\n\nPar: {PAIR}\nTimeframe: M1\n"
+        f"Cuenta: DEMO/PRACTICE\nImporte: {AMOUNT}\nExpiración: 1 minuto\n"
+        "Señal: clasificación de velas cerradas (fuerza, impulso, continuidad, "
+        "reversión o ruptura direccional).\nSin indicadores técnicos, sin S/R y sin rechazo como filtro."
     )
 
-    last_reported = 0
+    last_seen_candle = None
+    last_traded_candle = None
+    last_trade_wallclock = 0.0
     last_summary_count = 0
+    last_reported_count = 0
+
     while True:
         try:
             try:
@@ -140,6 +206,8 @@ def main():
                     connected, reason = iq.connect()
                     if not connected:
                         raise ConnectionError(reason)
+                    if hasattr(iq, "change_balance"):
+                        iq.change_balance(ACCOUNT_MODE)
             except AttributeError:
                 pass
 
@@ -149,43 +217,63 @@ def main():
                 continue
 
             classified = classify_candles(candles)
-            if last_reported == 0:
+            if last_seen_candle is None:
                 if SEND_INITIAL_HISTORY:
                     telegram_send(initial_history_message(candles))
-                    # Envía el historial completo inicial por bloques.
-                    for start in range(0, len(classified), 5):
+                    # Reporte detallado limitado a las últimas 20 velas para no saturar Telegram.
+                    for start in range(max(0, len(classified) - 20), len(classified), 5):
                         batch = classified[start:start + 5]
-                        text = f"📜 HISTORIAL DETALLADO | {PAIR} | velas {start + 1}-{start + len(batch)}\n\n"
-                        text += "\n\n".join(format_candle(start + j + 1, c) for j, c in enumerate(batch))
-                        telegram_send(text)
-                last_reported = candles[-1]["timestamp"]
+                        lines = []
+                        for j, c in enumerate(batch, start + 1):
+                            dt = datetime.fromtimestamp(c["timestamp"], tz=timezone.utc)
+                            lines.append(
+                                f'{j:04d} | {dt:%H:%M:%S} UTC | {c["color"]} | '
+                                f'O={c["open"]:.6f} H={c["high"]:.6f} L={c["low"]:.6f} C={c["close"]:.6f}\n'
+                                f'Rango={c["range"]:.6f} cuerpo={c["body_pct"]:.1f}% '
+                                f'mechas sup/inf={c["upper_wick_pct"]:.1f}%/{c["lower_wick_pct"]:.1f}%\n'
+                                f'Tipos: {", ".join(c["labels"])}'
+                            )
+                        telegram_send(f"📜 HISTORIAL M1 | {PAIR}\n\n" + "\n\n".join(lines))
+                last_seen_candle = candles[-1]["timestamp"]
+                last_reported_count = len(candles)
                 last_summary_count = len(candles)
                 time.sleep(POLL_SECONDS)
                 continue
 
-            new_indices = [i for i, c in enumerate(candles) if c["timestamp"] > last_reported]
-            for i in new_indices:
-                candle = classified[i]
-                message = (
-                    f"🕯 VELA M1 CERRADA | {PAIR}\n"
-                    f"Hora: {datetime.fromtimestamp(candle['timestamp'], tz=timezone.utc):%Y-%m-%d %H:%M:%S UTC}\n"
-                    f"Color: {candle['color']}\n"
-                    f"O={candle['open']:.8f} H={candle['high']:.8f} "
-                    f"L={candle['low']:.8f} C={candle['close']:.8f}\n"
-                    f"Rango={candle['range']:.8f} | Cuerpo={candle['body']:.8f} "
-                    f"({candle['body_pct']:.1f}%)\n"
-                    f"Mecha superior={candle['upper_wick']:.8f} "
-                    f"({candle['upper_wick_pct']:.1f}%)\n"
-                    f"Mecha inferior={candle['lower_wick']:.8f} "
-                    f"({candle['lower_wick_pct']:.1f}%)\n"
-                    f"Clasificación: {', '.join(candle['labels'])}\n"
-                    f"Velas cerradas disponibles: {len(candles)}"
-                )
-                telegram_send(message)
-                last_reported = candle["timestamp"]
-                log.info("%s cerrada: %s", PAIR, ", ".join(candle["labels"]))
+            # Procesa únicamente velas nuevas y cerradas. Si hubo desconexión, procesa
+            # solo la vela cerrada más reciente para no ejecutar señales atrasadas.
+            new_indices = [i for i, c in enumerate(candles) if c["timestamp"] > last_seen_candle]
+            if len(new_indices) > 1:
+                new_indices = [new_indices[-1]]
 
-                # Informe periódico de resumen; no afecta a la clasificación.
+            for i in new_indices:
+                candle = candles[i]
+                analysis = analyze_market(candles[:i + 1])
+                labels = ", ".join(analysis.get("latest", {}).get("labels", [])) or "Sin clasificación"
+                dt = datetime.fromtimestamp(candle["timestamp"], tz=timezone.utc)
+                telegram_send(
+                    f"🕯 VELA M1 CERRADA | {PAIR}\nHora UTC: {dt:%Y-%m-%d %H:%M:%S}\n"
+                    f"Color: {analysis.get('latest', {}).get('color', 'N/D')}\n"
+                    f"Tipos: {labels}\nSeñal: {analysis['signal'].upper()}\n"
+                    f"Motivo: {analysis['reason']}"
+                )
+
+                if analysis["signal"] in ("call", "put"):
+                    signal_ts = candle["timestamp"]
+                    elapsed = time.time() - last_trade_wallclock
+                    if signal_ts == last_traded_candle:
+                        log.info("Señal duplicada omitida para la vela %s", signal_ts)
+                    elif TRADE_COOLDOWN_SECONDS and elapsed < TRADE_COOLDOWN_SECONDS:
+                        log.info("Señal omitida por cooldown de %s segundos", TRADE_COOLDOWN_SECONDS)
+                    else:
+                        ok, order_id = place_trade(iq, analysis["signal"], signal_ts, analysis["reason"])
+                        if ok:
+                            last_traded_candle = signal_ts
+                            last_trade_wallclock = time.time()
+                            threading.Thread(target=check_result, args=(iq, order_id), daemon=True).start()
+
+                last_seen_candle = candle["timestamp"]
+
                 if len(candles) >= last_summary_count + SUMMARY_EVERY:
                     telegram_send(initial_history_message(candles))
                     last_summary_count = len(candles)
@@ -193,10 +281,10 @@ def main():
             time.sleep(POLL_SECONDS)
 
         except KeyboardInterrupt:
-            log.info("Analizador detenido.")
+            log.info("Bot detenido por usuario.")
             break
         except Exception:
-            log.exception("Error en ciclo de análisis")
+            log.exception("Error en ciclo principal")
             time.sleep(RETRY_SECONDS)
 
 
