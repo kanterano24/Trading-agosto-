@@ -5,13 +5,29 @@ Variables requeridas: IQ_EMAIL, IQ_PASSWORD. Telegram es opcional.
 
 import logging
 import os
+import sys
 import time
 import threading
 from datetime import datetime, timezone
 
 import requests
 from iqoptionapi.stable_api import IQ_Option
-from strategy import normalize_candles, classify_candles, analyze_market, describe_history
+
+# Asegura que Python busque strategy.py junto a este archivo, incluso si
+# Railway cambia el directorio de trabajo al iniciar el proceso.
+BOT_DIR = os.path.dirname(os.path.abspath(__file__))
+if BOT_DIR not in sys.path:
+    sys.path.insert(0, BOT_DIR)
+
+try:
+    from strategy import normalize_candles, classify_candles, analyze_market, describe_history
+except ModuleNotFoundError as exc:
+    if exc.name == "strategy":
+        raise ModuleNotFoundError(
+            "No se encuentra strategy.py junto a bot.py. "
+            f"Directorio del bot: {BOT_DIR}. Sube ambos archivos a la raíz del repositorio."
+        ) from exc
+    raise
 
 PAIR = os.getenv("ANALYSIS_PAIR", "GBPUSD-OTC").strip().upper()
 TIMEFRAME = 60
