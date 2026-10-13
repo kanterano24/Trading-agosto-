@@ -24,15 +24,15 @@ from strategy import normalize_candles, analyze_market
 
 PAIR = os.getenv("PAIR", "USDZAR-OTC").strip().upper()
 PAIRS = []
-MAX_OTC_PAIRS = max(1, min(50, int(os.getenv("MAX_OTC_PAIRS", "1"))))
-AUTO_DISCOVER_PAIRS = os.getenv("AUTO_DISCOVER_PAIRS", "false").lower() in ("1", "true", "yes", "si")
+MAX_OTC_PAIRS = 4  # Configuración solicitada: analizar cuatro pares OTC
+AUTO_DISCOVER_PAIRS = True  # Descubrir automáticamente cuatro pares OTC disponibles
 PAIR_REFRESH_SECONDS = 300.0
 TF = 60
 COUNT = 200
-EXPIRATION = 2
+EXPIRATION = 1
 # Importe predeterminado: mínimo habitual de IQ Option.
 # Si Railway tiene AMOUNT configurado, esa variable prevalece.
-AMOUNT = float(os.getenv("AMOUNT", "10"))
+AMOUNT = float(os.getenv("AMOUNT", "5"))
 if AMOUNT <= 0:
     raise ValueError("AMOUNT debe ser mayor que 0")
 
@@ -878,10 +878,10 @@ def main():
         f"Modo pares: {'auto' if AUTO_DISCOVER_PAIRS else 'fijo'}\n"
         f"Pares disponibles al iniciar: {len(PAIRS)}\n"
         "Temporalidad: M1\n"
-        "Estrategia: reversión confirmada + entrada en vela de continuidad\n"
-        "PUT: previa verde; reversión roja cierra bajo el mínimo previo\n"
-        "CALL: previa roja; reversión verde cierra sobre el máximo previo\n"
-        f"Entrada: durante la siguiente vela M1 (continuidad) | Expiración: {EXPIRATION} minuto\n"
+        "Estrategia: impulso a favor de la tendencia (acción del precio)\n"
+        "CALL: tendencia alcista + vela de impulso verde\n"
+        "PUT: tendencia bajista + vela de impulso roja\n"
+        f"Entrada: siguiente vela M1 después del impulso | Expiración: {EXPIRATION} minuto\n"
         f"Importe por operación: {AMOUNT:g}\n"
         "Indicadores: ninguno | S/R: no | Rechazo: no"
     )
@@ -944,7 +944,7 @@ def main():
                             + f"\nHistorial cerrado disponible: {len(closed)} velas"
                         )
 
-                    if current is None or len(closed) < 2:
+                    if current is None or len(closed) < 4:
                         continue
 
                     second = int(server_now - current["timestamp"])
@@ -959,7 +959,7 @@ def main():
 
                     # Evita ejecutar una señal antigua si IQ Option entregó velas
                     # desfasadas: la vela de entrada esperada debe ser la actual.
-                    setup_candles = closed[-2:]
+                    setup_candles = closed[-4:]
                     res = analyze_market(setup_candles)
                     sequence_text = "-".join(
                         {"green": "V", "red": "R", "doji": "D"}.get(x, "?")
@@ -977,11 +977,6 @@ def main():
                             order_text = (
                                 "\n⛔ ENTRADA BLOQUEADA: la señal no corresponde a la vela M1 actual."
                                 f"\nVela esperada: {expected_entry_stamp}; vela actual: {candle_stamp}."
-                            )
-                        elif last_global_order_candle == candle_stamp:
-                            order_text = (
-                                "\n⛔ Entrada bloqueada: ya se intentó una operación "
-                                "en este minuto M1 (límite global de una por minuto)."
                             )
                         elif last_order_candle.get(pair) == candle_stamp:
                             order_text = "\n⛔ Orden duplicada bloqueada para esta vela."
@@ -1016,7 +1011,7 @@ def main():
                         f"⏱️ EVALUACIÓN M1 | vela actual, segundo {second}\n"
                         f"Par: {pair}\nSecuencia analizada: {sequence_text}\n"
                         f"Señal: {res['signal']}\nMotivo: {res['reason']}\n\n"
-                        f"📚 VELAS CERRADAS UTILIZADAS (PREVIA / REVERSIÓN)\n{setup_text}\n\n"
+                        f"📚 VELAS CERRADAS UTILIZADAS (TENDENCIA / IMPULSO)\n{setup_text}\n\n"
                         f"🎯 VELA DE CONTINUIDAD / ENTRADA\n{entry_candle_text}"
                         + ("\n" + order_text.strip() if order_text else "\nOperación: no ejecutada (sin señal).")
                     )

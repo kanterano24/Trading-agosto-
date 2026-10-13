@@ -1,15 +1,9 @@
-"""Estrategia M1: vela previa + reversión cerrada; entrada en continuidad.
+"""Estrategia M1 de impulso a favor de la tendencia, solo acción del precio.
 
-PUT:
-  1) Vela previa verde.
-  2) Vela de reversión roja que cierra por debajo del mínimo de la previa.
-  3) La entrada PUT se intenta en la vela M1 inmediatamente siguiente
-     a la reversión (vela de continuidad, aún en formación).
-
-CALL: patrón contrario: previa roja; reversión verde cierra por encima
- del máximo previo; entrada CALL en la siguiente vela M1.
-
-Solo acción del precio. Sin indicadores, S/R ni rechazo.
+CALL: tendencia reciente alcista + última vela cerrada de impulso alcista.
+PUT: tendencia reciente bajista + última vela cerrada de impulso bajista.
+La orden se intenta en la vela M1 siguiente a la vela de impulso.
+No usa indicadores técnicos, S/R ni rechazo como filtro independiente.
 """
 
 
@@ -18,7 +12,7 @@ def _finite(value):
 
 
 def normalize_candles(raw):
-    """Normaliza velas de IQ Option, ordena por tiempo y quita duplicados."""
+    """Normaliza velas IQ Option, elimina inválidas/duplicadas y ordena por tiempo."""
     out = []
     for candle in raw or []:
         try:
@@ -32,10 +26,11 @@ def normalize_candles(raw):
             if high < max(op, cl) or low > min(op, cl) or low > high:
                 continue
             candle_range = high - low
+            body = abs(cl - op)
             out.append({
                 "timestamp": ts, "open": op, "close": cl,
                 "min": low, "max": high, "low": low, "high": high,
-                "range": candle_range, "body": abs(cl - op),
+                "range": candle_range, "body": body,
                 "lower_wick": min(op, cl) - low,
                 "upper_wick": high - max(op, cl),
                 "color": "green" if cl > op else "red" if cl < op else "doji",
@@ -66,64 +61,77 @@ def format_candle(index, candle):
 
 
 def analyze_market(raw):
-    """Detecta reversión en las últimas dos velas cerradas.
+    """Busca tendencia direccional en cierres recientes y una vela de impulso.
 
-    La señal se ejecuta durante la vela actual, que es la vela de continuidad.
+    La tendencia se confirma con 3 cambios consecutivos de cierre en la misma
+    dirección entre las últimas 4 velas cerradas. La última debe tener cuerpo
+    >= 60% de su rango y cerrar en el 25% extremo de la dirección del impulso.
+    La entrada corresponde a la vela M1 que comienza después del impulso.
     """
     candles = normalize_candles(raw)
-    if len(candles) < 2:
-        sequence = [c["color"] for c in candles]
-        return {
-            "signal": "NO SIGNAL", "bias": "NEUTRAL", "call_score": 0,
-            "put_score": 0,
-            "reason": f"Historial insuficiente: {len(candles)}/2 velas cerradas",
-            "sequence": sequence,
-            "sequence_text": "-".join({"green": "V", "red": "R", "doji": "D"}[x] for x in sequence),
-            "entry_timing": "CONTINUATION_CANDLE",
-            "entry_candle_timestamp": None,
-        }
-
-    previous, reversal = candles[-2:]
-    sequence = [previous["color"], reversal["color"]]
     color_code = {"green": "V", "red": "R", "doji": "D"}
-    sequence_text = "-".join(color_code[x] for x in sequence)
-
-    put_setup = (
-        previous["color"] == "green"
-        and reversal["color"] == "red"
-        and reversal["close"] < previous["low"]
-    )
-    call_setup = (
-        previous["color"] == "red"
-        and reversal["color"] == "green"
-        and reversal["close"] > previous["high"]
-    )
-
-    if put_setup:
-        signal = "PUT"
-        reason = ("PUT: vela previa verde; reversión roja cerró por debajo del mínimo "
-                  "previo. Entrada en la vela M1 siguiente (continuidad).")
-    elif call_setup:
-        signal = "CALL"
-        reason = ("CALL: vela previa roja; reversión verde cerró por encima del máximo "
-                  "previo. Entrada en la vela M1 siguiente (continuidad).")
-    else:
-        signal = "NO SIGNAL"
-        reason = ("Sin señal: se requieren dos velas cerradas; verde + reversión roja "
-                  "que cierre bajo el mínimo previo para PUT, o el patrón contrario para CALL.")
-
-    return {
-        "signal": signal,
-        "bias": signal if signal in ("CALL", "PUT") else "NEUTRAL",
-        "call_score": int(signal == "CALL"),
-        "put_score": int(signal == "PUT"),
-        "reason": reason,
-        "sequence": sequence,
-        "sequence_text": sequence_text,
-        "entry_timing": "CONTINUATION_CANDLE",
-        "previous_candle_timestamp": previous["timestamp"],
-        "reversal_candle_timestamp": reversal["timestamp"],
-        "confirmation_candle_timestamp": reversal["timestamp"],
-        "continuation_candle_timestamp": reversal["timestamp"] + 60,
-        "entry_candle_timestamp": reversal["timestamp"] + 60,
+    sequence = [c["color"] for c in candles[-4:]]
+    sequence_text = "-".join(color_code[c] for c in sequence)
+    base = {
+        "signal": "NO SIGNAL", "bias": "NEUTRAL", "call_score": 0,
+        "put_score": 0, "sequence": sequence, "sequence_text": sequence_text,
+        "entry_timing": "NEXT_M1_AFTER_IMPULSE", "entry_candle_timestamp": None,
+        "trend": "NEUTRAL", "impulse": False,
     }
+    if len(candles) < 4:
+        base["reason"] = f"Historial insuficiente: {len(candles)}/4 velas cerradas"
+        return base
+
+    recent = candles[-4:]
+    closes = [c["close"] for c in recent]
+    rises = all(closes[i] > closes[i - 1] for i in range(1, 4))
+    falls = all(closes[i] < closes[i - 1] for i in range(1, 4))
+    last = recent[-1]
+    candle_range = last["range"]
+    body_ratio = (last["body"] / candle_range) if candle_range > 0 else 0.0
+    close_position = ((last["close"] - last["low"]) / candle_range) if candle_range > 0 else 0.5
+    impulse_up = (
+        last["color"] == "green" and body_ratio >= 0.60 and close_position >= 0.75
+    )
+    impulse_down = (
+        last["color"] == "red" and body_ratio >= 0.60 and close_position <= 0.25
+    )
+
+    signal = "NO SIGNAL"
+    if rises and impulse_up:
+        signal = "CALL"
+        base["trend"] = "ALCISTA"
+        base["reason"] = (
+            f"CALL: tendencia alcista confirmada por 3 cierres ascendentes; "
+            f"impulso verde con cuerpo {body_ratio:.1%} del rango y cierre cerca del máximo."
+        )
+    elif falls and impulse_down:
+        signal = "PUT"
+        base["trend"] = "BAJISTA"
+        base["reason"] = (
+            f"PUT: tendencia bajista confirmada por 3 cierres descendentes; "
+            f"impulso rojo con cuerpo {body_ratio:.1%} del rango y cierre cerca del mínimo."
+        )
+    else:
+        if rises:
+            base["trend"] = "ALCISTA"
+        elif falls:
+            base["trend"] = "BAJISTA"
+        if not (rises or falls):
+            base["reason"] = "Sin señal: no hay tendencia direccional confirmada en los últimos 4 cierres."
+        elif not (impulse_up or impulse_down):
+            base["reason"] = (
+                f"Sin señal: tendencia {base['trend'].lower()}, pero la última vela no cumple "
+                f"el criterio de impulso (cuerpo={body_ratio:.1%}, posición de cierre={close_position:.1%})."
+            )
+        else:
+            base["reason"] = "Sin señal: el impulso no coincide con la dirección de la tendencia."
+
+    base["signal"] = signal
+    base["bias"] = signal if signal in ("CALL", "PUT") else base["trend"]
+    base["call_score"] = int(signal == "CALL")
+    base["put_score"] = int(signal == "PUT")
+    base["impulse"] = impulse_up or impulse_down
+    base["impulse_timestamp"] = last["timestamp"]
+    base["entry_candle_timestamp"] = last["timestamp"] + 60
+    return base
