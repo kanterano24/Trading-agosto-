@@ -28,25 +28,9 @@ try:
 except ModuleNotFoundError as import_error:
     if import_error.name != "strategy":
         raise
-    # Respaldo integrado: Railway puede arrancar incluso si olvidan subir strategy.py.
+    # Respaldo idéntico para que bot.py conserve compatibilidad si falta strategy.py.
     logging.basicConfig(level=logging.INFO)
-    logging.warning("No se encontró strategy.py; usando la misma estrategia integrada en bot.py")
-    """Estrategia estocástica M1 con ventana exacta para entrada en límites M5.
-
-    PUT:
-      1) La vela de señal abre en minuto :03, %K azul cruza HACIA ARRIBA 80,
-         y esa vela cierra roja.
-      2) La vela siguiente (:04) también cierra roja como confirmación.
-      3) La entrada se habilita únicamente al inicio del siguiente bloque M5 (:05, :10...).
-
-    CALL:
-      1) La vela de señal abre en minuto :03, %D roja cruza HACIA ABAJO 20,
-         y esa vela cierra verde.
-      2) La vela siguiente (:04) también cierra verde como confirmación.
-      3) La entrada se habilita únicamente al inicio del siguiente bloque M5.
-
-    Parámetros: K=13, suavizado K=3, D=3; niveles 80/20.
-    """
+    logging.warning("No se encontró strategy.py; usando la estrategia de velas integrada en bot.py")
     from math import isfinite
 
     STOCH_K_PERIOD = 13
@@ -55,8 +39,7 @@ except ModuleNotFoundError as import_error:
     STOCH_OVERBOUGHT = 80.0
     STOCH_OVERSOLD = 20.0
     TIMEFRAME_SECONDS = 60
-    BLOCK_SECONDS = 300
-
+    STRONG_BODY_RATIO = 0.60
 
     def normalize_candles(raw):
         out = []
@@ -71,10 +54,13 @@ except ModuleNotFoundError as import_error:
                     continue
                 if low > min(op, close) or high < max(op, close) or low > high:
                     continue
+                rng = high - low
+                body = abs(close - op)
                 out.append({
                     "timestamp": ts, "open": op, "close": close,
                     "min": low, "max": high, "low": low, "high": high,
-                    "range": high - low, "body": abs(close - op),
+                    "range": rng, "body": body,
+                    "body_ratio": body / rng if rng > 0 else 0.0,
                     "lower_wick": min(op, close) - low,
                     "upper_wick": high - max(op, close),
                     "color": "green" if close > op else "red" if close < op else "doji",
@@ -83,35 +69,6 @@ except ModuleNotFoundError as import_error:
                 continue
         unique = {c["timestamp"]: c for c in sorted(out, key=lambda x: x["timestamp"])}
         return list(unique.values())
-
-
-    def stochastic(candles):
-        """Calcula %K suavizado y %D, devolviendo una posición por vela."""
-        raw_k = []
-        for i, candle in enumerate(candles):
-            if i + 1 < STOCH_K_PERIOD:
-                raw_k.append(None)
-                continue
-            window = candles[i + 1 - STOCH_K_PERIOD:i + 1]
-            highest = max(c["high"] for c in window)
-            lowest = min(c["low"] for c in window)
-            raw_k.append(50.0 if highest == lowest else 100.0 * (candle["close"] - lowest) / (highest - lowest))
-
-        smooth_k = []
-        for i in range(len(raw_k)):
-            section = raw_k[max(0, i - STOCH_K_SMOOTH + 1):i + 1]
-            smooth_k.append(None if len(section) < STOCH_K_SMOOTH or any(v is None for v in section)
-                            else sum(section) / STOCH_K_SMOOTH)
-
-        d_values = []
-        for i in range(len(smooth_k)):
-            section = smooth_k[max(0, i - STOCH_D_PERIOD + 1):i + 1]
-            d_values.append(None if len(section) < STOCH_D_PERIOD or any(v is None for v in section)
-                            else sum(section) / STOCH_D_PERIOD)
-        return smooth_k, d_values
-
-
-    STRONG_BODY_RATIO = 0.60
 
     def analyze_market(raw, current_timestamp=None):
         candles = normalize_candles(raw)
@@ -127,42 +84,43 @@ except ModuleNotFoundError as import_error:
         if len(candles) < 3:
             result["reason"] = f"Historial insuficiente: {len(candles)}/3 velas cerradas."
             return result
-        first, reversal, continuation = candles[-3:]
+        force, reversal, continuation = candles[-3:]
         result.update({
-            "sequence": [first["color"], reversal["color"], continuation["color"]],
+            "sequence": [force["color"], reversal["color"], continuation["color"]],
             "sequence_text": "-".join({"green": "V", "red": "R", "doji": "D"}[c["color"]]
-                                      for c in (first, reversal, continuation)),
+                                      for c in (force, reversal, continuation)),
             "signal_candle_timestamp": reversal["timestamp"],
             "confirmation_candle_timestamp": continuation["timestamp"],
             "entry_candle_timestamp": int(current_timestamp) if current_timestamp is not None
                                       else continuation["timestamp"] + TIMEFRAME_SECONDS,
-            "first_candle": first, "reversal_candle": reversal,
+            "first_candle": force, "reversal_candle": reversal,
             "continuation_candle": continuation,
         })
-        strong_first = first["range"] > 0 and first["body"] / first["range"] >= STRONG_BODY_RATIO
-        # La continuidad no puede superar el extremo contrario de la vela de fuerza.
-        put_pattern = (strong_first and first["color"] == "green" and reversal["color"] == "red"
-                       and continuation["color"] == "red" and continuation["close"] < reversal["low"]
-                       and continuation["high"] <= first["high"])
-        call_pattern = (strong_first and first["color"] == "red" and reversal["color"] == "green"
-                        and continuation["color"] == "green" and continuation["close"] > reversal["high"]
-                        and continuation["low"] >= first["low"])
+        strong_force = force["range"] > 0 and force["body_ratio"] >= STRONG_BODY_RATIO
+        put_pattern = (strong_force and force["color"] == "green"
+                       and reversal["color"] == "red" and continuation["color"] == "red"
+                       and continuation["high"] <= force["open"])
+        call_pattern = (strong_force and force["color"] == "red"
+                        and reversal["color"] == "green" and continuation["color"] == "green"
+                        and continuation["low"] >= force["open"])
         if put_pattern:
             result.update({"signal": "PUT", "bias": "PUT", "put_score": 1,
-                "reason": (f"PUT: vela 1 verde fuerte ({first['body']/first['range']:.0%} del rango); "
-                           f"vela 2 roja; vela 3 roja cierra por debajo del mínimo de vela 2 "
-                           "sin superar el máximo de la vela de fuerza. Entrada en la siguiente M1.")})
+                "reason": (f"PUT válido: fuerza verde ({force['body_ratio']:.0%} del rango), "
+                           f"reversión roja y continuidad roja. Máximo de continuidad "
+                           f"({continuation['high']}) <= apertura de fuerza ({force['open']}). "
+                           "Entrada al abrir la siguiente vela M1.")})
         elif call_pattern:
             result.update({"signal": "CALL", "bias": "CALL", "call_score": 1,
-                "reason": (f"CALL: vela 1 roja fuerte ({first['body']/first['range']:.0%} del rango); "
-                           f"vela 2 verde; vela 3 verde cierra por encima del máximo de vela 2 "
-                           "sin perforar el mínimo de la vela de fuerza. Entrada en la siguiente M1.")})
+                "reason": (f"CALL válido: fuerza roja ({force['body_ratio']:.0%} del rango), "
+                           f"reversión verde y continuidad verde. Mínimo de continuidad "
+                           f"({continuation['low']}) >= apertura de fuerza ({force['open']}). "
+                           "Entrada al abrir la siguiente vela M1.")})
         else:
-            ratio = first["body"] / first["range"] if first["range"] > 0 else 0.0
-            result["reason"] = (f"Sin señal: patrón de 3 velas no confirmado; vela 1 fuerte >= "
-                f"{STRONG_BODY_RATIO:.0%}; PUT=verde-roja-roja y cierre 3 bajo mínimo 2; "
-                f"CALL=roja-verde-verde y cierre 3 sobre máximo 2. "
-                f"Secuencia={result['sequence_text']}; cuerpo/rango vela 1={ratio:.0%}.")
+            result["reason"] = ("Sin señal: fuerza >= 60% del rango, reversión de color contrario "
+                "y continuidad del color de reversión. PUT=verde-roja-roja con máximo de "
+                "continuidad <= apertura de fuerza; CALL=roja-verde-verde con mínimo de "
+                f"continuidad >= apertura de fuerza. Secuencia={result['sequence_text']}; "
+                f"cuerpo/rango de fuerza={force['body_ratio']:.0%}.")
         return result
 
 PAIR = os.getenv("PAIR", "EURUSD-OTC").strip() or "EURUSD-OTC"
@@ -174,7 +132,7 @@ TF = 60
 COUNT = 200
 EXPIRATION = 1
 # Importe predeterminado solicitado: 5. Si AMOUNT está definido en Railway, prevalece.
-AMOUNT = float(os.getenv("AMOUNT", "13"))
+AMOUNT = float(os.getenv("AMOUNT", "7"))
 if AMOUNT <= 0:
     raise ValueError("AMOUNT debe ser mayor que 0")
 
