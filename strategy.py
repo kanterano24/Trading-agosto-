@@ -1,8 +1,8 @@
 """Estrategia M1 de impulso a favor de la tendencia, solo acción del precio.
 
-CALL: tendencia reciente alcista + última vela cerrada de impulso alcista.
-PUT: tendencia reciente bajista + última vela cerrada de impulso bajista.
-La orden se intenta en la vela M1 siguiente a la vela de impulso.
+Confirma la dirección usando 5 velas M1 cerradas: los 4 cambios entre cierres
+deben ser ascendentes o descendentes, y la quinta vela debe ser un impulso
+en esa misma dirección. La orden se intenta en la sexta vela M1.
 No usa indicadores técnicos, S/R ni rechazo como filtro independiente.
 """
 
@@ -61,31 +61,31 @@ def format_candle(index, candle):
 
 
 def analyze_market(raw):
-    """Busca tendencia direccional en cierres recientes y una vela de impulso.
+    """Confirma con 5 velas cerradas y entra durante la sexta vela M1.
 
-    La tendencia se confirma con 3 cambios consecutivos de cierre en la misma
-    dirección entre las últimas 4 velas cerradas. La última debe tener cuerpo
-    >= 60% de su rango y cerrar en el 25% extremo de la dirección del impulso.
-    La entrada corresponde a la vela M1 que comienza después del impulso.
+    Los 4 cambios entre los cierres de las 5 velas deben apuntar en la misma
+    dirección. La quinta vela debe ser un impulso en esa dirección: cuerpo
+    >= 60% de su rango y cierre en el 25% extremo correspondiente.
+    No utiliza indicadores, S/R ni rechazo como filtro independiente.
     """
     candles = normalize_candles(raw)
     color_code = {"green": "V", "red": "R", "doji": "D"}
-    sequence = [c["color"] for c in candles[-4:]]
+    sequence = [c["color"] for c in candles[-5:]]
     sequence_text = "-".join(color_code[c] for c in sequence)
     base = {
         "signal": "NO SIGNAL", "bias": "NEUTRAL", "call_score": 0,
         "put_score": 0, "sequence": sequence, "sequence_text": sequence_text,
-        "entry_timing": "NEXT_M1_AFTER_IMPULSE", "entry_candle_timestamp": None,
+        "entry_timing": "SIXTH_M1_AFTER_FIVE_CLOSED", "entry_candle_timestamp": None,
         "trend": "NEUTRAL", "impulse": False,
     }
-    if len(candles) < 4:
-        base["reason"] = f"Historial insuficiente: {len(candles)}/4 velas cerradas"
+    if len(candles) < 5:
+        base["reason"] = f"Historial insuficiente: {len(candles)}/5 velas cerradas"
         return base
 
-    recent = candles[-4:]
+    recent = candles[-5:]
     closes = [c["close"] for c in recent]
-    rises = all(closes[i] > closes[i - 1] for i in range(1, 4))
-    falls = all(closes[i] < closes[i - 1] for i in range(1, 4))
+    rises = all(closes[i] > closes[i - 1] for i in range(1, 5))
+    falls = all(closes[i] < closes[i - 1] for i in range(1, 5))
     last = recent[-1]
     candle_range = last["range"]
     body_ratio = (last["body"] / candle_range) if candle_range > 0 else 0.0
@@ -102,14 +102,14 @@ def analyze_market(raw):
         signal = "CALL"
         base["trend"] = "ALCISTA"
         base["reason"] = (
-            f"CALL: tendencia alcista confirmada por 3 cierres ascendentes; "
+            f"CALL: tendencia alcista confirmada por 5 velas cerradas y 4 cierres ascendentes; "
             f"impulso verde con cuerpo {body_ratio:.1%} del rango y cierre cerca del máximo."
         )
     elif falls and impulse_down:
         signal = "PUT"
         base["trend"] = "BAJISTA"
         base["reason"] = (
-            f"PUT: tendencia bajista confirmada por 3 cierres descendentes; "
+            f"PUT: tendencia bajista confirmada por 5 velas cerradas y 4 cierres descendentes; "
             f"impulso rojo con cuerpo {body_ratio:.1%} del rango y cierre cerca del mínimo."
         )
     else:
@@ -118,7 +118,7 @@ def analyze_market(raw):
         elif falls:
             base["trend"] = "BAJISTA"
         if not (rises or falls):
-            base["reason"] = "Sin señal: no hay tendencia direccional confirmada en los últimos 4 cierres."
+            base["reason"] = "Sin señal: las 5 velas cerradas no confirman una dirección con 4 cambios de cierre consecutivos."
         elif not (impulse_up or impulse_down):
             base["reason"] = (
                 f"Sin señal: tendencia {base['trend'].lower()}, pero la última vela no cumple "
