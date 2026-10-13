@@ -29,10 +29,10 @@ AUTO_DISCOVER_PAIRS = os.getenv("AUTO_DISCOVER_PAIRS", "false").lower() in ("1",
 PAIR_REFRESH_SECONDS = 300.0
 TF = 60
 COUNT = 200
-EXPIRATION = 1
+EXPIRATION = 2
 # Importe predeterminado: mínimo habitual de IQ Option.
 # Si Railway tiene AMOUNT configurado, esa variable prevalece.
-AMOUNT = float(os.getenv("AMOUNT", "5"))
+AMOUNT = float(os.getenv("AMOUNT", "10"))
 if AMOUNT <= 0:
     raise ValueError("AMOUNT debe ser mayor que 0")
 
