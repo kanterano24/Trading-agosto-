@@ -1,11 +1,15 @@
-"""strategy.py — Clasificación de velas M1 usando exclusivamente precio OHLC.
-No utiliza indicadores técnicos, niveles S/R ni lógica de ejecución de operaciones.
+"""strategy.py — Clasificación de velas M1 y generación de señales por acción del precio.
+Usa exclusivamente velas cerradas OHLC: sin indicadores técnicos, S/R ni filtro de rechazo.
 """
 
 from datetime import datetime, timezone
 from statistics import median
 
 TIMEFRAME_SECONDS = 60
+ACTIONABLE_LABELS = {
+    "FUERZA", "IMPULSO", "CONTINUIDAD", "RUPTURA ALCISTA", "RUPTURA BAJISTA",
+    "REVERSIÓN (ENVOLVENTE)", "POSIBLE REVERSIÓN",
+}
 
 
 def normalize_candles(raw):
@@ -46,7 +50,7 @@ def candle_anatomy(candle):
 
 
 def classify_candles(raw):
-    """Devuelve todas las velas con una o más etiquetas descriptivas."""
+    """Clasifica cada vela; las categorías descriptivas pueden coexistir."""
     candles = normalize_candles(raw)
     result = []
     ranges = [c["high"] - c["low"] for c in candles]
@@ -54,12 +58,9 @@ def classify_candles(raw):
         x = candle_anatomy(raw_c)
         prev = candle_anatomy(candles[i - 1]) if i else None
         labels = []
-        body_pct = x["body_pct"]
-        close_pos = x["close_position_pct"]
-        rng = x["range"]
+        body_pct, close_pos, rng = x["body_pct"], x["close_position_pct"], x["range"]
         avg_range = median(ranges[max(0, i - 10):i]) if i else 0.0
 
-        # Categorías de forma/cuerpo
         if rng == 0 or body_pct <= 10:
             labels.append("DOJI")
         elif body_pct <= 25:
@@ -69,22 +70,22 @@ def classify_candles(raw):
 
         if body_pct >= 60 and (close_pos >= 80 or close_pos <= 20):
             labels.append("FUERZA")
-        if (body_pct >= 55 and close_pos >= 70 and x["color"] == "VERDE") or (
-            body_pct >= 55 and close_pos <= 30 and x["color"] == "ROJA"
+        if body_pct >= 55 and (
+            (close_pos >= 70 and x["color"] == "VERDE") or
+            (close_pos <= 30 and x["color"] == "ROJA")
         ):
             labels.append("IMPULSO")
 
         if prev:
-            prev_body_top = max(prev["open"], prev["close"])
-            prev_body_bottom = min(prev["open"], prev["close"])
-            cur_body_top = max(x["open"], x["close"])
-            cur_body_bottom = min(x["open"], x["close"])
+            prev_body_top, prev_body_bottom = max(prev["open"], prev["close"]), min(prev["open"], prev["close"])
+            cur_body_top, cur_body_bottom = max(x["open"], x["close"]), min(x["open"], x["close"])
             if x["high"] <= prev["high"] and x["low"] >= prev["low"]:
                 labels.append("INSIDE BAR")
             if x["high"] > prev["high"] and x["low"] < prev["low"]:
                 labels.append("OUTSIDE BAR")
             if x["color"] == prev["color"] and x["color"] != "DOJI" and body_pct >= 30:
                 labels.append("CONTINUIDAD")
+
             bullish_engulf = (
                 prev["color"] == "ROJA" and x["color"] == "VERDE"
                 and cur_body_top >= prev_body_top and cur_body_bottom <= prev_body_bottom
@@ -103,7 +104,7 @@ def classify_candles(raw):
             elif x["close"] < prev["low"]:
                 labels.append("RUPTURA BAJISTA")
 
-            # Rechazo se describe por la mecha dominante; no se usa como filtro de entrada.
+            # El rechazo se informa como descripción, nunca como filtro de entrada.
             if x["upper_wick"] >= max(x["body"] * 1.5, rng * 0.35) and close_pos < 65:
                 labels.append("RECHAZO SUPERIOR")
             if x["lower_wick"] >= max(x["body"] * 1.5, rng * 0.35) and close_pos > 35:
@@ -120,6 +121,43 @@ def classify_candles(raw):
         x["index"] = i + 1
         result.append(x)
     return result
+
+
+def analyze_market(raw):
+    """Evalúa las últimas velas cerradas y devuelve CALL, PUT o NO SIGNAL.
+
+    Para abrir una operación la última vela debe ser direccional y tener al menos
+    una etiqueta accionable. La dirección se determina por el color/cierre de la
+    vela; no se usa rechazo como filtro independiente.
+    """
+    items = classify_candles(raw)
+    if not items:
+        return {"signal": "NO SIGNAL", "reason": "No hay velas cerradas válidas", "candles": []}
+
+    latest = items[-1]
+    labels = set(latest["labels"])
+    actionable = labels.intersection(ACTIONABLE_LABELS)
+    if not actionable:
+        return {
+            "signal": "NO SIGNAL",
+            "reason": "La última vela no tiene una clasificación direccional de entrada.",
+            "latest": latest, "candles": items,
+        }
+    if latest["color"] == "VERDE":
+        signal = "call"
+    elif latest["color"] == "ROJA":
+        signal = "put"
+    else:
+        signal = "NO SIGNAL"
+
+    if signal == "NO SIGNAL":
+        reason = "La última vela es doji/indecisa; no se opera."
+    else:
+        reason = "Clasificación direccional: " + ", ".join(sorted(actionable))
+    return {
+        "signal": signal, "reason": reason, "latest": latest,
+        "sequence": [x["color"] for x in items], "candles": items,
+    }
 
 
 def describe_history(raw):
@@ -154,18 +192,3 @@ def format_candle(index, candle):
         f'Mecha inf={x["lower_wick"]:.8f} ({x["lower_wick_pct"]:.1f}%)\n'
         f'Tipos: {labels}'
     )
-
-
-def analyze_market(raw):
-    """Análisis descriptivo, no genera señales de trading."""
-    items = classify_candles(raw)
-    if not items:
-        return {"signal": "NO SIGNAL", "reason": "No hay velas cerradas válidas", "candles": []}
-    latest = items[-1]
-    return {
-        "signal": "NO SIGNAL",
-        "reason": "Modo de análisis: clasificación de acción del precio; operaciones desactivadas.",
-        "latest": latest,
-        "sequence": [x["color"] for x in items],
-        "candles": items,
-    }
