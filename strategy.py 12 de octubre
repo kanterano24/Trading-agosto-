@@ -1,124 +1,171 @@
-"""Estrategia M1: fuerza, reversión y continuidad.
-
-PUT: vela de fuerza verde, reversión roja y continuidad roja cuyo máximo
-no supera la APERTURA de la vela de fuerza. Señal para la vela siguiente.
-CALL: patrón inverso; fuerza roja, reversión verde y continuidad verde cuyo
-mínimo no queda por debajo de la APERTURA de la vela de fuerza.
+"""strategy.py — Clasificación de velas M1 usando exclusivamente precio OHLC.
+No utiliza indicadores técnicos, niveles S/R ni lógica de ejecución de operaciones.
 """
-from math import isfinite
 
-# Constantes conservadas para compatibilidad con bot.py.
-STOCH_K_PERIOD = 13
-STOCH_K_SMOOTH = 3
-STOCH_D_PERIOD = 3
-STOCH_OVERBOUGHT = 80.0
-STOCH_OVERSOLD = 20.0
+from datetime import datetime, timezone
+from statistics import median
+
 TIMEFRAME_SECONDS = 60
-STRONG_BODY_RATIO = 0.60
 
 
 def normalize_candles(raw):
-    """Normaliza velas de IQ Option y descarta registros inválidos."""
-    out = []
-    for candle in raw or []:
+    """Normaliza velas de IQ Option, elimina inválidas/duplicadas y ordena por tiempo."""
+    out = {}
+    for item in raw or []:
         try:
-            ts = int(candle.get("from", candle.get("at", candle.get("timestamp", 0))))
-            op = float(candle["open"])
-            close = float(candle["close"])
-            low = float(candle.get("min", candle.get("low", min(op, close))))
-            high = float(candle.get("max", candle.get("high", max(op, close))))
-            if ts <= 0 or not all(isfinite(x) for x in (op, close, low, high)):
+            ts = int(float(item.get("from", item.get("timestamp", item.get("at", 0)))))
+            o = float(item["open"])
+            h = float(item.get("max", item.get("high")))
+            lo = float(item.get("min", item.get("low")))
+            c = float(item["close"])
+            if ts <= 0 or not all(map(lambda x: x == x and abs(x) != float("inf"), (o, h, lo, c))):
                 continue
-            if low > min(op, close) or high < max(op, close) or low > high:
+            if h < max(o, lo, c) or lo > min(o, h, c):
                 continue
-            rng = high - low
-            body = abs(close - op)
-            out.append({
-                "timestamp": ts, "open": op, "close": close,
-                "min": low, "max": high, "low": low, "high": high,
-                "range": rng, "body": body,
-                "body_ratio": body / rng if rng > 0 else 0.0,
-                "lower_wick": min(op, close) - low,
-                "upper_wick": high - max(op, close),
-                "color": "green" if close > op else "red" if close < op else "doji",
-            })
+            out[ts] = {"timestamp": ts, "open": o, "high": h, "low": lo, "close": c}
         except (KeyError, TypeError, ValueError, OverflowError, AttributeError):
             continue
-    unique = {c["timestamp"]: c for c in sorted(out, key=lambda x: x["timestamp"])}
-    return list(unique.values())
+    return [out[k] for k in sorted(out)]
 
 
-def analyze_market(raw, current_timestamp=None):
-    """Evalúa fuerza + reversión + continuidad usando solo velas cerradas."""
-    candles = normalize_candles(raw)
-    result = {
-        "signal": "NO SIGNAL", "bias": "NEUTRAL", "call_score": 0, "put_score": 0,
-        "sequence": [], "sequence_text": "", "entry_timing": "NEXT_M1_CANDLE",
-        "signal_candle_timestamp": None, "confirmation_candle_timestamp": None,
-        "entry_candle_timestamp": None, "stoch_k": None, "stoch_d": None,
-        "stoch_k_previous": None, "stoch_d_previous": None,
-        "reason": "Se necesitan tres velas M1 cerradas para evaluar el patrón.",
-        "first_candle": None, "reversal_candle": None, "continuation_candle": None,
+def candle_anatomy(candle):
+    o, h, lo, c = (float(candle[k]) for k in ("open", "high", "low", "close"))
+    span = max(0.0, h - lo)
+    body = abs(c - o)
+    upper = max(0.0, h - max(o, c))
+    lower = max(0.0, min(o, c) - lo)
+    color = "VERDE" if c > o else "ROJA" if c < o else "DOJI"
+    return {
+        **candle, "color": color, "range": span, "body": body,
+        "body_pct": body / span * 100 if span else 0.0,
+        "upper_wick": upper, "lower_wick": lower,
+        "upper_wick_pct": upper / span * 100 if span else 0.0,
+        "lower_wick_pct": lower / span * 100 if span else 0.0,
+        "close_position_pct": (c - lo) / span * 100 if span else 50.0,
     }
-    if len(candles) < 3:
-        result["reason"] = f"Historial insuficiente: {len(candles)}/3 velas cerradas."
-        return result
 
-    force, reversal, continuation = candles[-3:]
-    result.update({
-        "sequence": [force["color"], reversal["color"], continuation["color"]],
-        "sequence_text": "-".join({"green": "V", "red": "R", "doji": "D"}[c["color"]]
-                                  for c in (force, reversal, continuation)),
-        "signal_candle_timestamp": reversal["timestamp"],
-        "confirmation_candle_timestamp": continuation["timestamp"],
-        "entry_candle_timestamp": int(current_timestamp) if current_timestamp is not None
-                                  else continuation["timestamp"] + TIMEFRAME_SECONDS,
-        "first_candle": force, "reversal_candle": reversal,
-        "continuation_candle": continuation,
-    })
 
-    strong_force = force["range"] > 0 and force["body_ratio"] >= STRONG_BODY_RATIO
-    # Regla solicitada: la continuidad se compara con la APERTURA de la vela de fuerza,
-    # no con su máximo/mínimo ni con el extremo de la vela de reversión.
-    put_pattern = (
-        strong_force and force["color"] == "green"
-        and reversal["color"] == "red" and continuation["color"] == "red"
-        and continuation["high"] <= force["open"]
-    )
-    call_pattern = (
-        strong_force and force["color"] == "red"
-        and reversal["color"] == "green" and continuation["color"] == "green"
-        and continuation["low"] >= force["open"]
-    )
+def classify_candles(raw):
+    """Devuelve todas las velas con una o más etiquetas descriptivas."""
+    candles = normalize_candles(raw)
+    result = []
+    ranges = [c["high"] - c["low"] for c in candles]
+    for i, raw_c in enumerate(candles):
+        x = candle_anatomy(raw_c)
+        prev = candle_anatomy(candles[i - 1]) if i else None
+        labels = []
+        body_pct = x["body_pct"]
+        close_pos = x["close_position_pct"]
+        rng = x["range"]
+        avg_range = median(ranges[max(0, i - 10):i]) if i else 0.0
 
-    if put_pattern:
-        result.update({
-            "signal": "PUT", "bias": "PUT", "put_score": 1,
-            "reason": (
-                f"PUT válido: fuerza verde ({force['body_ratio']:.0%} del rango), "
-                f"reversión roja y continuidad roja. Máximo de continuidad "
-                f"({continuation['high']}) <= apertura de fuerza ({force['open']}). "
-                "Entrada al abrir la siguiente vela M1."
-            ),
-        })
-    elif call_pattern:
-        result.update({
-            "signal": "CALL", "bias": "CALL", "call_score": 1,
-            "reason": (
-                f"CALL válido: fuerza roja ({force['body_ratio']:.0%} del rango), "
-                f"reversión verde y continuidad verde. Mínimo de continuidad "
-                f"({continuation['low']}) >= apertura de fuerza ({force['open']}). "
-                "Entrada al abrir la siguiente vela M1."
-            ),
-        })
-    else:
-        ratio = force["body_ratio"]
-        result["reason"] = (
-            "Sin señal: se requiere fuerza (cuerpo >= 60% del rango), reversión "
-            "de color contrario y continuidad del color de la reversión. "
-            "PUT: fuerza verde + roja + roja, con máximo de continuidad <= apertura "
-            "de fuerza. CALL: fuerza roja + verde + verde, con mínimo de continuidad "
-            f">= apertura de fuerza. Secuencia={result['sequence_text']}; "
-            f"cuerpo/rango de fuerza={ratio:.0%}."
-        )
+        # Categorías de forma/cuerpo
+        if rng == 0 or body_pct <= 10:
+            labels.append("DOJI")
+        elif body_pct <= 25:
+            labels.append("INDECISIÓN")
+        elif body_pct <= 35 and max(x["upper_wick_pct"], x["lower_wick_pct"]) >= 45:
+            labels.append("DESCANSO")
+
+        if body_pct >= 60 and (close_pos >= 80 or close_pos <= 20):
+            labels.append("FUERZA")
+        if (body_pct >= 55 and close_pos >= 70 and x["color"] == "VERDE") or (
+            body_pct >= 55 and close_pos <= 30 and x["color"] == "ROJA"
+        ):
+            labels.append("IMPULSO")
+
+        if prev:
+            prev_body_top = max(prev["open"], prev["close"])
+            prev_body_bottom = min(prev["open"], prev["close"])
+            cur_body_top = max(x["open"], x["close"])
+            cur_body_bottom = min(x["open"], x["close"])
+            if x["high"] <= prev["high"] and x["low"] >= prev["low"]:
+                labels.append("INSIDE BAR")
+            if x["high"] > prev["high"] and x["low"] < prev["low"]:
+                labels.append("OUTSIDE BAR")
+            if x["color"] == prev["color"] and x["color"] != "DOJI" and body_pct >= 30:
+                labels.append("CONTINUIDAD")
+            bullish_engulf = (
+                prev["color"] == "ROJA" and x["color"] == "VERDE"
+                and cur_body_top >= prev_body_top and cur_body_bottom <= prev_body_bottom
+            )
+            bearish_engulf = (
+                prev["color"] == "VERDE" and x["color"] == "ROJA"
+                and cur_body_top >= prev_body_top and cur_body_bottom <= prev_body_bottom
+            )
+            if bullish_engulf or bearish_engulf:
+                labels.append("REVERSIÓN (ENVOLVENTE)")
+            elif prev["color"] != x["color"] and x["color"] != "DOJI" and body_pct >= 40:
+                labels.append("POSIBLE REVERSIÓN")
+
+            if x["close"] > prev["high"]:
+                labels.append("RUPTURA ALCISTA")
+            elif x["close"] < prev["low"]:
+                labels.append("RUPTURA BAJISTA")
+
+            # Rechazo se describe por la mecha dominante; no se usa como filtro de entrada.
+            if x["upper_wick"] >= max(x["body"] * 1.5, rng * 0.35) and close_pos < 65:
+                labels.append("RECHAZO SUPERIOR")
+            if x["lower_wick"] >= max(x["body"] * 1.5, rng * 0.35) and close_pos > 35:
+                labels.append("RECHAZO INFERIOR")
+
+            if avg_range > 0 and rng >= avg_range * 1.5 and body_pct >= 45:
+                labels.append("EXPANSIÓN DE RANGO")
+            if avg_range > 0 and rng <= avg_range * 0.55:
+                labels.append("RANGO COMPRIMIDO")
+
+        if not labels:
+            labels.append("VELA NORMAL")
+        x["labels"] = list(dict.fromkeys(labels))
+        x["index"] = i + 1
+        result.append(x)
     return result
+
+
+def describe_history(raw):
+    items = classify_candles(raw)
+    greens = sum(x["color"] == "VERDE" for x in items)
+    reds = sum(x["color"] == "ROJA" for x in items)
+    dojis = sum(x["color"] == "DOJI" for x in items)
+    label_counts = {}
+    for candle in items:
+        for label in candle["labels"]:
+            label_counts[label] = label_counts.get(label, 0) + 1
+    return {
+        "candles": items, "count": len(items), "greens": greens, "reds": reds,
+        "dojis": dojis,
+        "sequence": " ".join("V" if x["color"] == "VERDE" else "R" if x["color"] == "ROJA" else "D" for x in items),
+        "highest": max((x["high"] for x in items), default=None),
+        "lowest": min((x["low"] for x in items), default=None),
+        "net_change": items[-1]["close"] - items[0]["open"] if items else 0.0,
+        "label_counts": label_counts,
+    }
+
+
+def format_candle(index, candle):
+    x = candle if "labels" in candle and "body_pct" in candle else candle_anatomy(candle)
+    dt = datetime.fromtimestamp(int(x["timestamp"]), tz=timezone.utc)
+    labels = ", ".join(x.get("labels", ["SIN CLASIFICAR"]))
+    return (
+        f'{index:04d} | {dt:%Y-%m-%d %H:%M:%S} UTC | {x["color"]}\n'
+        f'O={x["open"]:.8f} H={x["high"]:.8f} L={x["low"]:.8f} C={x["close"]:.8f}\n'
+        f'Rango={x["range"]:.8f} | Cuerpo={x["body"]:.8f} ({x["body_pct"]:.1f}%)\n'
+        f'Mecha sup={x["upper_wick"]:.8f} ({x["upper_wick_pct"]:.1f}%) | '
+        f'Mecha inf={x["lower_wick"]:.8f} ({x["lower_wick_pct"]:.1f}%)\n'
+        f'Tipos: {labels}'
+    )
+
+
+def analyze_market(raw):
+    """Análisis descriptivo, no genera señales de trading."""
+    items = classify_candles(raw)
+    if not items:
+        return {"signal": "NO SIGNAL", "reason": "No hay velas cerradas válidas", "candles": []}
+    latest = items[-1]
+    return {
+        "signal": "NO SIGNAL",
+        "reason": "Modo de análisis: clasificación de acción del precio; operaciones desactivadas.",
+        "latest": latest,
+        "sequence": [x["color"] for x in items],
+        "candles": items,
+    }
