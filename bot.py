@@ -219,7 +219,7 @@ except ModuleNotFoundError as exc:
             f'Tipos: {labels}'
         )
 
-PAIR = os.getenv("ANALYSIS_PAIR", "GBPUSD-OTC").strip().upper()
+PAIR = os.getenv("ANALYSIS_PAIR", "USDZAR-OTC").strip().upper()
 TIMEFRAME = 60
 HISTORY_COUNT = max(30, int(os.getenv("CANDLE_COUNT_M1", "300")))
 POLL_SECONDS = max(0.5, float(os.getenv("POLL_SECONDS", "1")))
