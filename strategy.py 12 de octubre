@@ -85,15 +85,19 @@ def analyze_market(raw, current_timestamp=None):
     })
 
     strong_first = first["range"] > 0 and first["body_ratio"] >= STRONG_BODY_RATIO
+    # La continuidad no puede invalidar/superar el extremo contrario de la
+    # vela de fuerza: PUT no supera su máximo; CALL no perfora su mínimo.
     put_pattern = (
         strong_first and first["color"] == "green"
         and reversal["color"] == "red" and continuation["color"] == "red"
         and continuation["close"] < reversal["low"]
+        and continuation["high"] <= first["high"]
     )
     call_pattern = (
         strong_first and first["color"] == "red"
         and reversal["color"] == "green" and continuation["color"] == "green"
         and continuation["close"] > reversal["high"]
+        and continuation["low"] >= first["low"]
     )
 
     if put_pattern:
@@ -102,7 +106,8 @@ def analyze_market(raw, current_timestamp=None):
             "reason": (
                 f"PUT: vela 1 verde fuerte (cuerpo/rango={first['body_ratio']:.0%}); "
                 f"vela 2 roja; vela 3 roja cierra {continuation['close']} por debajo "
-                f"del mínimo de vela 2 ({reversal['low']}). Entrada en la siguiente M1."
+                f"del mínimo de vela 2 ({reversal['low']}) y no supera el máximo "
+                f"de la vela de fuerza ({first['high']}). Entrada en la siguiente M1."
             ),
         })
     elif call_pattern:
@@ -118,8 +123,9 @@ def analyze_market(raw, current_timestamp=None):
         result["reason"] = (
             f"Sin señal: se requieren 3 velas cerradas; vela 1 fuerte >= "
             f"{STRONG_BODY_RATIO:.0%} del rango; PUT=verde fuerte-roja-roja con "
-            f"cierre 3 bajo mínimo 2; CALL=roja fuerte-verde-verde con cierre 3 "
-            f"sobre máximo 2. Secuencia={result['sequence_text']}; "
+            f"cierre 3 bajo mínimo 2 y máximo 3 <= máximo vela 1; "
+            f"CALL=roja fuerte-verde-verde con cierre 3 sobre máximo 2 y "
+            f"mínimo 3 >= mínimo vela 1. Secuencia={result['sequence_text']}; "
             f"cuerpo/rango vela 1={first['body_ratio']:.0%}."
         )
     return result
