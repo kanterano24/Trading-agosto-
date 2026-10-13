@@ -140,20 +140,23 @@ except ModuleNotFoundError as import_error:
             "continuation_candle": continuation,
         })
         strong_first = first["range"] > 0 and first["body"] / first["range"] >= STRONG_BODY_RATIO
+        # La continuidad no puede superar el extremo contrario de la vela de fuerza.
         put_pattern = (strong_first and first["color"] == "green" and reversal["color"] == "red"
-                       and continuation["color"] == "red" and continuation["close"] < reversal["low"])
+                       and continuation["color"] == "red" and continuation["close"] < reversal["low"]
+                       and continuation["high"] <= first["high"])
         call_pattern = (strong_first and first["color"] == "red" and reversal["color"] == "green"
-                        and continuation["color"] == "green" and continuation["close"] > reversal["high"])
+                        and continuation["color"] == "green" and continuation["close"] > reversal["high"]
+                        and continuation["low"] >= first["low"])
         if put_pattern:
             result.update({"signal": "PUT", "bias": "PUT", "put_score": 1,
                 "reason": (f"PUT: vela 1 verde fuerte ({first['body']/first['range']:.0%} del rango); "
-                           f"vela 2 roja; vela 3 roja cierra por debajo del mínimo de vela 2. "
-                           "Entrada en la siguiente M1.")})
+                           f"vela 2 roja; vela 3 roja cierra por debajo del mínimo de vela 2 "
+                           "sin superar el máximo de la vela de fuerza. Entrada en la siguiente M1.")})
         elif call_pattern:
             result.update({"signal": "CALL", "bias": "CALL", "call_score": 1,
                 "reason": (f"CALL: vela 1 roja fuerte ({first['body']/first['range']:.0%} del rango); "
-                           f"vela 2 verde; vela 3 verde cierra por encima del máximo de vela 2. "
-                           "Entrada en la siguiente M1.")})
+                           f"vela 2 verde; vela 3 verde cierra por encima del máximo de vela 2 "
+                           "sin perforar el mínimo de la vela de fuerza. Entrada en la siguiente M1.")})
         else:
             ratio = first["body"] / first["range"] if first["range"] > 0 else 0.0
             result["reason"] = (f"Sin señal: patrón de 3 velas no confirmado; vela 1 fuerte >= "
@@ -171,7 +174,7 @@ TF = 60
 COUNT = 200
 EXPIRATION = 1
 # Importe predeterminado solicitado: 5. Si AMOUNT está definido en Railway, prevalece.
-AMOUNT = float(os.getenv("AMOUNT", "5"))
+AMOUNT = float(os.getenv("AMOUNT", "13"))
 if AMOUNT <= 0:
     raise ValueError("AMOUNT debe ser mayor que 0")
 
