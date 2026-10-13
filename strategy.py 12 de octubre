@@ -1,20 +1,13 @@
-"""Estrategia de acción del precio basada en tres velas M1 cerradas.
+"""Estrategia M1: fuerza, reversión y continuidad.
 
-PUT:
-  1. Vela 1 verde fuerte (cuerpo >= 60% de su rango).
-  2. Vela 2 roja (reversión).
-  3. Vela 3 roja y cierre por debajo del mínimo de la vela 2 (continuidad).
-  4. Ejecutar PUT al abrir la vela M1 siguiente.
-
-CALL: patrón inverso: vela 1 roja fuerte, vela 2 verde, vela 3 verde
-que cierra por encima del máximo de la vela 2; ejecutar CALL en la siguiente.
-
-No utiliza indicadores. Los valores STOCH_* se conservan por compatibilidad con
-bot.py y herramientas de reporte, pero no intervienen en las señales.
+PUT: vela de fuerza verde, reversión roja y continuidad roja cuyo máximo
+no supera la APERTURA de la vela de fuerza. Señal para la vela siguiente.
+CALL: patrón inverso; fuerza roja, reversión verde y continuidad verde cuyo
+mínimo no queda por debajo de la APERTURA de la vela de fuerza.
 """
 from math import isfinite
 
-# Constantes conservadas para compatibilidad con el bot existente.
+# Constantes conservadas para compatibilidad con bot.py.
 STOCH_K_PERIOD = 13
 STOCH_K_SMOOTH = 3
 STOCH_D_PERIOD = 3
@@ -56,7 +49,7 @@ def normalize_candles(raw):
 
 
 def analyze_market(raw, current_timestamp=None):
-    """Evalúa solo las últimas tres velas cerradas y prepara entrada en la siguiente."""
+    """Evalúa fuerza + reversión + continuidad usando solo velas cerradas."""
     candles = normalize_candles(raw)
     result = {
         "signal": "NO SIGNAL", "bias": "NEUTRAL", "call_score": 0, "put_score": 0,
@@ -71,61 +64,61 @@ def analyze_market(raw, current_timestamp=None):
         result["reason"] = f"Historial insuficiente: {len(candles)}/3 velas cerradas."
         return result
 
-    first, reversal, continuation = candles[-3:]
+    force, reversal, continuation = candles[-3:]
     result.update({
-        "sequence": [first["color"], reversal["color"], continuation["color"]],
+        "sequence": [force["color"], reversal["color"], continuation["color"]],
         "sequence_text": "-".join({"green": "V", "red": "R", "doji": "D"}[c["color"]]
-                                  for c in (first, reversal, continuation)),
+                                  for c in (force, reversal, continuation)),
         "signal_candle_timestamp": reversal["timestamp"],
         "confirmation_candle_timestamp": continuation["timestamp"],
         "entry_candle_timestamp": int(current_timestamp) if current_timestamp is not None
                                   else continuation["timestamp"] + TIMEFRAME_SECONDS,
-        "first_candle": first, "reversal_candle": reversal,
+        "first_candle": force, "reversal_candle": reversal,
         "continuation_candle": continuation,
     })
 
-    strong_first = first["range"] > 0 and first["body_ratio"] >= STRONG_BODY_RATIO
-    # La continuidad no puede invalidar/superar el extremo contrario de la
-    # vela de fuerza: PUT no supera su máximo; CALL no perfora su mínimo.
+    strong_force = force["range"] > 0 and force["body_ratio"] >= STRONG_BODY_RATIO
+    # Regla solicitada: la continuidad se compara con la APERTURA de la vela de fuerza,
+    # no con su máximo/mínimo ni con el extremo de la vela de reversión.
     put_pattern = (
-        strong_first and first["color"] == "green"
+        strong_force and force["color"] == "green"
         and reversal["color"] == "red" and continuation["color"] == "red"
-        and continuation["close"] < reversal["low"]
-        and continuation["high"] <= first["high"]
+        and continuation["high"] <= force["open"]
     )
     call_pattern = (
-        strong_first and first["color"] == "red"
+        strong_force and force["color"] == "red"
         and reversal["color"] == "green" and continuation["color"] == "green"
-        and continuation["close"] > reversal["high"]
-        and continuation["low"] >= first["low"]
+        and continuation["low"] >= force["open"]
     )
 
     if put_pattern:
         result.update({
             "signal": "PUT", "bias": "PUT", "put_score": 1,
             "reason": (
-                f"PUT: vela 1 verde fuerte (cuerpo/rango={first['body_ratio']:.0%}); "
-                f"vela 2 roja; vela 3 roja cierra {continuation['close']} por debajo "
-                f"del mínimo de vela 2 ({reversal['low']}) y no supera el máximo "
-                f"de la vela de fuerza ({first['high']}). Entrada en la siguiente M1."
+                f"PUT válido: fuerza verde ({force['body_ratio']:.0%} del rango), "
+                f"reversión roja y continuidad roja. Máximo de continuidad "
+                f"({continuation['high']}) <= apertura de fuerza ({force['open']}). "
+                "Entrada al abrir la siguiente vela M1."
             ),
         })
     elif call_pattern:
         result.update({
             "signal": "CALL", "bias": "CALL", "call_score": 1,
             "reason": (
-                f"CALL: vela 1 roja fuerte (cuerpo/rango={first['body_ratio']:.0%}); "
-                f"vela 2 verde; vela 3 verde cierra {continuation['close']} por encima "
-                f"del máximo de vela 2 ({reversal['high']}). Entrada en la siguiente M1."
+                f"CALL válido: fuerza roja ({force['body_ratio']:.0%} del rango), "
+                f"reversión verde y continuidad verde. Mínimo de continuidad "
+                f"({continuation['low']}) >= apertura de fuerza ({force['open']}). "
+                "Entrada al abrir la siguiente vela M1."
             ),
         })
     else:
+        ratio = force["body_ratio"]
         result["reason"] = (
-            f"Sin señal: se requieren 3 velas cerradas; vela 1 fuerte >= "
-            f"{STRONG_BODY_RATIO:.0%} del rango; PUT=verde fuerte-roja-roja con "
-            f"cierre 3 bajo mínimo 2 y máximo 3 <= máximo vela 1; "
-            f"CALL=roja fuerte-verde-verde con cierre 3 sobre máximo 2 y "
-            f"mínimo 3 >= mínimo vela 1. Secuencia={result['sequence_text']}; "
-            f"cuerpo/rango vela 1={first['body_ratio']:.0%}."
+            "Sin señal: se requiere fuerza (cuerpo >= 60% del rango), reversión "
+            "de color contrario y continuidad del color de la reversión. "
+            "PUT: fuerza verde + roja + roja, con máximo de continuidad <= apertura "
+            "de fuerza. CALL: fuerza roja + verde + verde, con mínimo de continuidad "
+            f">= apertura de fuerza. Secuencia={result['sequence_text']}; "
+            f"cuerpo/rango de fuerza={ratio:.0%}."
         )
     return result
