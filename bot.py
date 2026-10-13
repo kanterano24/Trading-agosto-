@@ -29,7 +29,7 @@ AUTO_DISCOVER_PAIRS = True  # Descubrir automáticamente cuatro pares OTC dispon
 PAIR_REFRESH_SECONDS = 300.0
 TF = 60
 COUNT = 200
-EXPIRATION = 1
+EXPIRATION = 2
 # Importe predeterminado: mínimo habitual de IQ Option.
 # Si Railway tiene AMOUNT configurado, esa variable prevalece.
 AMOUNT = float(os.getenv("AMOUNT", "5"))
