@@ -132,7 +132,7 @@ TF = 60
 COUNT = 200
 EXPIRATION = 1
 # Importe predeterminado solicitado: 5. Si AMOUNT está definido en Railway, prevalece.
-AMOUNT = float(os.getenv("AMOUNT", "7"))
+AMOUNT = float(os.getenv("AMOUNT", "8"))
 if AMOUNT <= 0:
     raise ValueError("AMOUNT debe ser mayor que 0")
 
