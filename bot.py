@@ -111,112 +111,55 @@ except ModuleNotFoundError as import_error:
         return smooth_k, d_values
 
 
+    STRONG_BODY_RATIO = 0.60
+
     def analyze_market(raw, current_timestamp=None):
         candles = normalize_candles(raw)
         result = {
             "signal": "NO SIGNAL", "bias": "NEUTRAL", "call_score": 0, "put_score": 0,
-            "sequence": [], "sequence_text": "", "entry_timing": "NEXT_5M_BOUNDARY",
+            "sequence": [], "sequence_text": "", "entry_timing": "NEXT_M1_CANDLE",
             "signal_candle_timestamp": None, "confirmation_candle_timestamp": None,
             "entry_candle_timestamp": None, "stoch_k": None, "stoch_d": None,
             "stoch_k_previous": None, "stoch_d_previous": None,
-            "stoch_k_delta": None, "stoch_d_delta": None,
-            "signal_k_previous": None, "signal_k": None,
-            "signal_d_previous": None, "signal_d": None,
-            "k_crosses_overbought_up": False, "d_crosses_oversold_down": False,
-            "valid_signal_minute": False, "confirmation_ok": False,
-            "reason": "Historial insuficiente para calcular el estocástico.",
+            "reason": "Se necesitan tres velas M1 cerradas para evaluar el patrón.",
+            "first_candle": None, "reversal_candle": None, "continuation_candle": None,
         }
-        minimum = STOCH_K_PERIOD + STOCH_K_SMOOTH + STOCH_D_PERIOD + 2
-        if len(candles) < minimum:
-            result["reason"] = f"Historial insuficiente para estocástico: {len(candles)}/{minimum} velas."
+        if len(candles) < 3:
+            result["reason"] = f"Historial insuficiente: {len(candles)}/3 velas cerradas."
             return result
-
-        if current_timestamp is None:
-            current_timestamp = candles[-1]["timestamp"] + TIMEFRAME_SECONDS
-        current_timestamp = int(current_timestamp)
-        k_values, d_values = stochastic(candles)
-
-        # Última vela cerrada para reporte general de Telegram.
-        last_idx = len(candles) - 1
-        k_last, d_last = k_values[last_idx], d_values[last_idx]
-        k_last_prev, d_last_prev = k_values[last_idx - 1], d_values[last_idx - 1]
+        first, reversal, continuation = candles[-3:]
         result.update({
-            "stoch_k": k_last, "stoch_d": d_last,
-            "stoch_k_previous": k_last_prev, "stoch_d_previous": d_last_prev,
-            "stoch_k_delta": k_last - k_last_prev if k_last is not None and k_last_prev is not None else None,
-            "stoch_d_delta": d_last - d_last_prev if d_last is not None and d_last_prev is not None else None,
-            "evaluation_timestamp": current_timestamp,
-            "is_five_minute_boundary": current_timestamp % BLOCK_SECONDS == 0,
+            "sequence": [first["color"], reversal["color"], continuation["color"]],
+            "sequence_text": "-".join({"green": "V", "red": "R", "doji": "D"}[c["color"]]
+                                      for c in (first, reversal, continuation)),
+            "signal_candle_timestamp": reversal["timestamp"],
+            "confirmation_candle_timestamp": continuation["timestamp"],
+            "entry_candle_timestamp": int(current_timestamp) if current_timestamp is not None
+                                      else continuation["timestamp"] + TIMEFRAME_SECONDS,
+            "first_candle": first, "reversal_candle": reversal,
+            "continuation_candle": continuation,
         })
-
-        # Solo tomar decisiones cuando la vela M1 actual acaba de abrir en :00/:05/:10...
-        # La vela de señal debe haber abierto en :03 y la confirmación en :04.
-        if current_timestamp % BLOCK_SECONDS != 0:
-            result["reason"] = "Sin evaluación de entrada: no es un límite exacto de 5 minutos."
-            return result
-
-        signal_idx = len(candles) - 2
-        confirm_idx = len(candles) - 1
-        signal_candle = candles[signal_idx]
-        confirm_candle = candles[confirm_idx]
-        result.update({
-            "signal_candle_timestamp": signal_candle["timestamp"],
-            "confirmation_candle_timestamp": confirm_candle["timestamp"],
-            "signal_candle_color": signal_candle["color"],
-            "confirmation_candle_color": confirm_candle["color"],
-            "valid_signal_minute": signal_candle["timestamp"] % BLOCK_SECONDS == 180,
-            "confirmation_ok": (
-                confirm_candle["timestamp"] % BLOCK_SECONDS == 240
-                and confirm_candle["timestamp"] == signal_candle["timestamp"] + TIMEFRAME_SECONDS
-            ),
-        })
-
-        k_sig, d_sig = k_values[signal_idx], d_values[signal_idx]
-        k_before, d_before = k_values[signal_idx - 1], d_values[signal_idx - 1]
-        if any(v is None for v in (k_sig, d_sig, k_before, d_before)):
-            result["reason"] = "Estocástico no disponible en la vela de señal."
-            return result
-
-        k_cross = k_before <= STOCH_OVERBOUGHT and k_sig > STOCH_OVERBOUGHT
-        d_cross = d_before >= STOCH_OVERSOLD and d_sig < STOCH_OVERSOLD
-        result.update({
-            "signal_k_previous": k_before, "signal_k": k_sig,
-            "signal_d_previous": d_before, "signal_d": d_sig,
-            "k_crosses_overbought_up": k_cross,
-            "d_crosses_oversold_down": d_cross,
-        })
-
-        if not result["valid_signal_minute"] or not result["confirmation_ok"]:
-            result["reason"] = (
-                "Entrada bloqueada: el cruce debe estar en la vela que abre en minuto :03 "
-                "del bloque M5 y la vela :04 debe confirmar antes de la apertura del bloque siguiente."
-            )
-            return result
-
-        # PUT: K azul cruza hacia arriba de 80 en vela roja; siguiente vela también roja.
-        if k_cross and signal_candle["color"] == "red" and confirm_candle["color"] == "red":
-            result.update({
-                "signal": "PUT", "bias": "PUT", "put_score": 1,
-                "entry_candle_timestamp": current_timestamp,
-                "reason": (f"PUT válido: K azul cruzó arriba de 80 en vela roja (:03), "
-                           f"vela roja de confirmación (:04). K {k_before:.2f}->{k_sig:.2f}; "
-                           f"entrada en límite M5 {current_timestamp}; expiración 2 minutos."),
-            })
-        # CALL: D roja cruza hacia abajo de 20 en vela verde; siguiente vela también verde.
-        elif d_cross and signal_candle["color"] == "green" and confirm_candle["color"] == "green":
-            result.update({
-                "signal": "CALL", "bias": "CALL", "call_score": 1,
-                "entry_candle_timestamp": current_timestamp,
-                "reason": (f"CALL válido: D roja cruzó abajo de 20 en vela verde (:03), "
-                           f"vela verde de confirmación (:04). D {d_before:.2f}->{d_sig:.2f}; "
-                           f"entrada en límite M5 {current_timestamp}; expiración 2 minutos."),
-            })
+        strong_first = first["range"] > 0 and first["body"] / first["range"] >= STRONG_BODY_RATIO
+        put_pattern = (strong_first and first["color"] == "green" and reversal["color"] == "red"
+                       and continuation["color"] == "red" and continuation["close"] < reversal["low"])
+        call_pattern = (strong_first and first["color"] == "red" and reversal["color"] == "green"
+                        and continuation["color"] == "green" and continuation["close"] > reversal["high"])
+        if put_pattern:
+            result.update({"signal": "PUT", "bias": "PUT", "put_score": 1,
+                "reason": (f"PUT: vela 1 verde fuerte ({first['body']/first['range']:.0%} del rango); "
+                           f"vela 2 roja; vela 3 roja cierra por debajo del mínimo de vela 2. "
+                           "Entrada en la siguiente M1.")})
+        elif call_pattern:
+            result.update({"signal": "CALL", "bias": "CALL", "call_score": 1,
+                "reason": (f"CALL: vela 1 roja fuerte ({first['body']/first['range']:.0%} del rango); "
+                           f"vela 2 verde; vela 3 verde cierra por encima del máximo de vela 2. "
+                           "Entrada en la siguiente M1.")})
         else:
-            result["reason"] = (
-                f"Sin entrada: cruce PUT={k_cross}, color señal PUT={signal_candle['color']}, "
-                f"confirmación={confirm_candle['color']}; cruce CALL={d_cross}. "
-                f"Se exige PUT: K↑80 + roja/roja; CALL: D↓20 + verde/verde."
-            )
+            ratio = first["body"] / first["range"] if first["range"] > 0 else 0.0
+            result["reason"] = (f"Sin señal: patrón de 3 velas no confirmado; vela 1 fuerte >= "
+                f"{STRONG_BODY_RATIO:.0%}; PUT=verde-roja-roja y cierre 3 bajo mínimo 2; "
+                f"CALL=roja-verde-verde y cierre 3 sobre máximo 2. "
+                f"Secuencia={result['sequence_text']}; cuerpo/rango vela 1={ratio:.0%}.")
         return result
 
 PAIR = os.getenv("PAIR", "EURUSD-OTC").strip() or "EURUSD-OTC"
@@ -226,9 +169,8 @@ PAIR_REFRESH_SECONDS = 900.0  # Actualizar la lista cada 15 minutos
 PAIR_SCAN_INTERVAL_SECONDS = 1.0
 TF = 60
 COUNT = 200
-EXPIRATION = 2
-# Importe predeterminado: mínimo habitual de IQ Option.
-# Si Railway tiene AMOUNT configurado, esa variable prevalece.
+EXPIRATION = 1
+# Importe predeterminado solicitado: 5. Si AMOUNT está definido en Railway, prevalece.
 AMOUNT = float(os.getenv("AMOUNT", "5"))
 if AMOUNT <= 0:
     raise ValueError("AMOUNT debe ser mayor que 0")
@@ -1173,8 +1115,8 @@ def main():
                         result.get("stoch_d"), result.get("signal"), result.get("reason")
                     )
 
-                    # Solo enviar la orden en el límite M5 exacto; nunca recuperar tarde.
-                    if result.get("signal") in ("CALL", "PUT") and current_stamp % 300 == 0:
+                    # Entrada en la vela M1 siguiente a la tercera vela cerrada del patrón.
+                    if result.get("signal") in ("CALL", "PUT") and result.get("entry_candle_timestamp") == current_stamp:
                         age = int(server_now) - current_stamp
                         if age < 0 or age > 3:
                             tg(
@@ -1182,7 +1124,7 @@ def main():
                                 f"Señal: {result['signal']}\nRetraso: {age}s. No se ejecutará tarde."
                             )
                         elif last_order_candle.get(pair) == current_stamp:
-                            logging.warning("%s: ya se intentó una orden en el límite %s", pair, current_stamp)
+                            logging.warning("%s: ya se intentó una orden en la vela M1 %s", pair, current_stamp)
                         elif not ENABLE_TRADES:
                             tg(
                                 f"🧪 SEÑAL VÁLIDA SIN EJECUTAR\nPar: {pair}\n"
