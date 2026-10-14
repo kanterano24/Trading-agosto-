@@ -1,8 +1,8 @@
 """Estrategia M1 de impulso a favor de la tendencia, solo acción del precio.
 
-Confirma usando 5 velas M1 cerradas y ejecuta en la sexta vela.
-Tolera una variación menor en los cierres (3 de 4 cambios a favor), exige impulso
-al final y bloquea entradas cuando el impulso parece extendido/agotar el movimiento.
+Confirma usando 10 velas M1 cerradas y evalúa la entrada durante la undécima vela.
+Exige dirección consistente e impulso final; además, la vela de entrada debe
+confirmar en tiempo real la misma dirección antes de permitir una orden.
 No usa indicadores técnicos, S/R ni rechazo como filtro independiente.
 """
 
@@ -165,25 +165,51 @@ def analyze_market(raw, current=None):
     )
 
     current_candles = normalize_candles([current]) if current is not None else []
-    if current_candles:
-        cur = current_candles[-1]
-        ranges = sorted(c["range"] for c in recent if c["range"] > 0)
-        median_range = ranges[len(ranges) // 2] if ranges else 0.0
-        cur_ratio = cur["body"] / cur["range"] if cur["range"] > 0 else 0.0
-        cur_position = ((cur["close"] - cur["low"]) / cur["range"]) if cur["range"] > 0 else 0.5
-        strong_enough = median_range > 0 and cur["range"] >= 0.35 * median_range and cur_ratio >= 0.55
-        bearish_current = cur["color"] == "red" and cur_position <= 0.25
-        bullish_current = cur["color"] == "green" and cur_position >= 0.75
-        contradicts = (signal == "CALL" and strong_enough and bearish_current) or (
-            signal == "PUT" and strong_enough and bullish_current
+    if not current_candles:
+        base["reason"] = reason + " Entrada pendiente: no hay datos válidos de la vela actual."
+        return base
+
+    # Mejora de entrada: no basta con que las 10 velas cerradas sugieran dirección.
+    # La undécima vela en formación debe mostrar confirmación real en esa misma dirección.
+    cur = current_candles[-1]
+    ranges = sorted(c["range"] for c in recent if c["range"] > 0)
+    median_range = ranges[len(ranges) // 2] if ranges else 0.0
+    cur_ratio = cur["body"] / cur["range"] if cur["range"] > 0 else 0.0
+    cur_position = ((cur["close"] - cur["low"]) / cur["range"]) if cur["range"] > 0 else 0.5
+    min_current_range = 0.20 * median_range
+    enough_live_movement = (
+        median_range > 0
+        and cur["range"] >= min_current_range
+        and cur_ratio >= 0.55
+    )
+    aligned_call = (
+        cur["color"] == "green"
+        and cur_position >= 0.70
+        and enough_live_movement
+    )
+    aligned_put = (
+        cur["color"] == "red"
+        and cur_position <= 0.30
+        and enough_live_movement
+    )
+    aligned = aligned_call if signal == "CALL" else aligned_put
+
+    base["entry_candle_color"] = cur["color"]
+    base["entry_candle_body_ratio"] = cur_ratio
+    base["entry_candle_close_position"] = cur_position
+    base["entry_candle_range"] = cur["range"]
+    base["entry_minimum_range"] = min_current_range
+
+    if not aligned:
+        direction_label = "alcista/verde" if signal == "CALL" else "bajista/roja"
+        base["reason"] = (
+            f"Entrada no confirmada: las 10 velas cerradas sugieren {signal}, pero la "
+            f"undécima aún no confirma una vela {direction_label} con fuerza. "
+            f"Color actual={cur['color']}, cuerpo={cur_ratio:.1%}, "
+            f"posición de cierre={cur_position:.1%}, rango actual={cur['range']:.8g}, "
+            f"rango mínimo={min_current_range:.8g}. Se espera sin enviar orden."
         )
-        if contradicts:
-            base["reason"] = (
-                f"Entrada bloqueada: la vela actual ya muestra impulso contrario a {signal} "
-                f"(cuerpo={cur_ratio:.1%}, rango={cur['range']:.8g}, "
-                f"rango mediano previo={median_range:.8g})."
-            )
-            return base
+        return base
 
     base["signal"] = signal
     base["bias"] = signal

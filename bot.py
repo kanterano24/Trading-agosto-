@@ -186,7 +186,7 @@ def tg(msg):
         TG_QUEUE.put_nowait(message)
         return True
     except queue.Full:
-        # No bloquear el análisis de los 50 pares. Si es una alerta de operación,
+        # No bloquear el análisis de los pares configurados. Si es una alerta de operación,
         # libera un lugar descartando el mensaje más antiguo; los mensajes de
         # rutina nuevos se omiten mientras Telegram esté saturado.
         if critical:
@@ -857,7 +857,7 @@ def main():
     _ensure_telegram_worker()
 
     last_closed_stamp = {}       # último cierre procesado por par
-    last_evaluated_candle = {}   # evita evaluar dos veces la misma vela
+    last_reported_candle = {}    # limita los reportes rutinarios a uno por vela
     last_order_candle = {}       # evita duplicar una orden por par/vela
     last_pair_refresh = time.monotonic()
     last_heartbeat = 0.0
@@ -901,7 +901,7 @@ def main():
                     PAIRS = [pair for pair in PREFERRED_PAIRS if pair in set(refreshed)][:MAX_OTC_PAIRS]
                     # Elimina estados de pares que ya no están disponibles.
                     active_set = set(PAIRS)
-                    for state in (last_closed_stamp, last_evaluated_candle, last_order_candle):
+                    for state in (last_closed_stamp, last_reported_candle, last_order_candle):
                         for old_pair in list(state):
                             if old_pair not in active_set:
                                 state.pop(old_pair, None)
@@ -949,12 +949,8 @@ def main():
                     candle_stamp = current["timestamp"]
 
                     # La estrategia confirma con las últimas 10 velas M1 CERRADAS.
-                    # La vela actual es la undécima: allí se intenta la entrada.
-                    # Cada par se evalúa/ejecuta una sola vez por vela.
-                    if last_evaluated_candle.get(pair) == candle_stamp:
-                        continue
-                    last_evaluated_candle[pair] = candle_stamp
-
+                    # La undécima se reevalúa durante su formación para esperar
+                    # confirmación en tiempo real; las órdenes siguen limitadas a una por vela.
                     # Evita ejecutar una señal antigua si IQ Option entregó velas
                     # desfasadas: la vela de entrada esperada debe ser la actual.
                     setup_candles = closed[-10:]
@@ -969,6 +965,15 @@ def main():
                     )
 
                     order_text = ""
+                    # No perseguir una señal tardía: solo se permite entrada en los
+                    # primeros 20 segundos de la undécima vela M1.
+                    if res["signal"] in ("CALL", "PUT") and second > 20:
+                        res["signal"] = "NO SIGNAL"
+                        res["reason"] = (
+                            "Entrada cancelada: la vela actual confirmó demasiado tarde "
+                            f"(segundo {second}; límite 20s). Se espera la siguiente oportunidad."
+                        )
+
                     if res["signal"] in ("CALL", "PUT"):
                         expected_entry_stamp = res.get("entry_candle_timestamp")
                         if expected_entry_stamp != candle_stamp:
@@ -1004,14 +1009,19 @@ def main():
                     entry_candle_text = candle_detail(
                         current, pair, state="ACTUAL / VELA DE ENTRADA (EN FORMACIÓN)"
                     )
-                    telegram_reports.append(
-                        f"⏱️ EVALUACIÓN M1 | vela actual, segundo {second}\n"
-                        f"Par: {pair}\nSecuencia analizada: {sequence_text}\n"
-                        f"Señal: {res['signal']}\nMotivo: {res['reason']}\n\n"
-                        f"📚 10 VELAS CERRADAS DE CONTEXTO (TENDENCIA / IMPULSO)\n{setup_text}\n\n"
-                        f"🎯 UNDÉCIMA VELA M1 / ENTRADA\n{entry_candle_text}"
-                        + ("\n" + order_text.strip() if order_text else "\nOperación: no ejecutada (sin señal).")
-                    )
+                    # Reporta una evaluación rutinaria por vela para no saturar Telegram.
+                    # Si luego se ejecuta o rechaza una orden, reporta ese evento de inmediato.
+                    should_report = last_reported_candle.get(pair) != candle_stamp or bool(order_text)
+                    if should_report:
+                        telegram_reports.append(
+                            f"⏱️ EVALUACIÓN M1 | vela actual, segundo {second}\n"
+                            f"Par: {pair}\nSecuencia analizada: {sequence_text}\n"
+                            f"Señal: {res['signal']}\nMotivo: {res['reason']}\n\n"
+                            f"📚 10 VELAS CERRADAS DE CONTEXTO (TENDENCIA / IMPULSO)\n{setup_text}\n\n"
+                            f"🎯 UNDÉCIMA VELA M1 / ENTRADA\n{entry_candle_text}"
+                            + ("\n" + order_text.strip() if order_text else "\nOperación pendiente/no ejecutada.")
+                        )
+                        last_reported_candle[pair] = candle_stamp
 
                 except Exception:
                     logging.exception("Error procesando el par %s", pair)
