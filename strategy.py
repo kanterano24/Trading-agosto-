@@ -63,7 +63,7 @@ def format_candle(index, candle):
 def analyze_market(raw, current=None):
     """Analiza cinco velas cerradas; prepara una única entrada para la sexta.
 
-    Mantiene la inversión de señal solicitada anteriormente. La confirmación
+    La señal sigue la dirección confirmada por la tendencia. La confirmación
     requiere dirección neta, al menos 3 de 4 cambios de cierre a favor e impulso
     en la quinta vela. Evita perseguir un movimiento demasiado extendido y bloquea
     si la sexta vela ya muestra impulso fuerte contrario.
@@ -153,10 +153,10 @@ def analyze_market(raw, current=None):
         )
         return base
 
-    # Mantiene la inversión de las entradas solicitada anteriormente.
-    signal = "PUT" if original_signal == "CALL" else "CALL"
+    # Ejecuta en la misma dirección que confirma la tendencia y el impulso.
+    signal = original_signal
     reason = (
-        f"Entrada invertida: confirmación original {original_signal}; ejecutaría {signal}. "
+        f"Entrada a favor de la confirmación: señal {signal}. "
         f"Tendencia {base['trend'].lower()}, {max(up_count, down_count)}/4 cierres a favor, "
         f"impulso final con cuerpo {body_ratio:.1%} y cierre en {close_position:.1%} del rango."
     )
