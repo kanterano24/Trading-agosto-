@@ -61,35 +61,35 @@ def format_candle(index, candle):
 
 
 def analyze_market(raw, current=None):
-    """Analiza cinco velas cerradas; prepara una única entrada para la sexta.
+    """Analiza 10 velas M1 cerradas y prepara una única entrada en la undécima.
 
-    La señal sigue la dirección confirmada por la tendencia. La confirmación
-    requiere dirección neta, al menos 3 de 4 cambios de cierre a favor e impulso
-    en la quinta vela. Evita perseguir un movimiento demasiado extendido y bloquea
-    si la sexta vela ya muestra impulso fuerte contrario.
+    Usa solo acción del precio: dirección neta, cambios entre cierres, impulso
+    de la décima vela, mechas y posible agotamiento. No usa indicadores, S/R
+    ni rechazo como filtros independientes.
     """
     candles = normalize_candles(raw)
     color_code = {"green": "V", "red": "R", "doji": "D"}
-    sequence = [c["color"] for c in candles[-5:]]
+    recent = candles[-10:]
+    sequence = [c["color"] for c in recent]
     sequence_text = "-".join(color_code[c] for c in sequence)
     base = {
         "signal": "NO SIGNAL", "bias": "NEUTRAL", "call_score": 0,
         "put_score": 0, "sequence": sequence, "sequence_text": sequence_text,
-        "entry_timing": "SIXTH_M1_AFTER_FIVE_CLOSED", "entry_candle_timestamp": None,
+        "entry_timing": "ELEVENTH_M1_AFTER_TEN_CLOSED", "entry_candle_timestamp": None,
         "trend": "NEUTRAL", "impulse": False,
     }
-    if len(candles) < 5:
-        base["reason"] = f"Historial insuficiente: {len(candles)}/5 velas cerradas"
+    if len(candles) < 10:
+        base["reason"] = f"Historial insuficiente: {len(candles)}/10 velas cerradas"
         return base
 
-    recent = candles[-5:]
     closes = [c["close"] for c in recent]
-    changes = [closes[i] - closes[i - 1] for i in range(1, 5)]
+    changes = [closes[i] - closes[i - 1] for i in range(1, 10)]
     up_count = sum(delta > 0 for delta in changes)
     down_count = sum(delta < 0 for delta in changes)
+    flat_count = sum(delta == 0 for delta in changes)
     net_move = closes[-1] - closes[0]
-    trend_up = net_move > 0 and up_count >= 3
-    trend_down = net_move < 0 and down_count >= 3
+    trend_up = net_move > 0 and up_count >= 6
+    trend_down = net_move < 0 and down_count >= 6
 
     last = recent[-1]
     candle_range = last["range"]
@@ -98,10 +98,8 @@ def analyze_market(raw, current=None):
     impulse_up = last["color"] == "green" and body_ratio >= 0.60 and close_position >= 0.75
     impulse_down = last["color"] == "red" and body_ratio >= 0.60 and close_position <= 0.25
 
-    # Detecta extensión: la última vela tiene un rango excepcional respecto a
-    # las cuatro anteriores y el impulso previo ya iba en la misma dirección.
-    positive_ranges = sorted(c["range"] for c in recent[:-1] if c["range"] > 0)
-    median_previous_range = positive_ranges[len(positive_ranges) // 2] if positive_ranges else 0.0
+    previous_ranges = sorted(c["range"] for c in recent[:-1] if c["range"] > 0)
+    median_previous_range = previous_ranges[len(previous_ranges) // 2] if previous_ranges else 0.0
     previous = recent[-2]
     prev_range = previous["range"]
     prev_body_ratio = previous["body"] / prev_range if prev_range > 0 else 0.0
@@ -130,16 +128,22 @@ def analyze_market(raw, current=None):
     base["impulse"] = impulse_up or impulse_down
     base["impulse_timestamp"] = last["timestamp"]
     base["entry_candle_timestamp"] = last["timestamp"] + 60
+    base["up_closes"] = up_count
+    base["down_closes"] = down_count
+    base["flat_closes"] = flat_count
+    base["body_ratio"] = body_ratio
+    base["close_position"] = close_position
 
     if original_signal == "NO SIGNAL":
         if not (trend_up or trend_down):
             base["reason"] = (
-                "Sin señal: dirección mixta o insuficiente; "
-                f"cierres a favor alcista {up_count}/4, bajista {down_count}/4."
+                "Sin señal: las 10 velas no muestran dirección suficientemente consistente; "
+                f"cierres ascendentes {up_count}/9, descendentes {down_count}/9, "
+                f"sin cambio {flat_count}/9, variación neta={net_move:.8g}."
             )
         else:
             base["reason"] = (
-                f"Sin señal: tendencia {base['trend'].lower()}, pero la quinta vela "
+                f"Sin señal: tendencia {base['trend'].lower()}, pero la décima vela "
                 f"no confirma impulso suficiente (cuerpo={body_ratio:.1%}, "
                 f"posición de cierre={close_position:.1%})."
             )
@@ -147,18 +151,17 @@ def analyze_market(raw, current=None):
 
     if exhausted:
         base["reason"] = (
-            "Entrada bloqueada: posible impulso agotado; la última vela tiene "
-            f"un rango {candle_range / median_previous_range:.2f}x la mediana previa "
+            "Entrada bloqueada: posible agotamiento; la décima vela tiene un rango "
+            f"{candle_range / median_previous_range:.2f}x la mediana de las nueve previas "
             "y la vela anterior ya impulsaba en la misma dirección."
         )
         return base
 
-    # Ejecuta en la misma dirección que confirma la tendencia y el impulso.
     signal = original_signal
     reason = (
-        f"Entrada a favor de la confirmación: señal {signal}. "
-        f"Tendencia {base['trend'].lower()}, {max(up_count, down_count)}/4 cierres a favor, "
-        f"impulso final con cuerpo {body_ratio:.1%} y cierre en {close_position:.1%} del rango."
+        f"Señal {signal}: contexto de 10 velas con tendencia {base['trend'].lower()}, "
+        f"{max(up_count, down_count)}/9 cambios de cierre a favor e impulso en la décima "
+        f"(cuerpo={body_ratio:.1%}, cierre en {close_position:.1%} del rango)."
     )
 
     current_candles = normalize_candles([current]) if current is not None else []
@@ -176,7 +179,7 @@ def analyze_market(raw, current=None):
         )
         if contradicts:
             base["reason"] = (
-                f"Entrada bloqueada: la sexta vela ya muestra impulso contrario a {signal} "
+                f"Entrada bloqueada: la vela actual ya muestra impulso contrario a {signal} "
                 f"(cuerpo={cur_ratio:.1%}, rango={cur['range']:.8g}, "
                 f"rango mediano previo={median_range:.8g})."
             )

@@ -35,7 +35,7 @@ COUNT = 200
 EXPIRATION = 1
 # Importe predeterminado: mínimo habitual de IQ Option.
 # Si Railway tiene AMOUNT configurado, esa variable prevalece.
-AMOUNT = float(os.getenv("AMOUNT", "6"))
+AMOUNT = float(os.getenv("AMOUNT", "5"))
 if AMOUNT <= 0:
     raise ValueError("AMOUNT debe ser mayor que 0")
 
@@ -877,7 +877,7 @@ def main():
         f"Pares activos: {len(PAIRS)} de 3 permitidos\n"
         + (", ".join(PAIRS) if PAIRS else "Ninguno disponible en TURBO") + "\n"
         "Temporalidad: M1\n"
-        "Estrategia: confirmación con 5 velas M1 cerradas; entrada en la sexta\n"
+        "Estrategia: análisis de 10 velas M1 cerradas; entrada en la undécima\n"
         "Filtro: dirección neta, impulso y bloqueo de impulso agotado/contrario\n"
         f"Entrada: comienzo de la vela M1 actual | Expiración: {EXPIRATION} minuto\n"
         f"Importe por operación: {AMOUNT:g}\n"
@@ -942,14 +942,14 @@ def main():
                             + f"\nHistorial cerrado disponible: {len(closed)} velas"
                         )
 
-                    if current is None or len(closed) < 5:
+                    if current is None or len(closed) < 10:
                         continue
 
                     second = int(server_now - current["timestamp"])
                     candle_stamp = current["timestamp"]
 
-                    # La estrategia confirma con las últimas 5 velas M1 CERRADAS.
-                    # La vela actual es la sexta: allí se intenta la entrada.
+                    # La estrategia confirma con las últimas 10 velas M1 CERRADAS.
+                    # La vela actual es la undécima: allí se intenta la entrada.
                     # Cada par se evalúa/ejecuta una sola vez por vela.
                     if last_evaluated_candle.get(pair) == candle_stamp:
                         continue
@@ -957,7 +957,7 @@ def main():
 
                     # Evita ejecutar una señal antigua si IQ Option entregó velas
                     # desfasadas: la vela de entrada esperada debe ser la actual.
-                    setup_candles = closed[-5:]
+                    setup_candles = closed[-10:]
                     res = analyze_market(setup_candles, current=current)
                     sequence_text = "-".join(
                         {"green": "V", "red": "R", "doji": "D"}.get(x, "?")
@@ -995,7 +995,7 @@ def main():
                             )
 
                     # En Telegram se informa cada evaluación, incluso NO SIGNAL,
-                    # incluyendo las 5 velas cerradas de confirmación y la sexta vela M1 actual
+                    # incluyendo las 10 velas cerradas de confirmación y la undécima vela M1 actual
                     # (vela en la que se intenta entrar).
                     setup_text = "\n".join(
                         _candle_summary(candle, idx)
@@ -1008,8 +1008,8 @@ def main():
                         f"⏱️ EVALUACIÓN M1 | vela actual, segundo {second}\n"
                         f"Par: {pair}\nSecuencia analizada: {sequence_text}\n"
                         f"Señal: {res['signal']}\nMotivo: {res['reason']}\n\n"
-                        f"📚 5 VELAS CERRADAS DE CONFIRMACIÓN (TENDENCIA / IMPULSO)\n{setup_text}\n\n"
-                        f"🎯 SEXTA VELA M1 / ENTRADA\n{entry_candle_text}"
+                        f"📚 10 VELAS CERRADAS DE CONTEXTO (TENDENCIA / IMPULSO)\n{setup_text}\n\n"
+                        f"🎯 UNDÉCIMA VELA M1 / ENTRADA\n{entry_candle_text}"
                         + ("\n" + order_text.strip() if order_text else "\nOperación: no ejecutada (sin señal).")
                     )
 
