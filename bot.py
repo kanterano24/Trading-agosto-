@@ -22,10 +22,13 @@ from iqoptionapi import constants as OP_code
 from strategy import normalize_candles, analyze_market
 
 
-PAIR = os.getenv("PAIR", "USDZAR-OTC").strip().upper()
+PAIR = os.getenv("PAIR", "ARBUSD-OTC").strip().upper()
+# Solo estos tres pares, en este orden de preferencia. Se verifica que estén
+# disponibles en TURBO antes de analizarlos/operarlos.
+PREFERRED_PAIRS = ["ARBUSD-OTC", "ATOMUSD-OTC", "AUDCAD-OTC"]
 PAIRS = []
-MAX_OTC_PAIRS = 4  # Configuración solicitada: analizar cuatro pares OTC
-AUTO_DISCOVER_PAIRS = True  # Descubrir automáticamente cuatro pares OTC disponibles
+MAX_OTC_PAIRS = 3
+AUTO_DISCOVER_PAIRS = True
 PAIR_REFRESH_SECONDS = 300.0
 TF = 60
 COUNT = 200
@@ -764,13 +767,7 @@ def _active_pair_name(active):
 
 
 def discover_otc_1m_pairs(iq):
-    """
-    Descubre hasta 50 pares OTC que estén ABIERTOS en TURBO.
-
-    TURBO es el modo que admite expiraciones cortas de 1 a 5 minutos.
-    Por eso un par que no esté abierto/sin suspendido en TURBO queda
-    fuera de la lista: no se analiza y no se permite una entrada de 1m.
-    """
+    """Descubre los pares preferidos que estén ABIERTOS en TURBO, máximo tres."""
     try:
         data = iq.get_all_init_v2()
         actives = _get_turbo_actives(data)
@@ -806,7 +803,10 @@ def discover_otc_1m_pairs(iq):
             OP_code.ACTIVES[pair] = active_id
             found.append(pair)
 
-        pairs = sorted(set(found))[:MAX_OTC_PAIRS]
+        available = set(found)
+        # Limita estrictamente el bot a los tres pares configurados; no agrega
+        # otros activos aunque IQ Option devuelva decenas de pares OTC.
+        pairs = [pair for pair in PREFERRED_PAIRS if pair in available][:MAX_OTC_PAIRS]
 
         logging.info(
             "Pares OTC TURBO/1m encontrados: %d/%d | %s",
@@ -859,29 +859,27 @@ def main():
     last_closed_stamp = {}       # último cierre procesado por par
     last_evaluated_candle = {}   # evita evaluar dos veces la misma vela
     last_order_candle = {}       # evita duplicar una orden por par/vela
-    last_global_order_candle = None  # máximo una orden intentada en todo el bot por minuto M1
     last_pair_refresh = time.monotonic()
     last_heartbeat = 0.0
 
     if AUTO_DISCOVER_PAIRS:
         logging.info("INICIO_DESCUBRIMIENTO | buscando pares OTC TURBO")
         discovered = discover_otc_1m_pairs(iq)
-        PAIRS = discovered or [PAIR]
+        PAIRS = discovered
     else:
         PAIRS = [PAIR]
     logging.info("PARES_ACTIVOS | modo=%s | cantidad=%d | pares=%s", "auto" if AUTO_DISCOVER_PAIRS else "fijo", len(PAIRS), ", ".join(PAIRS))
     if AUTO_DISCOVER_PAIRS and not discovered:
-        tg("⚠️ No se encontraron pares OTC abiertos en TURBO; se intentará consultar el par configurado.")
+        tg("⚠️ Ninguno de los tres pares configurados está disponible en TURBO. El bot seguirá activo y volverá a comprobar disponibilidad.")
 
     tg(
         "🟢 Bot iniciado\n"
-        f"Modo pares: {'auto' if AUTO_DISCOVER_PAIRS else 'fijo'}\n"
-        f"Pares disponibles al iniciar: {len(PAIRS)}\n"
+        f"Pares activos: {len(PAIRS)} de 3 permitidos\n"
+        + (", ".join(PAIRS) if PAIRS else "Ninguno disponible en TURBO") + "\n"
         "Temporalidad: M1\n"
-        "Estrategia: impulso a favor de la tendencia (acción del precio)\n"
-        "CALL: tendencia alcista + vela de impulso verde\n"
-        "PUT: tendencia bajista + vela de impulso roja\n"
-        f"Entrada: siguiente vela M1 después del impulso | Expiración: {EXPIRATION} minuto\n"
+        "Estrategia: confirmación con 5 velas M1 cerradas; entrada en la sexta\n"
+        "Filtro: dirección neta, impulso y bloqueo de impulso agotado/contrario\n"
+        f"Entrada: comienzo de la vela M1 actual | Expiración: {EXPIRATION} minuto\n"
         f"Importe por operación: {AMOUNT:g}\n"
         "Indicadores: ninguno | S/R: no | Rechazo: no"
     )
@@ -900,7 +898,7 @@ def main():
                 refreshed = discover_otc_1m_pairs(iq)
                 if refreshed:
                     old = set(PAIRS)
-                    PAIRS = refreshed
+                    PAIRS = [pair for pair in PREFERRED_PAIRS if pair in set(refreshed)][:MAX_OTC_PAIRS]
                     # Elimina estados de pares que ya no están disponibles.
                     active_set = set(PAIRS)
                     for state in (last_closed_stamp, last_evaluated_candle, last_order_candle):
@@ -919,11 +917,11 @@ def main():
                 continue
 
             # Se agrupan los informes del ciclo para enviar varias velas por mensaje
-            # y evitar que Telegram se sature cuando se analizan hasta 50 pares.
+            # y evitar que Telegram se sature al analizar los tres pares.
             telegram_reports = []
 
-            # Cada ciclo revisa todos los pares descubiertos, no solo EURUSD-OTC.
-            # La disponibilidad cambia; discover_otc_1m_pairs filtra activos TURBO abiertos.
+            # Cada ciclo revisa únicamente los tres pares preferidos que estén abiertos.
+            # discover_otc_1m_pairs aplica la lista permitida y no agrega otros activos.
             for pair in list(PAIRS):
                 try:
                     logging.debug("CONSULTANDO_VELAS | par=%s", pair)
@@ -944,14 +942,14 @@ def main():
                             + f"\nHistorial cerrado disponible: {len(closed)} velas"
                         )
 
-                    if current is None or len(closed) < 4:
+                    if current is None or len(closed) < 5:
                         continue
 
                     second = int(server_now - current["timestamp"])
                     candle_stamp = current["timestamp"]
 
-                    # La estrategia usa 2 velas CERRADAS: previa y reversión.
-                    # La vela actual es la vela de continuidad y de entrada.
+                    # La estrategia confirma con las últimas 5 velas M1 CERRADAS.
+                    # La vela actual es la sexta: allí se intenta la entrada.
                     # Cada par se evalúa/ejecuta una sola vez por vela.
                     if last_evaluated_candle.get(pair) == candle_stamp:
                         continue
@@ -959,8 +957,8 @@ def main():
 
                     # Evita ejecutar una señal antigua si IQ Option entregó velas
                     # desfasadas: la vela de entrada esperada debe ser la actual.
-                    setup_candles = closed[-4:]
-                    res = analyze_market(setup_candles)
+                    setup_candles = closed[-5:]
+                    res = analyze_market(setup_candles, current=current)
                     sequence_text = "-".join(
                         {"green": "V", "red": "R", "doji": "D"}.get(x, "?")
                         for x in res.get("sequence", [])
@@ -983,9 +981,8 @@ def main():
                         elif not ENABLE_TRADES:
                             order_text = "\n🧪 Señal detectada; operaciones desactivadas."
                         else:
-                            # Reserva el minuto global ANTES de enviar la orden: incluso si
-                            # IQ Option tarda o rechaza la orden, no se intenta otra en este minuto.
-                            last_global_order_candle = candle_stamp
+                            # Una sola orden por par y vela M1. Los otros dos pares
+                            # pueden ejecutar una señal independiente en ese mismo minuto.
                             last_order_candle[pair] = candle_stamp
                             ok, oid = execute_binary_order(
                                 iq, pair, res["signal"], AMOUNT, EXPIRATION
@@ -998,8 +995,8 @@ def main():
                             )
 
                     # En Telegram se informa cada evaluación, incluso NO SIGNAL,
-                    # incluyendo las 3 velas cerradas (previa, reversión, continuidad)
-                    # y la vela M1 actual (vela en la que se intenta entrar).
+                    # incluyendo las 5 velas cerradas de confirmación y la sexta vela M1 actual
+                    # (vela en la que se intenta entrar).
                     setup_text = "\n".join(
                         _candle_summary(candle, idx)
                         for idx, candle in enumerate(setup_candles, start=1)
@@ -1011,8 +1008,8 @@ def main():
                         f"⏱️ EVALUACIÓN M1 | vela actual, segundo {second}\n"
                         f"Par: {pair}\nSecuencia analizada: {sequence_text}\n"
                         f"Señal: {res['signal']}\nMotivo: {res['reason']}\n\n"
-                        f"📚 VELAS CERRADAS UTILIZADAS (TENDENCIA / IMPULSO)\n{setup_text}\n\n"
-                        f"🎯 VELA DE CONTINUIDAD / ENTRADA\n{entry_candle_text}"
+                        f"📚 5 VELAS CERRADAS DE CONFIRMACIÓN (TENDENCIA / IMPULSO)\n{setup_text}\n\n"
+                        f"🎯 SEXTA VELA M1 / ENTRADA\n{entry_candle_text}"
                         + ("\n" + order_text.strip() if order_text else "\nOperación: no ejecutada (sin señal).")
                     )
 
