@@ -1,7 +1,7 @@
 """Bot OTC M1: ejecuta señales confirmadas en la siguiente vela M1.
 
 - Obtiene únicamente velas M1 cerradas desde IQ Option.
-- Envía cada vela cerrada a Telegram.
+- Telegram solo recibe confirmaciones de órdenes ejecutadas correctamente.
 - NO usa Telegram getUpdates.
 - Expone /health, /candles y /openapi.json para consultas externas.
 - /candles puede protegerse con CANDLES_API_KEY.
@@ -35,7 +35,7 @@ COUNT = 200
 EXPIRATION = 1
 # Importe predeterminado: mínimo habitual de IQ Option.
 # Si Railway tiene AMOUNT configurado, esa variable prevalece.
-AMOUNT = float(os.getenv("AMOUNT", "5"))
+AMOUNT = float(os.getenv("AMOUNT", "7"))
 if AMOUNT <= 0:
     raise ValueError("AMOUNT debe ser mayor que 0")
 
@@ -170,13 +170,17 @@ def _ensure_telegram_worker():
 
 
 def tg(msg):
-    """Encola sin bloquear el trading; protege alertas importantes si se llena."""
+    """Telegram se reserva exclusivamente para órdenes ejecutadas con éxito."""
     global TG_LAST_QUEUE_LOG
+    message = str(msg).strip()
+    # Descarta reportes, velas, inicio, cambios de pares, errores y órdenes
+    # rechazadas. Solo se permite el aviso dedicado generado tras IQ.buy exitoso.
+    if not message.startswith("🧪 ORDEN ENVIADA\nPar:"):
+        return False
     if not TOKEN or not CHAT:
         return False
 
     _ensure_telegram_worker()
-    message = str(msg)
     critical = any(marker in message.upper() for marker in (
         "ORDEN ENVIADA", "ORDEN RECHAZADA", "DIRECCIÓN:", "DIRECCION:",
         "ENTRADA BLOQUEADA", "ERROR", "⚠️"
@@ -625,7 +629,8 @@ def _candle_summary(candle, index):
 
 
 def send_telegram_batches(reports, title="📊 REPORTE DE ANÁLISIS"):
-    """Agrupa informes de muchos pares para evitar una inundación de Telegram."""
+    """Los reportes de análisis se mantienen en logs; no se envían a Telegram."""
+    return
     if not reports:
         return
     max_chars = max(2500, min(3500, int(os.getenv("TG_BATCH_MAX_CHARS", "3500"))))
@@ -998,6 +1003,17 @@ def main():
                                 f"\nImporte: {AMOUNT:g}\nExpiración: {EXPIRATION} minuto"
                                 f"\nID/respuesta: {oid}"
                             )
+                            # Un único mensaje por Telegram, únicamente si IQ Option
+                            # confirmó que la orden fue aceptada.
+                            if ok:
+                                tg(
+                                    "🧪 ORDEN ENVIADA\n"
+                                    f"Par: {pair}\n"
+                                    f"Dirección: {res['signal']}\n"
+                                    f"Importe: {AMOUNT:g}\n"
+                                    f"Expiración: {EXPIRATION} minuto\n"
+                                    f"ID/respuesta: {oid}"
+                                )
 
                     # En Telegram se informa cada evaluación, incluso NO SIGNAL,
                     # incluyendo las 10 velas cerradas de confirmación y la undécima vela M1 actual
