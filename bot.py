@@ -1,6 +1,6 @@
-"""Bot OTC M1: ejecuta señales confirmadas en la siguiente vela M1.
+"""Bot OTC M5: analiza velas cerradas de 5 minutos y ejecuta en la siguiente vela M5.
 
-- Obtiene únicamente velas M1 cerradas desde IQ Option.
+- Obtiene únicamente velas M5 cerradas desde IQ Option.
 - Telegram solo recibe confirmaciones de órdenes ejecutadas correctamente.
 - NO usa Telegram getUpdates.
 - Expone /health, /candles y /openapi.json para consultas externas.
@@ -23,20 +23,20 @@ from strategy import normalize_candles, analyze_market
 
 
 PAIR = os.getenv("PAIR", "ARBUSD-OTC").strip().upper()
-# Analiza hasta nueve pares OTC que estén abiertos en TURBO.
+# Analiza hasta 50 pares OTC que estén abiertos en TURBO.
 # Los pares preferidos van primero si están disponibles; los demás se descubren
 # automáticamente. La lista se vuelve a comprobar cada 15 minutos.
 PREFERRED_PAIRS = ["ARBUSD-OTC", "ATOMUSD-OTC", "AUDCAD-OTC"]
 PAIRS = []
-MAX_OTC_PAIRS = 9
+MAX_OTC_PAIRS = 50
 AUTO_DISCOVER_PAIRS = True
 PAIR_REFRESH_SECONDS = 900.0
-TF = 60
+TF = 300
 COUNT = 200
-EXPIRATION = 1
+EXPIRATION = 5
 # Importe predeterminado: mínimo habitual de IQ Option.
 # Si Railway tiene AMOUNT configurado, esa variable prevalece.
-AMOUNT = float(os.getenv("AMOUNT", "8"))
+AMOUNT = float(os.getenv("AMOUNT", "5"))
 if AMOUNT <= 0:
     raise ValueError("AMOUNT debe ser mayor que 0")
 
@@ -218,10 +218,10 @@ def tg(msg):
 OPENAPI_SPEC = {
     "openapi": "3.0.1",
     "info": {
-        "title": "EURUSD-OTC Candles API",
+        "title": "OTC Candles API",
         "version": "1.0.0",
         "description": (
-            "API de solo lectura para consultar las velas M1 "
+            "API de solo lectura para consultar las velas M5 "
             "cerradas de EURUSD-OTC."
         ),
     },
@@ -245,9 +245,9 @@ OPENAPI_SPEC = {
         "/candles": {
             "get": {
                 "operationId": "getCandles",
-                "summary": "Obtiene las velas M1 cerradas",
+                "summary": "Obtiene las velas M5 cerradas",
                 "description": (
-                    "Devuelve el historial actual de velas M1 "
+                    "Devuelve el historial actual de velas M5 "
                     "cerradas de EURUSD-OTC."
                 ),
                 "security": [
@@ -365,7 +365,7 @@ class CandlesAPIHandler(BaseHTTPRequestHandler):
                 200,
                 {
                     "ok": True,
-                    "service": "EURUSD candles",
+                    "service": "OTC candles",
                 },
             )
             return
@@ -403,7 +403,7 @@ class CandlesAPIHandler(BaseHTTPRequestHandler):
                     "timestamp": c.get("timestamp"),
                     "time": c.get("time"),
                     "pair": PAIR,
-                    "timeframe": "M1",
+                    "timeframe": "M5",
                     "color": c.get("color"),
                     "open": c.get("open"),
                     "close": c.get("close"),
@@ -421,7 +421,7 @@ class CandlesAPIHandler(BaseHTTPRequestHandler):
             {
                 "ok": True,
                 "pair": PAIR,
-                "timeframe": "M1",
+                "timeframe": "M5",
                 "count": len(candles),
                 "candles": candles,
             },
@@ -502,11 +502,6 @@ def connect_retry():
             logging.exception(
                 "No conectó; reintento en %ss",
                 delay,
-            )
-
-            tg(
-                f"⚠️ Conexión fallida ({type(e).__name__}); "
-                f"reintento en {delay}s"
             )
 
             time.sleep(delay)
@@ -601,7 +596,7 @@ def candle_detail(candle, pair, number=None, state="CERRADA"):
     lower = candle.get("lower_wick", min(candle["open"], candle["close"]) - candle["low"])
     upper = candle.get("upper_wick", candle["high"] - max(candle["open"], candle["close"]))
     return (
-        f"🕯️ VELA M1 {state}{title_number}\n"
+        f"🕯️ VELA M5 {state}{title_number}\n"
         f"Par: {pair}\nHora apertura: {dt}\n"
         f"Color actual: {_color_label(candle.get('color', 'desconocido'))}\n"
         f"Apertura: {_fmt_price(candle['open'])} | Cierre: {_fmt_price(candle['close'])}\n"
@@ -656,7 +651,7 @@ def binary_asset_status(iq, pair):
 
     TURBO es el mercado de opciones binarias que admite expiraciones
     de 1 a 5 minutos en iqoptionapi; por eso un par que no este abierto
-    en TURBO queda bloqueado para analisis y entrada de 1 minuto.
+    en TURBO queda bloqueado para analisis y entrada de 5 minutos.
     """
     try:
         data = iq.get_all_init_v2()
@@ -692,29 +687,29 @@ def binary_asset_status(iq, pair):
             is_open = enabled and not suspended
 
             if is_open:
-                return True, f"{pair} abierto en TURBO | expiracion 1m disponible"
+                return True, f"{pair} abierto en TURBO | expiracion 5m disponible"
 
             return False, f"{pair} TURBO cerrado/suspendido"
 
-        return False, f"{pair} no aparece en TURBO; 1m bloqueado"
+        return False, f"{pair} no aparece en TURBO; 5m bloqueado"
 
     except Exception as e:
         logging.exception(
             "No se pudo comprobar TURBO de %s",
             pair,
         )
-        return False, f"error disponibilidad 1m: {type(e).__name__}: {e}"
+        return False, f"error disponibilidad 5m: {type(e).__name__}: {e}"
 
 
 def wait_binary_asset(iq, pair, attempts=2, delay=0.35):
-    """Comprueba TURBO inmediatamente antes de una entrada de 1 minuto."""
+    """Comprueba TURBO inmediatamente antes de una entrada de 5 minutos."""
     last_reason = "sin respuesta"
 
     for attempt in range(1, attempts + 1):
         is_open, reason = binary_asset_status(iq, pair)
 
         logging.info(
-            "Disponibilidad 1m %s | intento=%d/%d | abierta=%s | %s",
+            "Disponibilidad 5m %s | intento=%d/%d | abierta=%s | %s",
             pair,
             attempt,
             attempts,
@@ -734,7 +729,7 @@ def wait_binary_asset(iq, pair, attempts=2, delay=0.35):
 
 
 def check_binary_availability(iq, pair):
-    """Comprueba exclusivamente disponibilidad TURBO para expiracion 1m."""
+    """Comprueba exclusivamente disponibilidad TURBO para expiracion 5m."""
     return binary_asset_status(iq, pair)
 
 
@@ -772,8 +767,8 @@ def _active_pair_name(active):
     return name.split(".")[-1]
 
 
-def discover_otc_1m_pairs(iq):
-    """Descubre hasta nueve pares OTC ABIERTOS en TURBO para expiración M1."""
+def discover_otc_5m_pairs(iq):
+    """Descubre hasta cincuenta pares OTC ABIERTOS en TURBO para expiración M5."""
     try:
         data = iq.get_all_init_v2()
         actives = _get_turbo_actives(data)
@@ -817,7 +812,7 @@ def discover_otc_1m_pairs(iq):
         pairs = (preferred + others)[:MAX_OTC_PAIRS]
 
         logging.info(
-            "Pares OTC TURBO/1m encontrados: %d/%d | %s",
+            "Pares OTC TURBO/M5 encontrados: %d/%d | %s",
             len(pairs),
             MAX_OTC_PAIRS,
             ", ".join(pairs) if pairs else "NINGUNO",
@@ -826,7 +821,7 @@ def discover_otc_1m_pairs(iq):
         return pairs
 
     except Exception:
-        logging.exception("Error actualizando pares OTC de 1 minuto")
+        logging.exception("Error actualizando pares OTC de 5 minutos")
         return []
 
 def execute_binary_order(iq, pair, signal, amount, expiration):
@@ -859,7 +854,7 @@ def execute_binary_order(iq, pair, signal, amount, expiration):
 def main():
     global received_candles, PAIR, PAIRS
 
-    logging.info("MAIN_INICIO | par=%s | M1 | demo | importe=%.2f | expiracion=%dm", PAIR, AMOUNT, EXPIRATION)
+    logging.info("MAIN_INICIO | par=%s | M5 | demo | importe=%.2f | expiracion=%dm", PAIR, AMOUNT, EXPIRATION)
     start_candles_api()
     iq = connect_retry()
     _ensure_telegram_worker()
@@ -872,25 +867,13 @@ def main():
 
     if AUTO_DISCOVER_PAIRS:
         logging.info("INICIO_DESCUBRIMIENTO | buscando pares OTC TURBO")
-        discovered = discover_otc_1m_pairs(iq)
+        discovered = discover_otc_5m_pairs(iq)
         PAIRS = discovered
     else:
         PAIRS = [PAIR]
     logging.info("PARES_ACTIVOS | modo=%s | cantidad=%d | pares=%s", "auto" if AUTO_DISCOVER_PAIRS else "fijo", len(PAIRS), ", ".join(PAIRS))
     if AUTO_DISCOVER_PAIRS and not discovered:
         logging.warning("No hay pares OTC disponibles en TURBO; se volverá a comprobar disponibilidad.")
-
-    tg(
-        "🟢 Bot iniciado\n"
-        f"Pares activos: {len(PAIRS)} de {MAX_OTC_PAIRS} permitidos\n"
-        + (", ".join(PAIRS) if PAIRS else "Ninguno disponible en TURBO") + "\n"
-        "Temporalidad: M1\n"
-        "Estrategia: sesgo de 10 velas cerradas + espera de retesteo, rechazo y ruptura confirmatoria\n"
-        "No entra por tendencia sola; espera el punto respetado aunque tome varias velas\n"
-        f"Entrada: comienzo de la vela M1 actual | Expiración: {EXPIRATION} minuto\n"
-        f"Importe por operación: {AMOUNT:g}\n"
-        "Indicadores: ninguno | zona estructural por precio + rechazo confirmado"
-    )
 
     while True:
         try:
@@ -903,7 +886,7 @@ def main():
                 logging.info("CICLO_ACTIVO | pares=%d | cola_telegram=%d", len(PAIRS), TG_QUEUE.qsize())
                 last_heartbeat = now_mono
             if AUTO_DISCOVER_PAIRS and now_mono - last_pair_refresh >= PAIR_REFRESH_SECONDS:
-                refreshed = discover_otc_1m_pairs(iq)
+                refreshed = discover_otc_5m_pairs(iq)
                 if refreshed:
                     old = set(PAIRS)
                     PAIRS = list(refreshed[:MAX_OTC_PAIRS])
@@ -914,7 +897,6 @@ def main():
                             if old_pair not in active_set:
                                 state.pop(old_pair, None)
                     if set(PAIRS) != old:
-                        logging.info("Lista OTC actualizada: %d pares | %s", len(PAIRS), ", ".join(PAIRS))
                         logging.info("Lista OTC actualizada: %d pares | %s", len(PAIRS), ", ".join(PAIRS))
                 else:
                     logging.warning("No se pudo actualizar la lista OTC; se conserva la lista anterior")
@@ -927,7 +909,7 @@ def main():
             # Los reportes de análisis se mantienen en los logs; Telegram solo acepta mensajes de ejecución.
             telegram_reports = []
 
-            # Cada ciclo revisa hasta nueve pares OTC abiertos; la lista se refresca cada 15 minutos.
+            # Cada ciclo revisa hasta cincuenta pares OTC abiertos; la lista se refresca cada 15 minutos.
             for pair in list(PAIRS):
                 try:
                     logging.debug("CONSULTANDO_VELAS | par=%s", pair)
@@ -954,8 +936,8 @@ def main():
                     second = int(server_now - current["timestamp"])
                     candle_stamp = current["timestamp"]
 
-                    # La estrategia confirma con las últimas 10 velas M1 CERRADAS.
-                    # La undécima se reevalúa durante su formación para esperar
+                    # La estrategia confirma con las últimas 10 velas M5 CERRADAS.
+                    # La undécima vela M5 se reevalúa durante su formación para esperar
                     # confirmación en tiempo real; las órdenes siguen limitadas a una por vela.
                     # Evita ejecutar una señal antigua si IQ Option entregó velas
                     # desfasadas: la vela de entrada esperada debe ser la actual.
@@ -972,7 +954,7 @@ def main():
 
                     order_text = ""
                     # No perseguir una señal tardía: solo se permite entrada en los
-                    # primeros 20 segundos de la undécima vela M1.
+                    # primeros 20 segundos de la undécima vela M5.
                     if res["signal"] in ("CALL", "PUT") and second > 20:
                         res["signal"] = "NO SIGNAL"
                         res["reason"] = (
@@ -984,7 +966,7 @@ def main():
                         expected_entry_stamp = res.get("entry_candle_timestamp")
                         if expected_entry_stamp != candle_stamp:
                             order_text = (
-                                "\n⛔ ENTRADA BLOQUEADA: la señal no corresponde a la vela M1 actual."
+                                "\n⛔ ENTRADA BLOQUEADA: la señal no corresponde a la vela M5 actual."
                                 f"\nVela esperada: {expected_entry_stamp}; vela actual: {candle_stamp}."
                             )
                         elif last_order_candle.get(pair) == candle_stamp:
@@ -992,7 +974,7 @@ def main():
                         elif not ENABLE_TRADES:
                             order_text = "\n🧪 Señal detectada; operaciones desactivadas."
                         else:
-                            # Una sola orden por par y vela M1. Los otros dos pares
+                            # Una sola orden por par y vela M5. Los otros dos pares
                             # pueden ejecutar una señal independiente en ese mismo minuto.
                             last_order_candle[pair] = candle_stamp
                             ok, oid = execute_binary_order(
@@ -1001,7 +983,7 @@ def main():
                             order_text = (
                                 f"\n\n{'🧪 ORDEN ENVIADA' if ok else '⚠️ ORDEN RECHAZADA'}"
                                 f"\nPar: {pair}\nDirección: {res['signal']}"
-                                f"\nImporte: {AMOUNT:g}\nExpiración: {EXPIRATION} minuto"
+                                f"\nImporte: {AMOUNT:g}\nExpiración: {EXPIRATION} minutos"
                                 f"\nID/respuesta: {oid}"
                             )
                             # Un único mensaje por Telegram, únicamente si IQ Option
@@ -1012,12 +994,12 @@ def main():
                                     f"Par: {pair}\n"
                                     f"Dirección: {res['signal']}\n"
                                     f"Importe: {AMOUNT:g}\n"
-                                    f"Expiración: {EXPIRATION} minuto\n"
+                                    f"Expiración: {EXPIRATION} minutos\n"
                                     f"ID/respuesta: {oid}"
                                 )
 
                     # En Telegram se informa cada evaluación, incluso NO SIGNAL,
-                    # incluyendo las 10 velas cerradas de confirmación y la undécima vela M1 actual
+                    # incluyendo las 10 velas cerradas de confirmación y la undécima vela M5 actual
                     # (vela en la que se intenta entrar).
                     setup_text = "\n".join(
                         _candle_summary(candle, idx)
@@ -1031,11 +1013,11 @@ def main():
                     should_report = last_reported_candle.get(pair) != candle_stamp or bool(order_text)
                     if should_report:
                         telegram_reports.append(
-                            f"⏱️ EVALUACIÓN M1 | vela actual, segundo {second}\n"
+                            f"⏱️ EVALUACIÓN M5 | vela actual, segundo {second}\n"
                             f"Par: {pair}\nSecuencia analizada: {sequence_text}\n"
                             f"Señal: {res['signal']}\nMotivo: {res['reason']}\n\n"
                             f"📚 10 VELAS CERRADAS DE CONTEXTO (TENDENCIA / IMPULSO)\n{setup_text}\n\n"
-                            f"🎯 UNDÉCIMA VELA M1 / ENTRADA\n{entry_candle_text}"
+                            f"🎯 UNDÉCIMA VELA M5 / ENTRADA\n{entry_candle_text}"
                             + ("\n" + order_text.strip() if order_text else "\nOperación pendiente/no ejecutada.")
                         )
                         last_reported_candle[pair] = candle_stamp
