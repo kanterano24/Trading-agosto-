@@ -23,19 +23,20 @@ from strategy import normalize_candles, analyze_market
 
 
 PAIR = os.getenv("PAIR", "ARBUSD-OTC").strip().upper()
-# Solo estos tres pares, en este orden de preferencia. Se verifica que estén
-# disponibles en TURBO antes de analizarlos/operarlos.
+# Analiza hasta nueve pares OTC que estén abiertos en TURBO.
+# Los pares preferidos van primero si están disponibles; los demás se descubren
+# automáticamente. La lista se vuelve a comprobar cada 15 minutos.
 PREFERRED_PAIRS = ["ARBUSD-OTC", "ATOMUSD-OTC", "AUDCAD-OTC"]
 PAIRS = []
-MAX_OTC_PAIRS = 3
+MAX_OTC_PAIRS = 9
 AUTO_DISCOVER_PAIRS = True
-PAIR_REFRESH_SECONDS = 300.0
+PAIR_REFRESH_SECONDS = 900.0
 TF = 60
 COUNT = 200
 EXPIRATION = 1
 # Importe predeterminado: mínimo habitual de IQ Option.
 # Si Railway tiene AMOUNT configurado, esa variable prevalece.
-AMOUNT = float(os.getenv("AMOUNT", "7"))
+AMOUNT = float(os.getenv("AMOUNT", "8"))
 if AMOUNT <= 0:
     raise ValueError("AMOUNT debe ser mayor que 0")
 
@@ -772,7 +773,7 @@ def _active_pair_name(active):
 
 
 def discover_otc_1m_pairs(iq):
-    """Descubre los pares preferidos que estén ABIERTOS en TURBO, máximo tres."""
+    """Descubre hasta nueve pares OTC ABIERTOS en TURBO para expiración M1."""
     try:
         data = iq.get_all_init_v2()
         actives = _get_turbo_actives(data)
@@ -809,9 +810,11 @@ def discover_otc_1m_pairs(iq):
             found.append(pair)
 
         available = set(found)
-        # Limita estrictamente el bot a los tres pares configurados; no agrega
-        # otros activos aunque IQ Option devuelva decenas de pares OTC.
-        pairs = [pair for pair in PREFERRED_PAIRS if pair in available][:MAX_OTC_PAIRS]
+        # Prioriza los pares conocidos y completa la lista con otros OTC abiertos.
+        # Orden estable para evitar cambios innecesarios entre actualizaciones.
+        preferred = [pair for pair in PREFERRED_PAIRS if pair in available]
+        others = sorted(pair for pair in available if pair not in set(preferred))
+        pairs = (preferred + others)[:MAX_OTC_PAIRS]
 
         logging.info(
             "Pares OTC TURBO/1m encontrados: %d/%d | %s",
@@ -875,11 +878,11 @@ def main():
         PAIRS = [PAIR]
     logging.info("PARES_ACTIVOS | modo=%s | cantidad=%d | pares=%s", "auto" if AUTO_DISCOVER_PAIRS else "fijo", len(PAIRS), ", ".join(PAIRS))
     if AUTO_DISCOVER_PAIRS and not discovered:
-        tg("⚠️ Ninguno de los tres pares configurados está disponible en TURBO. El bot seguirá activo y volverá a comprobar disponibilidad.")
+        logging.warning("No hay pares OTC disponibles en TURBO; se volverá a comprobar disponibilidad.")
 
     tg(
         "🟢 Bot iniciado\n"
-        f"Pares activos: {len(PAIRS)} de 3 permitidos\n"
+        f"Pares activos: {len(PAIRS)} de {MAX_OTC_PAIRS} permitidos\n"
         + (", ".join(PAIRS) if PAIRS else "Ninguno disponible en TURBO") + "\n"
         "Temporalidad: M1\n"
         "Estrategia: sesgo de 10 velas cerradas + espera de retesteo, rechazo y ruptura confirmatoria\n"
@@ -903,7 +906,7 @@ def main():
                 refreshed = discover_otc_1m_pairs(iq)
                 if refreshed:
                     old = set(PAIRS)
-                    PAIRS = [pair for pair in PREFERRED_PAIRS if pair in set(refreshed)][:MAX_OTC_PAIRS]
+                    PAIRS = list(refreshed[:MAX_OTC_PAIRS])
                     # Elimina estados de pares que ya no están disponibles.
                     active_set = set(PAIRS)
                     for state in (last_closed_stamp, last_reported_candle, last_order_candle):
@@ -912,7 +915,7 @@ def main():
                                 state.pop(old_pair, None)
                     if set(PAIRS) != old:
                         logging.info("Lista OTC actualizada: %d pares | %s", len(PAIRS), ", ".join(PAIRS))
-                        tg(f"🔄 Pares OTC actualizados: {len(PAIRS)}\n" + ", ".join(PAIRS))
+                        logging.info("Lista OTC actualizada: %d pares | %s", len(PAIRS), ", ".join(PAIRS))
                 else:
                     logging.warning("No se pudo actualizar la lista OTC; se conserva la lista anterior")
                 last_pair_refresh = now_mono
@@ -921,12 +924,10 @@ def main():
                 time.sleep(POLL)
                 continue
 
-            # Se agrupan los informes del ciclo para enviar varias velas por mensaje
-            # y evitar que Telegram se sature al analizar los tres pares.
+            # Los reportes de análisis se mantienen en los logs; Telegram solo acepta mensajes de ejecución.
             telegram_reports = []
 
-            # Cada ciclo revisa únicamente los tres pares preferidos que estén abiertos.
-            # discover_otc_1m_pairs aplica la lista permitida y no agrega otros activos.
+            # Cada ciclo revisa hasta nueve pares OTC abiertos; la lista se refresca cada 15 minutos.
             for pair in list(PAIRS):
                 try:
                     logging.debug("CONSULTANDO_VELAS | par=%s", pair)
@@ -1044,8 +1045,7 @@ def main():
                     continue
 
             # Un lote por ciclo (dividido en mensajes seguros para Telegram).
-            # Esto reduce drásticamente el número de envíos frente a 50 mensajes
-            # individuales por cada vela/par.
+            # Los reportes de análisis se guardan solo en logs; Telegram solo recibe órdenes aceptadas.
             send_telegram_batches(telegram_reports)
 
         except Exception:
