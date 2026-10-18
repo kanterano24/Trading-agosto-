@@ -1,13 +1,14 @@
-"""Estrategia M1 de presión y reversión.
-
-Analiza presión bajista/alcista en velas cerradas y busca una vela de reversión
-que confirme el cambio. CALL tras presión bajista; PUT tras presión alcista.
-La señal se ejecuta en la vela M1 siguiente. No garantiza resultados.
+"""Estrategia M1: presión previa + reversión cerrada + entrada en la vela siguiente.
+No garantiza resultados; probar en demo antes de usar dinero real.
 """
+import math
 
 
 def _finite(value):
-    return value == value and value not in (float("inf"), float("-inf"))
+    try:
+        return math.isfinite(float(value))
+    except (TypeError, ValueError, OverflowError):
+        return False
 
 
 def normalize_candles(raw):
@@ -16,16 +17,14 @@ def normalize_candles(raw):
     for candle in raw or []:
         try:
             ts = int(float(candle.get("from", candle.get("at", candle.get("timestamp", 0)))))
-            op = float(candle["open"])
-            cl = float(candle["close"])
+            op, cl = float(candle["open"]), float(candle["close"])
             low = float(candle.get("min", candle.get("low", min(op, cl))))
             high = float(candle.get("max", candle.get("high", max(op, cl))))
             if ts <= 0 or not all(_finite(v) for v in (op, cl, low, high)):
                 continue
             if high < max(op, cl) or low > min(op, cl) or low > high:
                 continue
-            rng = high - low
-            body = abs(cl - op)
+            rng, body = high - low, abs(cl - op)
             out[ts] = {
                 "timestamp": ts, "open": op, "close": cl,
                 "min": low, "max": high, "low": low, "high": high,
@@ -59,15 +58,14 @@ def format_candle(index, candle):
 
 
 def analyze_market(raw, current=None, pair=None):
-    """Compara presión, agotamiento y ubicación del precio para elegir reversiones mejores.
+    """Evalúa tres velas de presión y exige una cuarta vela cerrada de reversión.
 
-    Usa las tres últimas velas M1 cerradas como velas previas a la entrada.
-    Una señal solo se habilita para la apertura de la vela siguiente.
-    Incluye OHLC de las tres velas en la señal; el bot solo las enviará a Telegram
-    si esa señal termina siendo la orden ejecutada.
+    Si las tres velas previas presionan hacia abajo, CALL requiere una vela verde
+    de reversión con rechazo inferior y cerca del mínimo reciente. PUT es simétrico.
+    La señal solo es válida para la apertura de la vela M1 inmediatamente posterior.
     """
     candles = normalize_candles(raw)
-    recent = candles[-8:]
+    recent = candles[-10:]
     code = {"green": "V", "red": "R", "doji": "D"}
     base = {
         "signal": "NO SIGNAL", "bias": "NEUTRAL", "call_score": 0,
@@ -76,100 +74,90 @@ def analyze_market(raw, current=None, pair=None):
         "sequence_text": "-".join(code[c["color"]] for c in recent),
         "entry_timing": "NEXT_M1_CANDLE_OPEN", "entry_candle_timestamp": None,
         "trend": "NEUTRAL", "impulse": False,
-        "reason": "Sin señal: faltan velas cerradas para medir la presión.",
+        "reason": "Sin señal: faltan velas cerradas para evaluar presión y reversión.",
     }
-    if len(candles) < 3:
+    if len(candles) < 4:
         return base
 
-    pressure = candles[-3:]
-    # Datos de las tres velas que preceden a la potencial entrada.
-    candle_snapshot = [dict(c) for c in pressure]
-    base["candles_before_entry"] = candle_snapshot
-    if any(c["color"] == "doji" for c in pressure):
-        base["reason"] = "Sin señal: contexto de presión poco claro por velas doji."
+    pressure = candles[-4:-1]
+    reversal = candles[-1]
+    # Tres velas cerradas más recientes antes de la entrada, incluida la confirmación.
+    base["candles_before_entry"] = [dict(c) for c in candles[-3:]]
+    base["pressure_candles_data"] = [dict(c) for c in pressure]
+    if any(c["color"] == "doji" for c in pressure) or reversal["color"] == "doji":
+        base["reason"] = "Sin señal: doji en presión o reversión; se exige confirmación clara."
+        return base
+    if any(c["range"] <= 0 for c in pressure + [reversal]):
+        base["reason"] = "Sin señal: una vela no tiene rango suficiente."
         return base
 
     reds = sum(c["color"] == "red" for c in pressure)
     greens = sum(c["color"] == "green" for c in pressure)
-    first, middle, last = pressure
-    if last["range"] <= 0 or last["body"] <= 0:
-        base["reason"] = "Sin señal: la vela de presión no tiene rango/cuerpo suficiente."
-        return base
+    first, _, last_pressure = pressure
+    pressure_down = reds >= 2 and last_pressure["close"] < first["close"]
+    pressure_up = greens >= 2 and last_pressure["close"] > first["close"]
 
-    body_ratio = last["body"] / last["range"]
-    lower_ratio = last["lower_wick"] / last["range"]
-    upper_ratio = last["upper_wick"] / last["range"]
-    down_pressure = reds >= 2 and last["color"] == "red" and last["close"] < first["close"]
-    up_pressure = greens >= 2 and last["color"] == "green" and last["close"] > first["close"]
-
-    # Puntuación de ubicación: premia que la vela de presión alcance un extremo
-    # reciente, en vez de entrar tras un movimiento ya extendido en mitad del rango.
-    location_window = candles[-8:-3] + pressure
-    if not location_window:
-        location_window = pressure
-    recent_low = min(c["low"] for c in location_window)
-    recent_high = max(c["high"] for c in location_window)
+    zone = candles[-10:]
+    recent_low = min(c["low"] for c in zone)
+    recent_high = max(c["high"] for c in zone)
     total_range = max(recent_high - recent_low, 1e-12)
-    low_location = max(0.0, min(1.0, 1.0 - (last["low"] - recent_low) / total_range))
-    high_location = max(0.0, min(1.0, 1.0 - (recent_high - last["high"]) / total_range))
+    low_location = max(0.0, min(1.0, 1.0 - (reversal["low"] - recent_low) / total_range))
+    high_location = max(0.0, min(1.0, 1.0 - (recent_high - reversal["high"]) / total_range))
+    body_ratio = reversal["body"] / reversal["range"]
+    lower_ratio = reversal["lower_wick"] / reversal["range"]
+    upper_ratio = reversal["upper_wick"] / reversal["range"]
+    close_pos = (reversal["close"] - reversal["low"]) / reversal["range"]
 
-    if down_pressure:
-        # Para CALL: rechazo inferior real, y el cierre no debe quedar pegado al mínimo.
-        close_rejection = (last["close"] - last["low"]) / last["range"]
-        exhaustion = lower_ratio >= 0.20 or body_ratio <= 0.50
-        if not exhaustion or close_rejection < 0.20:
+    if pressure_down:
+        # Filtros obligatorios: no basta con que la puntuación sea alta.
+        if reversal["color"] != "green" or lower_ratio < 0.20 or close_pos < 0.60 or low_location < 0.55 or body_ratio < 0.20:
             base.update({"pressure": "BAJISTA", "reason":
-                "Presión bajista sin rechazo inferior suficientemente claro; se evita una entrada tardía."})
+                "Presión bajista detectada, pero falta reversión alcista confirmada: vela verde, rechazo inferior y ubicación baja."})
             return base
-        pressure_score = 25 * (reds / 3.0)
-        exhaustion_score = 35 * min(1.0, lower_ratio / 0.45) * (1.0 if body_ratio <= 0.65 else 0.75)
-        rejection_score = 20 * min(1.0, close_rejection / 0.60)
-        location_score = 20 * low_location
-        score = max(1, min(100, round(pressure_score + exhaustion_score + rejection_score + location_score)))
+        pscore = 25 * reds / 3.0
+        escore = 25 * min(1.0, lower_ratio / 0.40)
+        rscore = 25 * min(1.0, max(0.0, (close_pos - 0.50) / 0.40))
+        lscore = 25 * min(1.0, low_location / 0.80)
+        score = round(pscore + escore + rscore + lscore)
         base.update({
             "signal": "CALL", "bias": "CALL", "trend": "REVERSIÓN_ALCISTA",
             "call_score": score, "put_score": 0, "score": score, "impulse": True,
             "pressure": "BAJISTA", "pressure_candles": 3,
-            "pressure_timestamp": last["timestamp"],
-            "entry_candle_timestamp": last["timestamp"] + 60,
-            "location_score": round(location_score),
-            "exhaustion_score": round(exhaustion_score),
-            "rejection_score": round(rejection_score),
-            "reason": (f"CALL: presión bajista con rechazo inferior y ubicación evaluados; "
-                       f"presión={pressure_score:.0f}, agotamiento={exhaustion_score:.0f}, "
-                       f"rechazo={rejection_score:.0f}, zona={location_score:.0f}; score={score}/100."),
+            "pressure_timestamp": reversal["timestamp"],
+            "entry_candle_timestamp": reversal["timestamp"] + 60,
+            "location_score": round(lscore), "exhaustion_score": round(escore),
+            "rejection_score": round(rscore),
+            "reason": (f"CALL confirmado: presión bajista previa + vela verde de reversión; "
+                       f"presión={pscore:.0f}, agotamiento={escore:.0f}, rechazo={rscore:.0f}, "
+                       f"zona={lscore:.0f}; score={score}/100."),
         })
         return base
 
-    if up_pressure:
-        # Para PUT: rechazo superior real, y el cierre no debe quedar pegado al máximo.
-        close_rejection = (last["high"] - last["close"]) / last["range"]
-        exhaustion = upper_ratio >= 0.20 or body_ratio <= 0.50
-        if not exhaustion or close_rejection < 0.20:
+    if pressure_up:
+        if reversal["color"] != "red" or upper_ratio < 0.20 or close_pos > 0.40 or high_location < 0.55 or body_ratio < 0.20:
             base.update({"pressure": "ALCISTA", "reason":
-                "Presión alcista sin rechazo superior suficientemente claro; se evita una entrada tardía."})
+                "Presión alcista detectada, pero falta reversión bajista confirmada: vela roja, rechazo superior y ubicación alta."})
             return base
-        pressure_score = 25 * (greens / 3.0)
-        exhaustion_score = 35 * min(1.0, upper_ratio / 0.45) * (1.0 if body_ratio <= 0.65 else 0.75)
-        rejection_score = 20 * min(1.0, close_rejection / 0.60)
-        location_score = 20 * high_location
-        score = max(1, min(100, round(pressure_score + exhaustion_score + rejection_score + location_score)))
+        pscore = 25 * greens / 3.0
+        escore = 25 * min(1.0, upper_ratio / 0.40)
+        rscore = 25 * min(1.0, max(0.0, (0.50 - close_pos) / 0.40))
+        lscore = 25 * min(1.0, high_location / 0.80)
+        score = round(pscore + escore + rscore + lscore)
         base.update({
             "signal": "PUT", "bias": "PUT", "trend": "REVERSIÓN_BAJISTA",
             "call_score": 0, "put_score": score, "score": score, "impulse": True,
             "pressure": "ALCISTA", "pressure_candles": 3,
-            "pressure_timestamp": last["timestamp"],
-            "entry_candle_timestamp": last["timestamp"] + 60,
-            "location_score": round(location_score),
-            "exhaustion_score": round(exhaustion_score),
-            "rejection_score": round(rejection_score),
-            "reason": (f"PUT: presión alcista con rechazo superior y ubicación evaluados; "
-                       f"presión={pressure_score:.0f}, agotamiento={exhaustion_score:.0f}, "
-                       f"rechazo={rejection_score:.0f}, zona={location_score:.0f}; score={score}/100."),
+            "pressure_timestamp": reversal["timestamp"],
+            "entry_candle_timestamp": reversal["timestamp"] + 60,
+            "location_score": round(lscore), "exhaustion_score": round(escore),
+            "rejection_score": round(rscore),
+            "reason": (f"PUT confirmado: presión alcista previa + vela roja de reversión; "
+                       f"presión={pscore:.0f}, agotamiento={escore:.0f}, rechazo={rscore:.0f}, "
+                       f"zona={lscore:.0f}; score={score}/100."),
         })
         return base
 
-    base["reason"] = "Sin señal: las tres velas cerradas no muestran presión direccional suficiente."
+    base["reason"] = "Sin señal: las tres velas previas no muestran presión direccional suficiente."
     return base
 
 

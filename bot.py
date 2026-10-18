@@ -23,9 +23,8 @@ from strategy import normalize_candles, analyze_market
 
 
 PAIR = os.getenv("PAIR", "ARBUSD-OTC").strip().upper()
-# Analiza hasta 50 pares OTC que estén abiertos en TURBO.
-# Los pares preferidos van primero si están disponibles; los demás se descubren
-# automáticamente. La lista se vuelve a comprobar cada 15 minutos.
+# Analiza seis pares OTC abiertos en TURBO. Los preferidos van primero;
+# la lista se vuelve a comprobar cada 15 minutos.
 PREFERRED_PAIRS = ["EURUSD-OTC", "GBPUSD-OTC", "USDJPY-OTC", "AUDUSD-OTC", "EURJPY-OTC", "GBPJPY-OTC"]
 PAIRS = []
 MAX_OTC_PAIRS = 6
@@ -834,7 +833,7 @@ def discover_otc_m1_pairs(iq):
         if not all_pairs:
             return []
 
-        # Analiza hasta 50 pares disponibles; actualiza la lista cada 15 minutos.
+        # Selecciona hasta seis pares disponibles; actualiza la lista cada 15 minutos.
         pairs = all_pairs[:MAX_OTC_PAIRS]
 
         logging.info(
@@ -986,7 +985,8 @@ def main():
                     logging.exception("Error analizando el par %s", pair)
                     continue
 
-            # Escoge un único candidato global por minuto: mayor puntuación combinada de presión, rechazo y ubicación.
+            # Escoge un único candidato global por minuto. La estrategia ya exige presión,
+            # reversión cerrada, rechazo y ubicación antes de permitir una señal.
             if candidates and broker_now is not None:
                 minute_key = int(broker_now // 60)
                 if last_global_entry_minute != minute_key:
