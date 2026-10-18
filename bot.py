@@ -28,9 +28,11 @@ PAIR = os.getenv("PAIR", "ARBUSD-OTC").strip().upper()
 # automáticamente. La lista se vuelve a comprobar cada 15 minutos.
 PREFERRED_PAIRS = ["ARBUSD-OTC", "ATOMUSD-OTC", "AUDCAD-OTC"]
 PAIRS = []
-MAX_OTC_PAIRS = 50
+MAX_OTC_PAIRS = 2
 AUTO_DISCOVER_PAIRS = True
-PAIR_REFRESH_SECONDS = 900.0
+# La lista rota únicamente después de que los dos pares activos ejecuten
+# una operación aceptada cada uno.
+PAIR_ROTATION_OFFSET = 0
 TF = 300
 COUNT = 200
 EXPIRATION = 5
@@ -768,7 +770,8 @@ def _active_pair_name(active):
 
 
 def discover_otc_5m_pairs(iq):
-    """Descubre hasta cincuenta pares OTC ABIERTOS en TURBO para expiración M5."""
+    """Selecciona dos pares OTC abiertos; avanza por la lista disponible en cada rotación."""
+    global PAIR_ROTATION_OFFSET
     try:
         data = iq.get_all_init_v2()
         actives = _get_turbo_actives(data)
@@ -809,15 +812,25 @@ def discover_otc_5m_pairs(iq):
         # Orden estable para evitar cambios innecesarios entre actualizaciones.
         preferred = [pair for pair in PREFERRED_PAIRS if pair in available]
         others = sorted(pair for pair in available if pair not in set(preferred))
-        pairs = (preferred + others)[:MAX_OTC_PAIRS]
+        all_pairs = preferred + others
+        if not all_pairs:
+            return []
+
+        # Selecciona dos pares consecutivos y rota a los siguientes en la próxima
+        # llamada, evitando quedarse siempre con los mismos dos primeros.
+        start = PAIR_ROTATION_OFFSET % len(all_pairs)
+        end = start + MAX_OTC_PAIRS
+        if end <= len(all_pairs):
+            pairs = all_pairs[start:end]
+        else:
+            pairs = all_pairs[start:] + all_pairs[:end - len(all_pairs)]
+        PAIR_ROTATION_OFFSET = (start + MAX_OTC_PAIRS) % len(all_pairs)
 
         logging.info(
-            "Pares OTC TURBO/M5 encontrados: %d/%d | %s",
-            len(pairs),
-            MAX_OTC_PAIRS,
+            "Pares OTC TURBO/M5 encontrados: %d disponibles; seleccionados %d/%d | %s",
+            len(all_pairs), len(pairs), MAX_OTC_PAIRS,
             ", ".join(pairs) if pairs else "NINGUNO",
         )
-
         return pairs
 
     except Exception:
@@ -862,8 +875,9 @@ def main():
     last_closed_stamp = {}       # último cierre procesado por par
     last_reported_candle = {}    # limita los reportes rutinarios a uno por vela
     last_order_candle = {}       # evita duplicar una orden por par/vela
-    last_pair_refresh = time.monotonic()
     last_heartbeat = 0.0
+    last_rotation_attempt = 0.0
+    cycle_traded_pairs = set()  # pares que ya ejecutaron una operación en el ciclo actual
 
     if AUTO_DISCOVER_PAIRS:
         logging.info("INICIO_DESCUBRIMIENTO | buscando pares OTC TURBO")
@@ -879,37 +893,18 @@ def main():
         try:
             if not iq.check_connect():
                 iq = connect_retry()
-                last_pair_refresh = 0.0
 
             now_mono = time.monotonic()
             if now_mono - last_heartbeat >= 30.0:
                 logging.info("CICLO_ACTIVO | pares=%d | cola_telegram=%d", len(PAIRS), TG_QUEUE.qsize())
                 last_heartbeat = now_mono
-            if AUTO_DISCOVER_PAIRS and now_mono - last_pair_refresh >= PAIR_REFRESH_SECONDS:
-                refreshed = discover_otc_5m_pairs(iq)
-                if refreshed:
-                    old = set(PAIRS)
-                    PAIRS = list(refreshed[:MAX_OTC_PAIRS])
-                    # Elimina estados de pares que ya no están disponibles.
-                    active_set = set(PAIRS)
-                    for state in (last_closed_stamp, last_reported_candle, last_order_candle):
-                        for old_pair in list(state):
-                            if old_pair not in active_set:
-                                state.pop(old_pair, None)
-                    if set(PAIRS) != old:
-                        logging.info("Lista OTC actualizada: %d pares | %s", len(PAIRS), ", ".join(PAIRS))
-                else:
-                    logging.warning("No se pudo actualizar la lista OTC; se conserva la lista anterior")
-                last_pair_refresh = now_mono
-
             if not PAIRS:
                 time.sleep(POLL)
                 continue
 
             # Los reportes de análisis se mantienen en los logs; Telegram solo acepta mensajes de ejecución.
-            telegram_reports = []
 
-            # Cada ciclo revisa hasta cincuenta pares OTC abiertos; la lista se refresca cada 15 minutos.
+            # Cada ciclo revisa únicamente los dos pares activos del ciclo actual.
             for pair in list(PAIRS):
                 try:
                     logging.debug("CONSULTANDO_VELAS | par=%s", pair)
@@ -925,10 +920,6 @@ def main():
                     closed_stamp = closed[-1]["timestamp"]
                     if last_closed_stamp.get(pair) != closed_stamp:
                         last_closed_stamp[pair] = closed_stamp
-                        telegram_reports.append(
-                            candle_message(closed[-1], len(closed), pair=pair)
-                            + f"\nHistorial cerrado disponible: {len(closed)} velas"
-                        )
 
                     if current is None or len(closed) < 10:
                         continue
@@ -962,7 +953,10 @@ def main():
                             f"(segundo {second}; límite 20s). Se espera la siguiente oportunidad."
                         )
 
-                    if res["signal"] in ("CALL", "PUT"):
+                    if res["signal"] in ("CALL", "PUT") and pair in cycle_traded_pairs:
+                        order_text = "\n⏸️ Par en pausa: ya ejecutó una operación en este ciclo; espera a que el otro par también opere."
+
+                    if res["signal"] in ("CALL", "PUT") and pair not in cycle_traded_pairs:
                         expected_entry_stamp = res.get("entry_candle_timestamp")
                         if expected_entry_stamp != candle_stamp:
                             order_text = (
@@ -974,8 +968,8 @@ def main():
                         elif not ENABLE_TRADES:
                             order_text = "\n🧪 Señal detectada; operaciones desactivadas."
                         else:
-                            # Una sola orden por par y vela M5. Los otros dos pares
-                            # pueden ejecutar una señal independiente en ese mismo minuto.
+                            # Una sola orden por par y vela M5; cada par solo puede
+                            # ejecutar una operación aceptada por ciclo de dos pares.
                             last_order_candle[pair] = candle_stamp
                             ok, oid = execute_binary_order(
                                 iq, pair, res["signal"], AMOUNT, EXPIRATION
@@ -997,48 +991,54 @@ def main():
                                     f"Expiración: {EXPIRATION} minutos\n"
                                     f"ID/respuesta: {oid}"
                                 )
+                                cycle_traded_pairs.add(pair)
+                                logging.info(
+                                    "OPERACION_CICLO | par=%s | pares_con_operacion=%d/%d",
+                                    pair, len(cycle_traded_pairs), len(PAIRS)
+                                )
 
-                    # En Telegram se informa cada evaluación, incluso NO SIGNAL,
-                    # incluyendo las 10 velas cerradas de confirmación y la undécima vela M5 actual
-                    # (vela en la que se intenta entrar).
-                    setup_text = "\n".join(
-                        _candle_summary(candle, idx)
-                        for idx, candle in enumerate(setup_candles, start=1)
-                    )
-                    entry_candle_text = candle_detail(
-                        current, pair, state="ACTUAL / VELA DE ENTRADA (EN FORMACIÓN)"
-                    )
-                    # Reporta una evaluación rutinaria por vela para no saturar Telegram.
-                    # Si luego se ejecuta o rechaza una orden, reporta ese evento de inmediato.
-                    should_report = last_reported_candle.get(pair) != candle_stamp or bool(order_text)
-                    if should_report:
-                        telegram_reports.append(
-                            f"⏱️ EVALUACIÓN M5 | vela actual, segundo {second}\n"
-                            f"Par: {pair}\nSecuencia analizada: {sequence_text}\n"
-                            f"Señal: {res['signal']}\nMotivo: {res['reason']}\n\n"
-                            f"📚 10 VELAS CERRADAS DE CONTEXTO (TENDENCIA / IMPULSO)\n{setup_text}\n\n"
-                            f"🎯 UNDÉCIMA VELA M5 / ENTRADA\n{entry_candle_text}"
-                            + ("\n" + order_text.strip() if order_text else "\nOperación pendiente/no ejecutada.")
-                        )
-                        last_reported_candle[pair] = candle_stamp
 
                 except Exception:
                     logging.exception("Error procesando el par %s", pair)
                     continue
 
-            # Un lote por ciclo (dividido en mensajes seguros para Telegram).
-            # Los reportes de análisis se guardan solo en logs; Telegram solo recibe órdenes aceptadas.
-            send_telegram_batches(telegram_reports)
+            # La lista de dos pares solo se actualiza cuando AMBOS pares activos
+            # han ejecutado una operación aceptada. Hasta entonces, un par que ya
+            # operó queda en pausa y el bot sigue esperando al segundo.
+            active_pair_set = set(PAIRS)
+            if (AUTO_DISCOVER_PAIRS and len(active_pair_set) == 2
+                    and active_pair_set.issubset(cycle_traded_pairs)
+                    and now_mono - last_rotation_attempt >= 15.0):
+                previous_pairs = list(PAIRS)
+                last_rotation_attempt = now_mono
+                refreshed = discover_otc_5m_pairs(iq)
+                if refreshed:
+                    PAIRS = list(refreshed[:MAX_OTC_PAIRS])
+                    cycle_traded_pairs.clear()
+                    active_set = set(PAIRS)
+                    for state in (last_closed_stamp, last_reported_candle, last_order_candle):
+                        for old_pair in list(state):
+                            if old_pair not in active_set:
+                                state.pop(old_pair, None)
+                    logging.info(
+                        "ROTACION_PARES tras operar ambos | anteriores=%s | nuevos=%s",
+                        ", ".join(previous_pairs), ", ".join(PAIRS)
+                    )
+                else:
+                    logging.warning(
+                        "Ambos pares ya operaron, pero no se pudo actualizar la lista; "
+                        "se conservan los pares actuales y se reintentará."
+                    )
+
+            # Telegram solo recibe el aviso de una orden aceptada por IQ Option.
 
         except Exception:
             logging.exception("Error de ciclo principal")
             try:
                 if not iq.check_connect():
                     iq = connect_retry()
-                    last_pair_refresh = 0.0
             except Exception:
                 iq = connect_retry()
-                last_pair_refresh = 0.0
 
         time.sleep(POLL)
 
