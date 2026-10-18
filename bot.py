@@ -28,14 +28,14 @@ PAIR = os.getenv("PAIR", "ARBUSD-OTC").strip().upper()
 # automáticamente. La lista se vuelve a comprobar cada 15 minutos.
 PREFERRED_PAIRS = ["ARBUSD-OTC", "ATOMUSD-OTC", "AUDCAD-OTC"]
 PAIRS = []
-MAX_OTC_PAIRS = 9
+MAX_OTC_PAIRS = 50
 AUTO_DISCOVER_PAIRS = True
 # La lista rota únicamente después de que los dos pares activos ejecuten
 # una operación aceptada cada uno.
 PAIR_ROTATION_OFFSET = 0
 TF = 60
 COUNT = 200
-EXPIRATION = 1
+EXPIRATION = 2
 # Importe predeterminado: mínimo habitual de IQ Option.
 # Si Railway tiene AMOUNT configurado, esa variable prevalece.
 AMOUNT = float(os.getenv("AMOUNT", "5"))
@@ -788,7 +788,7 @@ def _active_pair_name(active):
 
 
 def discover_otc_m1_pairs(iq):
-    """Selecciona dos pares OTC abiertos; avanza por la lista disponible en cada rotación."""
+    """Selecciona hasta 50 pares OTC abiertos y disponibles."""
     global PAIR_ROTATION_OFFSET
     try:
         data = iq.get_all_init_v2()
@@ -834,15 +834,8 @@ def discover_otc_m1_pairs(iq):
         if not all_pairs:
             return []
 
-        # Selecciona dos pares consecutivos y rota a los siguientes en la próxima
-        # llamada, evitando quedarse siempre con los mismos dos primeros.
-        start = PAIR_ROTATION_OFFSET % len(all_pairs)
-        end = start + MAX_OTC_PAIRS
-        if end <= len(all_pairs):
-            pairs = all_pairs[start:end]
-        else:
-            pairs = all_pairs[start:] + all_pairs[:end - len(all_pairs)]
-        PAIR_ROTATION_OFFSET = (start + MAX_OTC_PAIRS) % len(all_pairs)
+        # Analiza hasta 50 pares disponibles; actualiza la lista cada 15 minutos.
+        pairs = all_pairs[:MAX_OTC_PAIRS]
 
         logging.info(
             "Pares OTC TURBO/M1 encontrados: %d disponibles; seleccionados %d/%d | %s",
@@ -946,7 +939,7 @@ def main():
 
             # Los reportes de análisis se mantienen en los logs; Telegram solo acepta mensajes de ejecución.
 
-            # Cada ciclo revisa únicamente los dos pares activos del ciclo actual.
+            # Cada ciclo revisa todos los pares activos de la lista (hasta 50).
             for pair in list(PAIRS):
                 try:
                     logging.debug("CONSULTANDO_VELAS | par=%s", pair)
@@ -969,11 +962,8 @@ def main():
                     second = int(server_now - current["timestamp"])
                     candle_stamp = current["timestamp"]
 
-                    # La estrategia confirma con las últimas 10 velas M1 CERRADAS.
-                    # La siguiente vela M1 se reevalúa durante su formación para esperar
-                    # confirmación en tiempo real; las órdenes siguen limitadas a una por vela.
-                    # Evita ejecutar una señal antigua si IQ Option entregó velas
-                    # desfasadas: la vela de entrada esperada debe ser la actual.
+                    # Analiza la última vela M1 cerrada y programa la entrada en la
+                    # siguiente vela, al segundo 30 del reloj del servidor de IQ Option.
                     setup_candles = closed[-10:]
                     res = analyze_market(setup_candles, current=current, pair=pair)
                     sequence_text = "-".join(
@@ -986,14 +976,11 @@ def main():
                     )
 
                     order_text = ""
-                    # No perseguir una señal tardía: solo se permite entrada en los
-                    # primeros 20 segundos de la undécima vela M1.
-                    if res["signal"] in ("CALL", "PUT") and second > 12:
+                    # Ejecutar únicamente alrededor del segundo 30 de la vela M1 actual.
+                    # Ventana de 30-35s para compensar latencia de consulta y envío.
+                    if res["signal"] in ("CALL", "PUT") and not (30 <= second <= 35):
                         res["signal"] = "NO SIGNAL"
-                        res["reason"] = (
-                            "Entrada cancelada: la vela actual confirmó demasiado tarde "
-                            f"(segundo {second}; límite 12s). Se espera la siguiente oportunidad."
-                        )
+                        res["reason"] = f"Señal pendiente: segundo del broker={second}; entrada solo entre 30 y 35."
 
                     if res["signal"] in ("CALL", "PUT") and pair in traded_pairs:
                         order_text = "\n⏸️ Entrada bloqueada: este par ya operó durante esta ejecución del bot."
@@ -1054,7 +1041,7 @@ def main():
                     logging.exception("Error procesando el par %s", pair)
                     continue
 
-            # Actualizar los 9 pares disponibles cada 15 minutos, independientemente de las operaciones.
+            # Actualizar hasta 50 pares disponibles cada 15 minutos, independientemente de las operaciones.
             if AUTO_DISCOVER_PAIRS and now_mono - last_pairs_refresh >= refresh_pairs_interval:
                 previous_pairs = list(PAIRS)
                 refreshed = discover_otc_m1_pairs(iq)
