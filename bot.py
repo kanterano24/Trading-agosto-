@@ -1,4 +1,4 @@
-"""Bot OTC M1: patrón de reversión en cuatro velas, expiración de 1 minuto.
+"""Bot OTC M1: presión completa y entrada de reversión al abrir la vela siguiente, expiración de 1 minuto.
 
 - Obtiene únicamente velas M1 cerradas desde IQ Option.
 - Telegram solo recibe confirmaciones de órdenes ejecutadas correctamente.
@@ -898,7 +898,7 @@ def execute_binary_order(iq, pair, signal, amount, expiration):
 def main():
     global received_candles, PAIR, PAIRS
 
-    logging.info("MAIN_INICIO | presión y reversión M1 | DEMO | importe=%.2f | expiración=%dm", AMOUNT, EXPIRATION)
+    logging.info("MAIN_INICIO | presión completa y reversión en apertura de siguiente M1 | DEMO | importe=%.2f | expiración=%dm", AMOUNT, EXPIRATION)
     start_candles_api()
     iq = connect_retry()
     _ensure_telegram_worker()
@@ -971,9 +971,10 @@ def main():
                         continue
                     if res.get("entry_candle_timestamp") != current_stamp:
                         continue
-                    # La vela actual es la siguiente a la vela de reversión. Entrar
-                    # solo entre los segundos 30-35 del reloj del broker.
-                    if not (30 <= second <= 35):
+                    # La vela de presión ya está completamente cerrada. Ejecutar
+                    # en la apertura de la vela M1 siguiente, no 30 segundos después.
+                    # Se permite una ventana corta por la latencia de la API/red.
+                    if not (0 <= second <= 8):
                         continue
                     if last_order_candle.get(pair) == current_stamp:
                         continue
