@@ -986,7 +986,7 @@ def main():
                     logging.exception("Error analizando el par %s", pair)
                     continue
 
-            # Escoge un único candidato global por minuto: score mayor primero.
+            # Escoge un único candidato global por minuto: mayor puntuación combinada de presión, rechazo y ubicación.
             if candidates and broker_now is not None:
                 minute_key = int(broker_now // 60)
                 if last_global_entry_minute != minute_key:
@@ -1012,7 +1012,15 @@ def main():
                             f"Par: {pair}\nDirección: {signal}\nImporte: {AMOUNT:g}\n"
                             f"Expiración: {EXPIRATION} minutos\nID de orden: {oid}\n"
                             f"Presión previa: {chosen.get('pressure', 'N/D')}\n"
-                            f"Puntuación del patrón: {chosen.get('score', 0)}/100"
+                            f"Puntuación de oportunidad: {chosen.get('score', 0)}/100\n"
+                            f"Ubicación: {chosen.get('location_score', 0)}/20 | "
+                            f"Agotamiento: {chosen.get('exhaustion_score', 0)}/35 | "
+                            f"Rechazo: {chosen.get('rejection_score', 0)}/20\n"
+                            "\n📊 TRES VELAS ANTERIORES A LA ENTRADA\n"
+                            + "\n".join(
+                                _candle_summary(candle, idx)
+                                for idx, candle in enumerate(chosen.get("candles_before_entry", []), start=1)
+                            )
                         )
                         tg(message)
                         logging.info("MEJOR_SEÑAL_EJECUTADA | par=%s | dirección=%s | score=%s | id=%s", pair, signal, chosen.get("score", 0), oid)
