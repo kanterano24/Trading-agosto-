@@ -1,6 +1,6 @@
-"""Bot OTC M5: analiza velas cerradas de 5 minutos y ejecuta en la siguiente vela M5.
+"""Bot OTC M1: analiza velas de 1 minuto y ejecuta con expiración de 1 minuto.
 
-- Obtiene únicamente velas M5 cerradas desde IQ Option.
+- Obtiene únicamente velas M1 cerradas desde IQ Option.
 - Telegram solo recibe confirmaciones de órdenes ejecutadas correctamente.
 - NO usa Telegram getUpdates.
 - Expone /health, /candles y /openapi.json para consultas externas.
@@ -28,14 +28,14 @@ PAIR = os.getenv("PAIR", "ARBUSD-OTC").strip().upper()
 # automáticamente. La lista se vuelve a comprobar cada 15 minutos.
 PREFERRED_PAIRS = ["ARBUSD-OTC", "ATOMUSD-OTC", "AUDCAD-OTC"]
 PAIRS = []
-MAX_OTC_PAIRS = 2
+MAX_OTC_PAIRS = 9
 AUTO_DISCOVER_PAIRS = True
 # La lista rota únicamente después de que los dos pares activos ejecuten
 # una operación aceptada cada uno.
 PAIR_ROTATION_OFFSET = 0
-TF = 300
+TF = 60
 COUNT = 200
-EXPIRATION = 5
+EXPIRATION = 1
 # Importe predeterminado: mínimo habitual de IQ Option.
 # Si Railway tiene AMOUNT configurado, esa variable prevalece.
 AMOUNT = float(os.getenv("AMOUNT", "5"))
@@ -241,7 +241,7 @@ OPENAPI_SPEC = {
         "title": "OTC Candles API",
         "version": "1.0.0",
         "description": (
-            "API de solo lectura para consultar las velas M5 "
+            "API de solo lectura para consultar las velas M1 "
             "cerradas de EURUSD-OTC."
         ),
     },
@@ -265,9 +265,9 @@ OPENAPI_SPEC = {
         "/candles": {
             "get": {
                 "operationId": "getCandles",
-                "summary": "Obtiene las velas M5 cerradas",
+                "summary": "Obtiene las velas M1 cerradas",
                 "description": (
-                    "Devuelve el historial actual de velas M5 "
+                    "Devuelve el historial actual de velas M1 "
                     "cerradas de EURUSD-OTC."
                 ),
                 "security": [
@@ -423,7 +423,7 @@ class CandlesAPIHandler(BaseHTTPRequestHandler):
                     "timestamp": c.get("timestamp"),
                     "time": c.get("time"),
                     "pair": PAIR,
-                    "timeframe": "M5",
+                    "timeframe": "M1",
                     "color": c.get("color"),
                     "open": c.get("open"),
                     "close": c.get("close"),
@@ -441,7 +441,7 @@ class CandlesAPIHandler(BaseHTTPRequestHandler):
             {
                 "ok": True,
                 "pair": PAIR,
-                "timeframe": "M5",
+                "timeframe": "M1",
                 "count": len(candles),
                 "candles": candles,
             },
@@ -616,7 +616,7 @@ def candle_detail(candle, pair, number=None, state="CERRADA"):
     lower = candle.get("lower_wick", min(candle["open"], candle["close"]) - candle["low"])
     upper = candle.get("upper_wick", candle["high"] - max(candle["open"], candle["close"]))
     return (
-        f"🕯️ VELA M5 {state}{title_number}\n"
+        f"🕯️ VELA M1 {state}{title_number}\n"
         f"Par: {pair}\nHora apertura: {dt}\n"
         f"Color actual: {_color_label(candle.get('color', 'desconocido'))}\n"
         f"Apertura: {_fmt_price(candle['open'])} | Cierre: {_fmt_price(candle['close'])}\n"
@@ -671,7 +671,7 @@ def binary_asset_status(iq, pair):
 
     TURBO es el mercado de opciones binarias que admite expiraciones
     de 1 a 5 minutos en iqoptionapi; por eso un par que no este abierto
-    en TURBO queda bloqueado para analisis y entrada de 5 minutos.
+    en TURBO queda bloqueado para analisis y entrada de 1 minuto.
     """
     try:
         data = iq.get_all_init_v2()
@@ -707,29 +707,29 @@ def binary_asset_status(iq, pair):
             is_open = enabled and not suspended
 
             if is_open:
-                return True, f"{pair} abierto en TURBO | expiracion 5m disponible"
+                return True, f"{pair} abierto en TURBO | expiracion 1m disponible"
 
             return False, f"{pair} TURBO cerrado/suspendido"
 
-        return False, f"{pair} no aparece en TURBO; 5m bloqueado"
+        return False, f"{pair} no aparece en TURBO; 1m bloqueado"
 
     except Exception as e:
         logging.exception(
             "No se pudo comprobar TURBO de %s",
             pair,
         )
-        return False, f"error disponibilidad 5m: {type(e).__name__}: {e}"
+        return False, f"error disponibilidad 1m: {type(e).__name__}: {e}"
 
 
 def wait_binary_asset(iq, pair, attempts=2, delay=0.35):
-    """Comprueba TURBO inmediatamente antes de una entrada de 5 minutos."""
+    """Comprueba TURBO inmediatamente antes de una entrada de 1 minuto."""
     last_reason = "sin respuesta"
 
     for attempt in range(1, attempts + 1):
         is_open, reason = binary_asset_status(iq, pair)
 
         logging.info(
-            "Disponibilidad 5m %s | intento=%d/%d | abierta=%s | %s",
+            "Disponibilidad 1m %s | intento=%d/%d | abierta=%s | %s",
             pair,
             attempt,
             attempts,
@@ -749,7 +749,7 @@ def wait_binary_asset(iq, pair, attempts=2, delay=0.35):
 
 
 def check_binary_availability(iq, pair):
-    """Comprueba exclusivamente disponibilidad TURBO para expiracion 5m."""
+    """Comprueba exclusivamente disponibilidad TURBO para expiracion 1m."""
     return binary_asset_status(iq, pair)
 
 
@@ -787,7 +787,7 @@ def _active_pair_name(active):
     return name.split(".")[-1]
 
 
-def discover_otc_5m_pairs(iq):
+def discover_otc_m1_pairs(iq):
     """Selecciona dos pares OTC abiertos; avanza por la lista disponible en cada rotación."""
     global PAIR_ROTATION_OFFSET
     try:
@@ -845,14 +845,14 @@ def discover_otc_5m_pairs(iq):
         PAIR_ROTATION_OFFSET = (start + MAX_OTC_PAIRS) % len(all_pairs)
 
         logging.info(
-            "Pares OTC TURBO/M5 encontrados: %d disponibles; seleccionados %d/%d | %s",
+            "Pares OTC TURBO/M1 encontrados: %d disponibles; seleccionados %d/%d | %s",
             len(all_pairs), len(pairs), MAX_OTC_PAIRS,
             ", ".join(pairs) if pairs else "NINGUNO",
         )
         return pairs
 
     except Exception:
-        logging.exception("Error actualizando pares OTC de 5 minutos")
+        logging.exception("Error actualizando pares OTC de 1 minuto")
         return []
 
 def execute_binary_order(iq, pair, signal, amount, expiration):
@@ -905,7 +905,7 @@ def execute_binary_order(iq, pair, signal, amount, expiration):
 def main():
     global received_candles, PAIR, PAIRS
 
-    logging.info("MAIN_INICIO | par=%s | M5 | demo | importe=%.2f | expiracion=%dm", PAIR, AMOUNT, EXPIRATION)
+    logging.info("MAIN_INICIO | par=%s | M1 | demo | importe=%.2f | expiracion=%dm", PAIR, AMOUNT, EXPIRATION)
     start_candles_api()
     iq = connect_retry()
     _ensure_telegram_worker()
@@ -917,11 +917,13 @@ def main():
     submitted_order_ids = set()   # no volver a procesar/notificar el mismo ID
     last_heartbeat = 0.0
     last_rotation_attempt = 0.0
-    cycle_traded_pairs = set()  # pares que ya ejecutaron una operación en el ciclo actual
+    traded_pairs = set()  # no volver a operar un par durante esta ejecución
+    refresh_pairs_interval = 900.0
+    last_pairs_refresh = time.monotonic()
 
     if AUTO_DISCOVER_PAIRS:
         logging.info("INICIO_DESCUBRIMIENTO | buscando pares OTC TURBO")
-        discovered = discover_otc_5m_pairs(iq)
+        discovered = discover_otc_m1_pairs(iq)
         PAIRS = discovered
     else:
         PAIRS = [PAIR]
@@ -967,8 +969,8 @@ def main():
                     second = int(server_now - current["timestamp"])
                     candle_stamp = current["timestamp"]
 
-                    # La estrategia confirma con las últimas 10 velas M5 CERRADAS.
-                    # La undécima vela M5 se reevalúa durante su formación para esperar
+                    # La estrategia confirma con las últimas 10 velas M1 CERRADAS.
+                    # La siguiente vela M1 se reevalúa durante su formación para esperar
                     # confirmación en tiempo real; las órdenes siguen limitadas a una por vela.
                     # Evita ejecutar una señal antigua si IQ Option entregó velas
                     # desfasadas: la vela de entrada esperada debe ser la actual.
@@ -985,22 +987,22 @@ def main():
 
                     order_text = ""
                     # No perseguir una señal tardía: solo se permite entrada en los
-                    # primeros 20 segundos de la undécima vela M5.
-                    if res["signal"] in ("CALL", "PUT") and second > 20:
+                    # primeros 20 segundos de la undécima vela M1.
+                    if res["signal"] in ("CALL", "PUT") and second > 12:
                         res["signal"] = "NO SIGNAL"
                         res["reason"] = (
                             "Entrada cancelada: la vela actual confirmó demasiado tarde "
-                            f"(segundo {second}; límite 20s). Se espera la siguiente oportunidad."
+                            f"(segundo {second}; límite 12s). Se espera la siguiente oportunidad."
                         )
 
-                    if res["signal"] in ("CALL", "PUT") and pair in cycle_traded_pairs:
-                        order_text = "\n⏸️ Par en pausa: ya ejecutó una operación en este ciclo; espera a que el otro par también opere."
+                    if res["signal"] in ("CALL", "PUT") and pair in traded_pairs:
+                        order_text = "\n⏸️ Entrada bloqueada: este par ya operó durante esta ejecución del bot."
 
-                    if res["signal"] in ("CALL", "PUT") and pair not in cycle_traded_pairs:
+                    if res["signal"] in ("CALL", "PUT") and pair not in traded_pairs:
                         expected_entry_stamp = res.get("entry_candle_timestamp")
                         if expected_entry_stamp != candle_stamp:
                             order_text = (
-                                "\n⛔ ENTRADA BLOQUEADA: la señal no corresponde a la vela M5 actual."
+                                "\n⛔ ENTRADA BLOQUEADA: la señal no corresponde a la vela M1 actual."
                                 f"\nVela esperada: {expected_entry_stamp}; vela actual: {candle_stamp}."
                             )
                         elif last_order_candle.get(pair) == candle_stamp:
@@ -1008,7 +1010,7 @@ def main():
                         elif not ENABLE_TRADES:
                             order_text = "\n🧪 Señal detectada; operaciones desactivadas."
                         else:
-                            # Una sola orden por par y vela M5; cada par solo puede
+                            # Una sola orden por par y vela M1; cada par solo puede
                             # ejecutar una operación aceptada por ciclo de dos pares.
                             # Reservar par/vela antes de llamar a la API evita reintentos
                             # duplicados si la respuesta tarda o queda ambigua.
@@ -1036,11 +1038,8 @@ def main():
                                     f"Expiración: {EXPIRATION} minutos\n"
                                     f"ID de orden: {oid}"
                                 )
-                                cycle_traded_pairs.add(pair)
-                                logging.info(
-                                    "OPERACION_CICLO | par=%s | pares_con_operacion=%d/%d",
-                                    pair, len(cycle_traded_pairs), len(PAIRS)
-                                )
+                                traded_pairs.add(pair)
+                                logging.info("PAR_BLOQUEADO_TRAS_OPERACION | par=%s | total=%d", pair, len(traded_pairs))
                             else:
                                 order_text = (
                                     f"\n\n⚠️ ORDEN NO CONFIRMADA"
@@ -1055,35 +1054,21 @@ def main():
                     logging.exception("Error procesando el par %s", pair)
                     continue
 
-            # La lista de dos pares solo se actualiza cuando AMBOS pares activos
-            # han ejecutado una operación aceptada. Hasta entonces, un par que ya
-            # operó queda en pausa y el bot sigue esperando al segundo.
-            active_pair_set = set(PAIRS)
-            if (AUTO_DISCOVER_PAIRS and len(active_pair_set) == 2
-                    and active_pair_set.issubset(cycle_traded_pairs)
-                    and now_mono - last_rotation_attempt >= 15.0):
+            # Actualizar los 9 pares disponibles cada 15 minutos, independientemente de las operaciones.
+            if AUTO_DISCOVER_PAIRS and now_mono - last_pairs_refresh >= refresh_pairs_interval:
                 previous_pairs = list(PAIRS)
-                last_rotation_attempt = now_mono
-                refreshed = discover_otc_5m_pairs(iq)
+                refreshed = discover_otc_m1_pairs(iq)
+                last_pairs_refresh = now_mono
                 if refreshed:
                     PAIRS = list(refreshed[:MAX_OTC_PAIRS])
-                    cycle_traded_pairs.clear()
                     active_set = set(PAIRS)
                     for state in (last_closed_stamp, last_reported_candle, last_order_candle):
                         for old_pair in list(state):
                             if old_pair not in active_set:
                                 state.pop(old_pair, None)
-                    logging.info(
-                        "ROTACION_PARES tras operar ambos | anteriores=%s | nuevos=%s",
-                        ", ".join(previous_pairs), ", ".join(PAIRS)
-                    )
+                    logging.info("ACTUALIZACION_PARES_15M | anteriores=%s | nuevos=%s", ", ".join(previous_pairs), ", ".join(PAIRS))
                 else:
-                    logging.warning(
-                        "Ambos pares ya operaron, pero no se pudo actualizar la lista; "
-                        "se conservan los pares actuales y se reintentará."
-                    )
-
-            # Telegram solo recibe el aviso de una orden aceptada por IQ Option.
+                    logging.warning("No se pudo actualizar la lista de pares; se conservan los actuales.")
 
         except Exception:
             logging.exception("Error de ciclo principal")

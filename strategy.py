@@ -1,8 +1,8 @@
-"""Estrategia M5 de ruptura + pullback/retest de soporte/resistencia.
+"""Estrategia M1 de ruptura + pullback/retest de soporte/resistencia.
 
 Busca niveles horizontales recientes, ruptura con fuerza, retroceso débil hacia
 el nivel roto y rechazo a favor de la ruptura. Evita perseguir velas extendidas.
-La orden solo se habilita en la vela M5 siguiente y durante sus primeros segundos,
+La orden solo se habilita en la vela M1 siguiente y durante sus primeros segundos,
 si el precio en formación confirma la dirección. No garantiza resultados.
 """
 
@@ -109,7 +109,7 @@ def analyze_market(raw, current=None, pair=None):
     base = {
         "signal": "NO SIGNAL", "bias": "NEUTRAL", "call_score": 0,
         "put_score": 0, "sequence": sequence, "sequence_text": sequence_text,
-        "entry_timing": "M5_RETEST_NEXT_CANDLE", "entry_candle_timestamp": None,
+        "entry_timing": "M1_RETEST_NEXT_CANDLE", "entry_candle_timestamp": None,
         "trend": "NEUTRAL", "impulse": False,
     }
     if len(recent) < 7:
@@ -123,7 +123,7 @@ def analyze_market(raw, current=None, pair=None):
         return base
     # Tolerancia adaptada a volatilidad. El nivel es una zona, no una línea exacta.
     tol = max(med_range * 0.22, 1e-12)
-    base["entry_candle_timestamp"] = recent[-1]["timestamp"] + 300
+    base["entry_candle_timestamp"] = recent[-1]["timestamp"] + 60
     base["zone_tolerance"] = tol
 
     # El último cierre debe ser la vela de rechazo del retest. Buscamos una ruptura
@@ -192,7 +192,7 @@ def analyze_market(raw, current=None, pair=None):
         base["reason"] = (
             "Sin entrada: no hay una ruptura reciente con fuerza seguida de retroceso débil "
             "y vela cerrada de rechazo en la zona S/R. No perseguir el precio; esperar otro retest. "
-            f"Tolerancia de zona={tol:.8g}, rango medio M5={med_range:.8g}."
+            f"Tolerancia de zona={tol:.8g}, rango medio M1={med_range:.8g}."
         )
         base["support_resistance"] = "Sin retest válido"
         return base
@@ -234,7 +234,7 @@ def analyze_market(raw, current=None, pair=None):
                  "put_score": int(signal == "PUT"), "reason": (
                      f"{signal} habilitado: ruptura con fuerza, retroceso débil y rechazo confirmado "
                      f"en retest de {level:.8g}; distancia al nivel={distance:.2f} rangos medios; "
-                     f"vela actual confirma temprano. Entrada solo al inicio de la vela M5 siguiente."
+                     f"vela actual confirma temprano. Entrada solo al inicio de la vela M1 siguiente."
                  )})
     return base
 
