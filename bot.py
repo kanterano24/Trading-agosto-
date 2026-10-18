@@ -75,6 +75,10 @@ TG_LAST_QUEUE_LOG = 0.0
 TG_WORKER_STARTED = False
 TG_WORKER_LOCK = threading.Lock()
 
+# Evita volver a notificar el mismo ID durante esta ejecución.
+NOTIFIED_ORDER_IDS = set()
+NOTIFIED_ORDER_LOCK = threading.Lock()
+
 # Historial actual que queda expuesto por /candles.
 received_candles = []
 API_SERVER = None
@@ -178,8 +182,22 @@ def tg(msg):
     message = str(msg).strip()
     # Descarta reportes, velas, inicio, cambios de pares, errores y órdenes
     # rechazadas. Solo se permite el aviso dedicado generado tras IQ.buy exitoso.
-    if not message.startswith("🧪 ORDEN ENVIADA\nPar:"):
+    if not message.startswith("🧪 ORDEN ACEPTADA\nPar:"):
         return False
+    # Un ID repetido no vuelve a generar otro aviso de Telegram.
+    order_id = None
+    for line in message.splitlines():
+        if line.startswith("ID de orden:"):
+            order_id = line.split(":", 1)[1].strip()
+            break
+    if not order_id or order_id.lower() in {"none", "false", "0", ""}:
+        logging.warning("Telegram bloqueó aviso sin ID de orden válido")
+        return False
+    with NOTIFIED_ORDER_LOCK:
+        if order_id in NOTIFIED_ORDER_IDS:
+            logging.warning("Aviso duplicado bloqueado para ID %s", order_id)
+            return False
+        NOTIFIED_ORDER_IDS.add(order_id)
     if not TOKEN or not CHAT:
         return False
 
@@ -838,30 +856,50 @@ def discover_otc_5m_pairs(iq):
         return []
 
 def execute_binary_order(iq, pair, signal, amount, expiration):
-    """Envía una sola orden y explica claramente los rechazos por saldo insuficiente."""
+    """Envía una orden en DEMO y solo la acepta si IQ Option devuelve un ID válido."""
     try:
         if amount <= 0:
-            return False, "Importe inválido: AMOUNT debe ser mayor que 0"
-        # Este bot trabaja en cuenta de práctica; no cambia a REAL.
+            return False, None, "Importe inválido: AMOUNT debe ser mayor que 0"
+        if signal not in ("CALL", "PUT"):
+            return False, None, f"Dirección inválida: {signal}"
+
+        # Fuerza DEMO justo antes de comprar; nunca cambia a REAL.
         iq.change_balance("PRACTICE")
-        ok, response = iq.buy(amount, pair, signal.lower(), expiration)
-        response_text = str(response)
-        if not ok and "insufficient funds" in response_text.lower():
-            return False, (
-                "Saldo insuficiente en la cuenta PRACTICE para el importe "
-                f"{amount:g}. Reduce AMOUNT en Railway (por ejemplo, a 1) "
-                "o verifica el saldo disponible de práctica."
-            )
-        return bool(ok), response
+        result = iq.buy(amount, pair, signal.lower(), expiration)
+        if not isinstance(result, (tuple, list)) or len(result) < 2:
+            return False, None, f"Respuesta inesperada de IQ Option: {result!r}"
+
+        ok, response = result[0], result[1]
+        # La API de IQ Option normalmente devuelve (True, id). No considerar
+        # aceptada una respuesta True sin un identificador comprobable.
+        if ok is not True or response in (None, False, 0, "", "None"):
+            response_text = str(response)
+            if "insufficient funds" in response_text.lower():
+                return False, None, (
+                    "Saldo insuficiente en PRACTICE. Reduce AMOUNT o verifica el saldo DEMO."
+                )
+            return False, None, f"IQ Option no confirmó la orden: ok={ok!r}, respuesta={response!r}"
+
+        # Normaliza el ID, sin inventarlo ni usar el texto de la respuesta como ID.
+        if isinstance(response, dict):
+            raw_id = response.get("id", response.get("order_id"))
+        else:
+            raw_id = response
+        try:
+            order_id = str(int(raw_id))
+        except (TypeError, ValueError, OverflowError):
+            return False, None, f"IQ Option respondió sin ID numérico verificable: {response!r}"
+        if int(order_id) <= 0:
+            return False, None, f"ID de orden no válido: {order_id}"
+
+        logging.info("ORDEN_CONFIRMADA_IQ | par=%s | dirección=%s | id=%s | cuenta=PRACTICE", pair, signal, order_id)
+        return True, order_id, "IQ Option aceptó la orden y devolvió un ID válido"
     except Exception as exc:
         response_text = str(exc)
         if "insufficient funds" in response_text.lower():
-            return False, (
-                "Saldo insuficiente en la cuenta PRACTICE. Reduce AMOUNT en "
-                "Railway (por ejemplo, a 1) o verifica el saldo disponible."
-            )
+            return False, None, "Saldo insuficiente en la cuenta PRACTICE."
         logging.exception("Error enviando orden %s %s", pair, signal)
-        return False, f"{type(exc).__name__}: {exc}"
+        return False, None, f"{type(exc).__name__}: {exc}"
 
 
 def main():
@@ -875,6 +913,8 @@ def main():
     last_closed_stamp = {}       # último cierre procesado por par
     last_reported_candle = {}    # limita los reportes rutinarios a uno por vela
     last_order_candle = {}       # evita duplicar una orden por par/vela
+    order_lock = threading.Lock() # serializa solicitudes de compra dentro de esta instancia
+    submitted_order_ids = set()   # no volver a procesar/notificar el mismo ID
     last_heartbeat = 0.0
     last_rotation_attempt = 0.0
     cycle_traded_pairs = set()  # pares que ya ejecutaron una operación en el ciclo actual
@@ -970,32 +1010,45 @@ def main():
                         else:
                             # Una sola orden por par y vela M5; cada par solo puede
                             # ejecutar una operación aceptada por ciclo de dos pares.
-                            last_order_candle[pair] = candle_stamp
-                            ok, oid = execute_binary_order(
-                                iq, pair, res["signal"], AMOUNT, EXPIRATION
-                            )
-                            order_text = (
-                                f"\n\n{'🧪 ORDEN ENVIADA' if ok else '⚠️ ORDEN RECHAZADA'}"
-                                f"\nPar: {pair}\nDirección: {res['signal']}"
-                                f"\nImporte: {AMOUNT:g}\nExpiración: {EXPIRATION} minutos"
-                                f"\nID/respuesta: {oid}"
-                            )
-                            # Un único mensaje por Telegram, únicamente si IQ Option
-                            # confirmó que la orden fue aceptada.
+                            # Reservar par/vela antes de llamar a la API evita reintentos
+                            # duplicados si la respuesta tarda o queda ambigua.
+                            with order_lock:
+                                last_order_candle[pair] = candle_stamp
+                                ok, oid, detail = execute_binary_order(
+                                    iq, pair, res["signal"], AMOUNT, EXPIRATION
+                                )
+                            if ok and oid in submitted_order_ids:
+                                ok = False
+                                detail = f"ID duplicado bloqueado: {oid}"
                             if ok:
+                                submitted_order_ids.add(oid)
+                                order_text = (
+                                    f"\n\n🧪 ORDEN ACEPTADA POR IQ OPTION"
+                                    f"\nPar: {pair}\nDirección: {res['signal']}"
+                                    f"\nImporte: {AMOUNT:g}\nExpiración: {EXPIRATION} minutos"
+                                    f"\nID de orden: {oid}"
+                                )
                                 tg(
-                                    "🧪 ORDEN ENVIADA\n"
+                                    "🧪 ORDEN ACEPTADA\n"
                                     f"Par: {pair}\n"
                                     f"Dirección: {res['signal']}\n"
                                     f"Importe: {AMOUNT:g}\n"
                                     f"Expiración: {EXPIRATION} minutos\n"
-                                    f"ID/respuesta: {oid}"
+                                    f"ID de orden: {oid}"
                                 )
                                 cycle_traded_pairs.add(pair)
                                 logging.info(
                                     "OPERACION_CICLO | par=%s | pares_con_operacion=%d/%d",
                                     pair, len(cycle_traded_pairs), len(PAIRS)
                                 )
+                            else:
+                                order_text = (
+                                    f"\n\n⚠️ ORDEN NO CONFIRMADA"
+                                    f"\nPar: {pair}\nDirección: {res['signal']}"
+                                    f"\nDetalle: {detail}"
+                                    "\nNo se reintenta en esta vela para evitar duplicados."
+                                )
+                                logging.warning("ORDEN_NO_CONFIRMADA | par=%s | señal=%s | detalle=%s", pair, res['signal'], detail)
 
 
                 except Exception:
