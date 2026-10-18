@@ -1,9 +1,8 @@
-"""Estrategia M1 de ruptura + pullback/retest de soporte/resistencia.
+"""Estrategia M1 de presión y reversión.
 
-Busca niveles horizontales recientes, ruptura con fuerza, retroceso débil hacia
-el nivel roto y rechazo a favor de la ruptura. Evita perseguir velas extendidas.
-La orden solo se habilita en la vela M1 siguiente y durante sus primeros segundos,
-si el precio en formación confirma la dirección. No garantiza resultados.
+Analiza presión bajista/alcista en velas cerradas y busca una vela de reversión
+que confirme el cambio. CALL tras presión bajista; PUT tras presión alcista.
+La señal se ejecuta en la vela M1 siguiente. No garantiza resultados.
 """
 
 
@@ -59,104 +58,95 @@ def format_candle(index, candle):
             f"MechaInf={c['lower_wick']} MechaSup={c['upper_wick']}")
 
 
-def _median(values):
-    values = sorted(v for v in values if v > 0)
-    if not values:
-        return 0.0
-    n = len(values)
-    return values[n // 2] if n % 2 else (values[n // 2 - 1] + values[n // 2]) / 2
-
-
-def _near(a, b, tolerance):
-    return abs(a - b) <= tolerance
-
-
-def _levels(candles, end_index, tolerance):
-    """Obtiene niveles horizontales a partir de máximos/mínimos pivote previos."""
-    highs, lows = [], []
-    # Usar pivotes confirmados, nunca velas posteriores al candidato de ruptura.
-    for i in range(1, max(1, end_index - 1)):
-        left, cur, right = candles[i - 1], candles[i], candles[i + 1]
-        if cur["high"] >= left["high"] and cur["high"] >= right["high"]:
-            highs.append(cur["high"])
-        if cur["low"] <= left["low"] and cur["low"] <= right["low"]:
-            lows.append(cur["low"])
-    # Agrupa niveles cercanos para tratar la zona como área, no como precio exacto.
-    def cluster(values):
-        groups = []
-        for value in sorted(values):
-            if groups and abs(value - sum(groups[-1]) / len(groups[-1])) <= tolerance:
-                groups[-1].append(value)
-            else:
-                groups.append([value])
-        return [sum(g) / len(g) for g in groups if len(g) >= 1]
-    return cluster(highs), cluster(lows)
-
-
 def analyze_market(raw, current=None, pair=None):
-    """Patrón de reversión CALL en tres velas M1:
-    1) vela roja con mecha inferior > cuerpo y mecha superior pequeña;
-    2) vela verde cerrada que confirma el giro alcista;
-    3) la vela M1 actual es la vela de entrada, con expiración configurada en bot.py.
+    """Evalúa presión de 3 velas y reversión confirmada en la última cerrada.
+
+    La entrada se programa en la vela actual (la siguiente a la reversión),
+    con ventana de ejecución en segundos 30-35 del reloj del broker.
+    Devuelve puntuación 0-100 para que bot.py escoja el mejor de seis pares.
     """
     candles = normalize_candles(raw)
-    recent = candles[-10:]
-    sequence = [c["color"] for c in recent]
+    recent = candles[-8:]
     code = {"green": "V", "red": "R", "doji": "D"}
     base = {
-        "signal": "NO SIGNAL", "bias": "NEUTRAL", "call_score": 0,
-        "put_score": 0, "sequence": sequence,
-        "sequence_text": "-".join(code[c] for c in sequence),
-        "entry_timing": "THIRD_M1_CANDLE_SECOND_30",
-        "entry_candle_timestamp": None, "trend": "NEUTRAL", "impulse": False,
+        "signal": "NO SIGNAL", "bias": "NEUTRAL", "call_score": 0, "put_score": 0,
+        "score": 0, "sequence": [c["color"] for c in recent],
+        "sequence_text": "-".join(code[c["color"]] for c in recent),
+        "entry_timing": "NEXT_M1_CANDLE_SECOND_30", "entry_candle_timestamp": None,
+        "trend": "NEUTRAL", "impulse": False,
+        "reason": "Sin señal: faltan velas para medir presión y reversión.",
     }
-    if len(candles) < 2:
-        base["reason"] = "Sin señal: se necesitan al menos dos velas cerradas para detectar el patrón."
+    if len(candles) < 4:
         return base
 
-    rejection = candles[-2]  # primera vela: rechazo bajista por mecha inferior
-    confirmation = candles[-1]  # segunda vela: confirmación verde
-    base["entry_candle_timestamp"] = confirmation["timestamp"] + 60
-
-    body = rejection["body"]
-    lower = rejection["lower_wick"]
-    upper = rejection["upper_wick"]
-    if rejection["color"] != "red":
-        base["reason"] = "Sin señal: la vela de rechazo (primera) no es roja."
-        return base
-    if body <= 0 or lower <= body:
-        base["reason"] = f"Sin señal: mecha inferior ({lower:.8g}) no supera el cuerpo ({body:.8g})."
-        return base
-    if upper > min(body * 0.35, rejection["range"] * 0.20):
-        base["reason"] = f"Sin señal: mecha superior demasiado grande ({upper:.8g})."
-        return base
-    if confirmation["color"] != "green":
-        base["reason"] = "Sin señal: la segunda vela no confirma la reversión con cierre verde."
-        return base
-    if confirmation["close"] <= rejection["open"]:
-        base["reason"] = "Sin señal: la vela verde no recupera el nivel de apertura de la vela roja."
+    # Tres velas anteriores deben mostrar presión en una dirección.
+    pressure = candles[-4:-1]
+    reversal = candles[-1]
+    if any(c["color"] == "doji" for c in pressure):
+        base["reason"] = "Sin señal: presión poco clara por velas doji."
         return base
 
-    # Evita considerar confirmación una vela verde insignificante/doji-like.
-    if confirmation["range"] <= 0 or confirmation["body"] < confirmation["range"] * 0.25:
-        base["reason"] = "Sin señal: la vela verde confirma con poca fuerza (cuerpo menor al 25% del rango)."
+    reds = sum(c["color"] == "red" for c in pressure)
+    greens = sum(c["color"] == "green" for c in pressure)
+    down_pressure = reds >= 2 and pressure[-1]["close"] < pressure[0]["close"]
+    up_pressure = greens >= 2 and pressure[-1]["close"] > pressure[0]["close"]
+    if not (down_pressure or up_pressure):
+        base["reason"] = "Sin señal: las tres velas previas no muestran presión direccional suficiente."
         return base
 
-    base.update({
-        "signal": "CALL", "bias": "CALL", "trend": "ALCISTA_POR_REVERSIÓN",
-        "call_score": 1, "put_score": 0, "impulse": True,
-        "candle_timestamp": rejection["timestamp"],
-        "confirmation_timestamp": confirmation["timestamp"],
-        "candle_body": body, "lower_wick": lower, "upper_wick": upper,
-        "reason": ("CALL habilitado: vela roja con mecha inferior larga, seguida de vela verde "
-                   "que confirma la reversión. Entrada en la tercera vela M1."),
-    })
+    if reversal["range"] <= 0 or reversal["body"] <= 0:
+        base["reason"] = "Sin señal: vela de reversión sin rango/cuerpo suficiente."
+        return base
+
+    # La reversión debe tener cuerpo y cerrar más allá del cierre previo; la mecha
+    # en contra de la nueva dirección debe ser moderada, para evitar dojis.
+    prior = candles[-2]
+    if down_pressure and reversal["color"] == "green":
+        close_confirmation = reversal["close"] > prior["close"]
+        body_ratio = reversal["body"] / reversal["range"]
+        wick_ratio = reversal["upper_wick"] / reversal["range"]
+        if close_confirmation and body_ratio >= 0.30 and wick_ratio <= 0.45:
+            pressure_strength = min(25, 10 + (reds * 5))
+            reversal_strength = min(50, int(25 + body_ratio * 35))
+            wick_strength = min(25, int((1 - wick_ratio) * 25))
+            score = max(1, min(100, pressure_strength + reversal_strength + wick_strength))
+            base.update({
+                "signal": "CALL", "bias": "CALL", "trend": "REVERSIÓN_ALCISTA",
+                "call_score": score, "put_score": 0, "score": score, "impulse": True,
+                "pressure": "BAJISTA", "pressure_candles": 3,
+                "reversal_timestamp": reversal["timestamp"],
+                "entry_candle_timestamp": reversal["timestamp"] + 60,
+                "reason": (f"Presión bajista detectada; vela verde de reversión confirmada. "
+                           f"Puntuación {score}/100; CALL en la siguiente vela M1."),
+            })
+            return base
+
+    if up_pressure and reversal["color"] == "red":
+        close_confirmation = reversal["close"] < prior["close"]
+        body_ratio = reversal["body"] / reversal["range"]
+        wick_ratio = reversal["lower_wick"] / reversal["range"]
+        if close_confirmation and body_ratio >= 0.30 and wick_ratio <= 0.45:
+            pressure_strength = min(25, 10 + (greens * 5))
+            reversal_strength = min(50, int(25 + body_ratio * 35))
+            wick_strength = min(25, int((1 - wick_ratio) * 25))
+            score = max(1, min(100, pressure_strength + reversal_strength + wick_strength))
+            base.update({
+                "signal": "PUT", "bias": "PUT", "trend": "REVERSIÓN_BAJISTA",
+                "call_score": 0, "put_score": score, "score": score, "impulse": True,
+                "pressure": "ALCISTA", "pressure_candles": 3,
+                "reversal_timestamp": reversal["timestamp"],
+                "entry_candle_timestamp": reversal["timestamp"] + 60,
+                "reason": (f"Presión alcista detectada; vela roja de reversión confirmada. "
+                           f"Puntuación {score}/100; PUT en la siguiente vela M1."),
+            })
+            return base
+
+    base["reason"] = "Presión detectada, pero la vela cerrada no confirmó una reversión suficientemente fuerte."
     return base
 
+
 def classify_candles(raw):
-    """Compatibilidad con versiones previas del bot."""
-    result = analyze_market(raw)
-    return result.get("signal", "NO SIGNAL")
+    return analyze_market(raw).get("signal", "NO SIGNAL")
 
 
 def get_signal(df):

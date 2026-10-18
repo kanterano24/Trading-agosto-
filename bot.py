@@ -1,4 +1,4 @@
-"""Bot OTC M1: patrón de reversión en tres velas, expiración de 2 minutos.
+"""Bot OTC M1: patrón de reversión en cuatro velas, expiración de 1 minuto.
 
 - Obtiene únicamente velas M1 cerradas desde IQ Option.
 - Telegram solo recibe confirmaciones de órdenes ejecutadas correctamente.
@@ -26,16 +26,16 @@ PAIR = os.getenv("PAIR", "ARBUSD-OTC").strip().upper()
 # Analiza hasta 50 pares OTC que estén abiertos en TURBO.
 # Los pares preferidos van primero si están disponibles; los demás se descubren
 # automáticamente. La lista se vuelve a comprobar cada 15 minutos.
-PREFERRED_PAIRS = ["ARBUSD-OTC", "ATOMUSD-OTC", "AUDCAD-OTC"]
+PREFERRED_PAIRS = ["EURUSD-OTC", "GBPUSD-OTC", "USDJPY-OTC", "AUDUSD-OTC", "EURJPY-OTC", "GBPJPY-OTC"]
 PAIRS = []
-MAX_OTC_PAIRS = 50
+MAX_OTC_PAIRS = 6
 AUTO_DISCOVER_PAIRS = True
 # La lista rota únicamente después de que los dos pares activos ejecuten
 # una operación aceptada cada uno.
 PAIR_ROTATION_OFFSET = 0
 TF = 60
 COUNT = 200
-EXPIRATION = 2
+EXPIRATION = 1
 # Importe predeterminado: mínimo habitual de IQ Option.
 # Si Railway tiene AMOUNT configurado, esa variable prevalece.
 AMOUNT = float(os.getenv("AMOUNT", "5"))
@@ -788,7 +788,7 @@ def _active_pair_name(active):
 
 
 def discover_otc_m1_pairs(iq):
-    """Selecciona hasta 50 pares OTC abiertos y disponibles."""
+    """Selecciona los seis pares OTC abiertos con preferencia a los pares configurados."""
     global PAIR_ROTATION_OFFSET
     try:
         data = iq.get_all_init_v2()
@@ -898,31 +898,28 @@ def execute_binary_order(iq, pair, signal, amount, expiration):
 def main():
     global received_candles, PAIR, PAIRS
 
-    logging.info("MAIN_INICIO | par=%s | M1 | demo | importe=%.2f | expiracion=%dm", PAIR, AMOUNT, EXPIRATION)
+    logging.info("MAIN_INICIO | presión y reversión M1 | DEMO | importe=%.2f | expiración=%dm", AMOUNT, EXPIRATION)
     start_candles_api()
     iq = connect_retry()
     _ensure_telegram_worker()
 
-    last_closed_stamp = {}       # último cierre procesado por par
-    last_reported_candle = {}    # limita los reportes rutinarios a uno por vela
-    last_order_candle = {}       # evita duplicar una orden por par/vela
-    order_lock = threading.Lock() # serializa solicitudes de compra dentro de esta instancia
-    submitted_order_ids = set()   # no volver a procesar/notificar el mismo ID
+    last_closed_stamp = {}
+    last_order_candle = {}
+    submitted_order_ids = set()
+    order_lock = threading.Lock()
     last_heartbeat = 0.0
-    last_rotation_attempt = 0.0
-    traded_pairs = set()  # no volver a operar un par durante esta ejecución
-    refresh_pairs_interval = 900.0
     last_pairs_refresh = time.monotonic()
+    refresh_pairs_interval = 900.0
+    # Limita a una sola entrada total por minuto de broker, no una por cada par.
+    last_global_entry_minute = None
+    last_scan_log = {}
 
     if AUTO_DISCOVER_PAIRS:
-        logging.info("INICIO_DESCUBRIMIENTO | buscando pares OTC TURBO")
-        discovered = discover_otc_m1_pairs(iq)
-        PAIRS = discovered
+        logging.info("INICIO_DESCUBRIMIENTO | buscando 6 pares OTC TURBO")
+        PAIRS = discover_otc_m1_pairs(iq)
     else:
         PAIRS = [PAIR]
-    logging.info("PARES_ACTIVOS | modo=%s | cantidad=%d | pares=%s", "auto" if AUTO_DISCOVER_PAIRS else "fijo", len(PAIRS), ", ".join(PAIRS))
-    if AUTO_DISCOVER_PAIRS and not discovered:
-        logging.warning("No hay pares OTC disponibles en TURBO; se volverá a comprobar disponibilidad.")
+    logging.info("PARES_ACTIVOS | cantidad=%d | pares=%s", len(PAIRS), ", ".join(PAIRS))
 
     while True:
         try:
@@ -931,128 +928,105 @@ def main():
 
             now_mono = time.monotonic()
             if now_mono - last_heartbeat >= 30.0:
-                logging.info("CICLO_ACTIVO | pares=%d | cola_telegram=%d", len(PAIRS), TG_QUEUE.qsize())
+                logging.info("CICLO_ACTIVO | pares=%d | analizando_aunque_haya_operaciones_abiertas", len(PAIRS))
                 last_heartbeat = now_mono
+
             if not PAIRS:
+                if AUTO_DISCOVER_PAIRS and now_mono - last_pairs_refresh >= 30.0:
+                    discovered = discover_otc_m1_pairs(iq)
+                    last_pairs_refresh = now_mono
+                    if discovered:
+                        PAIRS = discovered[:MAX_OTC_PAIRS]
                 time.sleep(POLL)
                 continue
 
-            # Los reportes de análisis se mantienen en los logs; Telegram solo acepta mensajes de ejecución.
-
-            # Cada ciclo revisa todos los pares activos de la lista (hasta 50).
-            for pair in list(PAIRS):
+            candidates = []
+            broker_now = None
+            # Siempre analiza los seis pares, aunque haya una operación en curso.
+            for pair in list(PAIRS[:MAX_OTC_PAIRS]):
                 try:
-                    logging.debug("CONSULTANDO_VELAS | par=%s", pair)
                     closed, current, server_now = get_candles(iq, pair)
-                    if not closed:
-                        logging.warning("SIN_VELAS_CERRADAS | par=%s; se reintentará en el siguiente ciclo", pair)
+                    broker_now = server_now if broker_now is None else max(broker_now, server_now)
+                    if len(closed) < 4 or current is None:
                         continue
 
                     PAIR = pair
                     received_candles = build_candle_api_history(closed)
-
-                    logging.info("VELAS_RECIBIDAS | par=%s | cerradas=%d | actual=%s", pair, len(closed), current.get("timestamp") if current else "no disponible")
                     closed_stamp = closed[-1]["timestamp"]
-                    if last_closed_stamp.get(pair) != closed_stamp:
-                        last_closed_stamp[pair] = closed_stamp
-
-                    if current is None or len(closed) < 10:
-                        continue
-
+                    last_closed_stamp[pair] = closed_stamp
                     second = int(server_now - current["timestamp"])
-                    candle_stamp = current["timestamp"]
+                    current_stamp = current["timestamp"]
+                    res = analyze_market(closed[-10:], current=current, pair=pair)
 
-                    # Analiza las dos últimas velas M1 cerradas: rechazo rojo y confirmación verde.
-                    # La entrada corresponde a la tercera vela, al segundo 30 del broker.
-                    setup_candles = closed[-10:]
-                    res = analyze_market(setup_candles, current=current, pair=pair)
-                    sequence_text = "-".join(
-                        {"green": "V", "red": "R", "doji": "D"}.get(x, "?")
-                        for x in res.get("sequence", [])
-                    )
-                    logging.info(
-                        "%s | segundo=%d | secuencia=%s | señal=%s | %s",
-                        pair, second, sequence_text, res["signal"], res["reason"]
-                    )
+                    # Reduce ruido de logs: una línea por par y vela de broker.
+                    if last_scan_log.get(pair) != current_stamp:
+                        logging.info(
+                            "ANÁLISIS_REVERSIÓN | par=%s | presión=%s | señal=%s | score=%s | %s",
+                            pair, res.get("pressure", "NEUTRAL"), res["signal"],
+                            res.get("score", 0), res["reason"]
+                        )
+                        last_scan_log[pair] = current_stamp
 
-                    order_text = ""
-                    # Ejecutar únicamente alrededor del segundo 30 de la tercera vela M1.
-                    # Ventana de 30-35s para compensar latencia de consulta y envío.
-                    if res["signal"] in ("CALL", "PUT") and not (30 <= second <= 35):
-                        res["signal"] = "NO SIGNAL"
-                        res["reason"] = f"Señal pendiente: segundo del broker={second}; entrada solo entre 30 y 35."
-
-                    if res["signal"] in ("CALL", "PUT") and pair in traded_pairs:
-                        order_text = "\n⏸️ Entrada bloqueada: este par ya operó durante esta ejecución del bot."
-
-                    if res["signal"] in ("CALL", "PUT") and pair not in traded_pairs:
-                        expected_entry_stamp = res.get("entry_candle_timestamp")
-                        if expected_entry_stamp != candle_stamp:
-                            order_text = (
-                                "\n⛔ ENTRADA BLOQUEADA: la señal no corresponde a la vela M1 actual."
-                                f"\nVela esperada: {expected_entry_stamp}; vela actual: {candle_stamp}."
-                            )
-                        elif last_order_candle.get(pair) == candle_stamp:
-                            order_text = "\n⛔ Orden duplicada bloqueada para esta vela."
-                        elif not ENABLE_TRADES:
-                            order_text = "\n🧪 Señal detectada; operaciones desactivadas."
-                        else:
-                            # Una sola orden por par y vela M1; cada par solo puede
-                            # ejecutar una operación aceptada durante esta ejecución.
-                            # Reservar par/vela antes de llamar a la API evita reintentos
-                            # duplicados si la respuesta tarda o queda ambigua.
-                            with order_lock:
-                                last_order_candle[pair] = candle_stamp
-                                ok, oid, detail = execute_binary_order(
-                                    iq, pair, res["signal"], AMOUNT, EXPIRATION
-                                )
-                            if ok and oid in submitted_order_ids:
-                                ok = False
-                                detail = f"ID duplicado bloqueado: {oid}"
-                            if ok:
-                                submitted_order_ids.add(oid)
-                                order_text = (
-                                    f"\n\n🧪 ORDEN ACEPTADA POR IQ OPTION"
-                                    f"\nPar: {pair}\nDirección: {res['signal']}"
-                                    f"\nImporte: {AMOUNT:g}\nExpiración: {EXPIRATION} minutos"
-                                    f"\nID de orden: {oid}"
-                                )
-                                tg(
-                                    "🧪 ORDEN ACEPTADA\n"
-                                    f"Par: {pair}\n"
-                                    f"Dirección: {res['signal']}\n"
-                                    f"Importe: {AMOUNT:g}\n"
-                                    f"Expiración: {EXPIRATION} minutos\n"
-                                    f"ID de orden: {oid}"
-                                )
-                                traded_pairs.add(pair)
-                                logging.info("PAR_BLOQUEADO_TRAS_OPERACION | par=%s | total=%d", pair, len(traded_pairs))
-                            else:
-                                order_text = (
-                                    f"\n\n⚠️ ORDEN NO CONFIRMADA"
-                                    f"\nPar: {pair}\nDirección: {res['signal']}"
-                                    f"\nDetalle: {detail}"
-                                    "\nNo se reintenta en esta vela para evitar duplicados."
-                                )
-                                logging.warning("ORDEN_NO_CONFIRMADA | par=%s | señal=%s | detalle=%s", pair, res['signal'], detail)
-
+                    if res["signal"] not in ("CALL", "PUT"):
+                        continue
+                    if res.get("entry_candle_timestamp") != current_stamp:
+                        continue
+                    # La vela actual es la siguiente a la vela de reversión. Entrar
+                    # solo entre los segundos 30-35 del reloj del broker.
+                    if not (30 <= second <= 35):
+                        continue
+                    if last_order_candle.get(pair) == current_stamp:
+                        continue
+                    res = dict(res)
+                    res.update({"pair": pair, "second": second, "current_stamp": current_stamp})
+                    candidates.append(res)
 
                 except Exception:
-                    logging.exception("Error procesando el par %s", pair)
+                    logging.exception("Error analizando el par %s", pair)
                     continue
 
-            # Actualizar hasta 50 pares disponibles cada 15 minutos, independientemente de las operaciones.
+            # Escoge un único candidato global por minuto: score mayor primero.
+            if candidates and broker_now is not None:
+                minute_key = int(broker_now // 60)
+                if last_global_entry_minute != minute_key:
+                    candidates.sort(key=lambda item: (item.get("score", 0), item.get("call_score", 0), item.get("put_score", 0)), reverse=True)
+                    chosen = candidates[0]
+                    pair = chosen["pair"]
+                    signal = chosen["signal"]
+                    current_stamp = chosen["current_stamp"]
+                    with order_lock:
+                        # Reservar antes de la llamada para evitar reintentos duplicados
+                        # si la respuesta de la API es lenta o ambigua.
+                        last_order_candle[pair] = current_stamp
+                        last_global_entry_minute = minute_key
+                        ok, oid, detail = execute_binary_order(iq, pair, signal, AMOUNT, EXPIRATION)
+
+                    if ok and oid in submitted_order_ids:
+                        ok = False
+                        detail = f"ID duplicado bloqueado: {oid}"
+                    if ok:
+                        submitted_order_ids.add(oid)
+                        message = (
+                            "🧪 ORDEN ACEPTADA\n"
+                            f"Par: {pair}\nDirección: {signal}\nImporte: {AMOUNT:g}\n"
+                            f"Expiración: {EXPIRATION} minutos\nID de orden: {oid}\n"
+                            f"Presión previa: {chosen.get('pressure', 'N/D')}\n"
+                            f"Puntuación del patrón: {chosen.get('score', 0)}/100"
+                        )
+                        tg(message)
+                        logging.info("MEJOR_SEÑAL_EJECUTADA | par=%s | dirección=%s | score=%s | id=%s", pair, signal, chosen.get("score", 0), oid)
+                    else:
+                        logging.warning("ORDEN_NO_CONFIRMADA | par=%s | señal=%s | detalle=%s", pair, signal, detail)
+                else:
+                    logging.debug("ENTRADA_GLOBAL_BLOQUEADA | ya hubo una entrada en minuto=%s", minute_key)
+
+            # Actualizar seis pares cada 15 minutos; no espera a que las operaciones terminen.
             if AUTO_DISCOVER_PAIRS and now_mono - last_pairs_refresh >= refresh_pairs_interval:
                 previous_pairs = list(PAIRS)
                 refreshed = discover_otc_m1_pairs(iq)
                 last_pairs_refresh = now_mono
                 if refreshed:
                     PAIRS = list(refreshed[:MAX_OTC_PAIRS])
-                    active_set = set(PAIRS)
-                    for state in (last_closed_stamp, last_reported_candle, last_order_candle):
-                        for old_pair in list(state):
-                            if old_pair not in active_set:
-                                state.pop(old_pair, None)
                     logging.info("ACTUALIZACION_PARES_15M | anteriores=%s | nuevos=%s", ", ".join(previous_pairs), ", ".join(PAIRS))
                 else:
                     logging.warning("No se pudo actualizar la lista de pares; se conservan los actuales.")
