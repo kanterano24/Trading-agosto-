@@ -1,4 +1,4 @@
-"""Bot OTC M1: analiza velas de 1 minuto y ejecuta con expiración de 1 minuto.
+"""Bot OTC M1: patrón de reversión en tres velas, expiración de 2 minutos.
 
 - Obtiene únicamente velas M1 cerradas desde IQ Option.
 - Telegram solo recibe confirmaciones de órdenes ejecutadas correctamente.
@@ -962,8 +962,8 @@ def main():
                     second = int(server_now - current["timestamp"])
                     candle_stamp = current["timestamp"]
 
-                    # Analiza la última vela M1 cerrada y programa la entrada en la
-                    # siguiente vela, al segundo 30 del reloj del servidor de IQ Option.
+                    # Analiza las dos últimas velas M1 cerradas: rechazo rojo y confirmación verde.
+                    # La entrada corresponde a la tercera vela, al segundo 30 del broker.
                     setup_candles = closed[-10:]
                     res = analyze_market(setup_candles, current=current, pair=pair)
                     sequence_text = "-".join(
@@ -976,7 +976,7 @@ def main():
                     )
 
                     order_text = ""
-                    # Ejecutar únicamente alrededor del segundo 30 de la vela M1 actual.
+                    # Ejecutar únicamente alrededor del segundo 30 de la tercera vela M1.
                     # Ventana de 30-35s para compensar latencia de consulta y envío.
                     if res["signal"] in ("CALL", "PUT") and not (30 <= second <= 35):
                         res["signal"] = "NO SIGNAL"
@@ -998,7 +998,7 @@ def main():
                             order_text = "\n🧪 Señal detectada; operaciones desactivadas."
                         else:
                             # Una sola orden por par y vela M1; cada par solo puede
-                            # ejecutar una operación aceptada por ciclo de dos pares.
+                            # ejecutar una operación aceptada durante esta ejecución.
                             # Reservar par/vela antes de llamar a la API evita reintentos
                             # duplicados si la respuesta tarda o queda ambigua.
                             with order_lock:
