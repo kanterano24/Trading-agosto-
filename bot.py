@@ -284,7 +284,7 @@ def _telegram_control_panel():
 
 
 def _telegram_control_worker():
-    """Lee exclusivamente los botones de control del chat autorizado."""
+    """Procesa /start, /stop y los botones del chat de Telegram autorizado."""
     global TG_UPDATE_OFFSET
     if not TOKEN or not CHAT:
         return
@@ -294,7 +294,7 @@ def _telegram_control_worker():
         try:
             response = sess.get(
                 f"{base}/getUpdates",
-                params={"offset": TG_UPDATE_OFFSET, "timeout": 20, "allowed_updates": json.dumps(["callback_query"])},
+                params={"offset": TG_UPDATE_OFFSET, "timeout": 20, "allowed_updates": json.dumps(["message", "callback_query"])},
                 timeout=30,
             )
             response.raise_for_status()
@@ -305,6 +305,33 @@ def _telegram_control_worker():
 
             for update in payload.get("result", []):
                 TG_UPDATE_OFFSET = max(TG_UPDATE_OFFSET, int(update.get("update_id", 0)) + 1)
+
+                # Comandos de texto: solo se aceptan desde TELEGRAM_CHAT_ID configurado.
+                incoming = update.get("message") or {}
+                incoming_chat_id = str((incoming.get("chat") or {}).get("id", ""))
+                text = str(incoming.get("text", "")).strip()
+                command = text.split()[0].split("@", 1)[0].lower() if text else ""
+                if incoming_chat_id == str(CHAT) and command in ("/start", "/stop", "/status"):
+                    if command == "/start":
+                        active = _set_bot_active(True)
+                        reply = "▶️ BOT ACTIVADO. Puede abrir nuevas operaciones. El análisis continúa en segundo plano."
+                    elif command == "/stop":
+                        active = _set_bot_active(False)
+                        reply = "⏹️ BOT DETENIDO. No abrirá nuevas operaciones; el análisis continúa en segundo plano."
+                    else:
+                        active = _bot_is_active()
+                        reply = "Estado del bot: " + ("ACTIVO; puede abrir operaciones." if active else "DETENIDO; no abrirá operaciones.")
+                    try:
+                        sess.post(
+                            f"{base}/sendMessage",
+                            json={"chat_id": CHAT, "text": reply, "reply_markup": _control_keyboard()},
+                            timeout=10,
+                        ).raise_for_status()
+                        logging.info("CONTROL_TELEGRAM | comando=%s | bot=%s", command, "ACTIVO" if active else "DETENIDO")
+                    except requests.RequestException:
+                        logging.exception("No se pudo responder al comando Telegram %s", command)
+                    continue
+
                 callback = update.get("callback_query") or {}
                 data = callback.get("data")
                 message = callback.get("message") or {}
@@ -325,7 +352,7 @@ def _telegram_control_worker():
                         json={
                             "chat_id": CHAT,
                             "message_id": message.get("message_id"),
-                            "text": "🎛️ CONTROL DEL BOT QUANT MODE\nEstado: " + ("ACTIVO" if active else "DETENIDO") + "\n\nUsa los botones para permitir o pausar nuevas operaciones. El análisis continúa en segundo plano.",
+                            "text": "🎛️ CONTROL DEL BOT QUANT MODE\nEstado: " + ("ACTIVO" if active else "DETENIDO") + "\n\nUsa los botones o /start y /stop para controlar nuevas operaciones. El análisis continúa en segundo plano.",
                             "reply_markup": _control_keyboard(),
                             "disable_web_page_preview": True,
                         },
