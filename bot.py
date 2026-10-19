@@ -1,8 +1,7 @@
 """Bot OTC M1: presión completa y entrada de reversión al abrir la vela siguiente, expiración de 1 minuto.
 
 - Obtiene únicamente velas M1 cerradas desde IQ Option.
-- Telegram solo recibe confirmaciones de órdenes ejecutadas correctamente.
-- NO usa Telegram getUpdates.
+- Telegram recibe confirmaciones de órdenes y ofrece botones para activar/detener operaciones.
 - Expone /health, /candles y /openapi.json para consultas externas.
 - /candles puede protegerse con CANDLES_API_KEY.
 """
@@ -44,6 +43,10 @@ if AMOUNT <= 0:
 ENABLE_TRADES = os.getenv("ENABLE_TRADES", "true").lower() in (
     "1", "true", "yes", "si"
 )
+BOT_ACTIVE = ENABLE_TRADES
+BOT_ACTIVE_LOCK = threading.Lock()
+TG_CONTROL_STARTED = False
+TG_UPDATE_OFFSET = 0
 
 EMAIL = os.getenv("IQ_EMAIL", "")
 PASSWORD = os.getenv("IQ_PASSWORD", "")
@@ -232,6 +235,120 @@ def tg(msg):
             )
             TG_LAST_QUEUE_LOG = now
         return False
+
+
+def _bot_is_active():
+    with BOT_ACTIVE_LOCK:
+        return BOT_ACTIVE
+
+
+def _set_bot_active(active):
+    global BOT_ACTIVE
+    with BOT_ACTIVE_LOCK:
+        BOT_ACTIVE = bool(active)
+        return BOT_ACTIVE
+
+
+def _control_keyboard():
+    active = _bot_is_active()
+    return {
+        "inline_keyboard": [[
+            {"text": "▶️ ACTIVAR BOT" if not active else "✅ BOT ACTIVO", "callback_data": "bot:start"},
+            {"text": "⏹️ DETENER BOT" if active else "⏸️ BOT DETENIDO", "callback_data": "bot:stop"},
+        ]]
+    }
+
+
+def _telegram_control_panel():
+    """Publica el panel de control de operaciones en el chat configurado."""
+    if not TOKEN or not CHAT:
+        logging.warning("Botones de Telegram desactivados: falta TELEGRAM_TOKEN o TELEGRAM_CHAT_ID")
+        return
+    try:
+        response = sess.post(
+            f"https://api.telegram.org/bot{TOKEN}/sendMessage",
+            json={
+                "chat_id": CHAT,
+                "text": "🎛️ CONTROL DEL BOT QUANT MODE\nEstado: " + ("ACTIVO" if _bot_is_active() else "DETENIDO") + "\n\nUsa los botones para permitir o pausar nuevas operaciones. El análisis continúa en segundo plano.",
+                "reply_markup": _control_keyboard(),
+                "disable_web_page_preview": True,
+            },
+            timeout=15,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        if not payload.get("ok"):
+            logging.warning("No se pudo crear el panel de control Telegram: %s", payload)
+    except requests.RequestException as exc:
+        logging.warning("No se pudo enviar el panel de control Telegram: %s", exc)
+
+
+def _telegram_control_worker():
+    """Lee exclusivamente los botones de control del chat autorizado."""
+    global TG_UPDATE_OFFSET
+    if not TOKEN or not CHAT:
+        return
+
+    base = f"https://api.telegram.org/bot{TOKEN}"
+    while True:
+        try:
+            response = sess.get(
+                f"{base}/getUpdates",
+                params={"offset": TG_UPDATE_OFFSET, "timeout": 20, "allowed_updates": json.dumps(["callback_query"])},
+                timeout=30,
+            )
+            response.raise_for_status()
+            payload = response.json()
+            if not payload.get("ok"):
+                time.sleep(2)
+                continue
+
+            for update in payload.get("result", []):
+                TG_UPDATE_OFFSET = max(TG_UPDATE_OFFSET, int(update.get("update_id", 0)) + 1)
+                callback = update.get("callback_query") or {}
+                data = callback.get("data")
+                message = callback.get("message") or {}
+                chat_id = str((message.get("chat") or {}).get("id", ""))
+                if chat_id != str(CHAT) or data not in ("bot:start", "bot:stop"):
+                    continue
+
+                active = _set_bot_active(data == "bot:start")
+                answer = "Bot ACTIVADO: puede abrir nuevas operaciones." if active else "Bot DETENIDO: no abrirá nuevas operaciones. El análisis continúa."
+                try:
+                    sess.post(
+                        f"{base}/answerCallbackQuery",
+                        json={"callback_query_id": callback.get("id"), "text": answer, "show_alert": False},
+                        timeout=10,
+                    )
+                    sess.post(
+                        f"{base}/editMessageText",
+                        json={
+                            "chat_id": CHAT,
+                            "message_id": message.get("message_id"),
+                            "text": "🎛️ CONTROL DEL BOT QUANT MODE\nEstado: " + ("ACTIVO" if active else "DETENIDO") + "\n\nUsa los botones para permitir o pausar nuevas operaciones. El análisis continúa en segundo plano.",
+                            "reply_markup": _control_keyboard(),
+                            "disable_web_page_preview": True,
+                        },
+                        timeout=10,
+                    )
+                    logging.info("CONTROL_TELEGRAM | bot=%s", "ACTIVO" if active else "DETENIDO")
+                except requests.RequestException:
+                    logging.exception("No se pudo actualizar el panel de control Telegram")
+        except requests.RequestException as exc:
+            logging.warning("Control Telegram sin conexión; reintento: %s", exc)
+            time.sleep(3)
+        except Exception:
+            logging.exception("Error en el control Telegram")
+            time.sleep(3)
+
+
+def start_telegram_controls():
+    global TG_CONTROL_STARTED
+    if TG_CONTROL_STARTED or not TOKEN or not CHAT:
+        return
+    TG_CONTROL_STARTED = True
+    _telegram_control_panel()
+    threading.Thread(target=_telegram_control_worker, name="telegram-bot-controls", daemon=True).start()
 
 
 OPENAPI_SPEC = {
@@ -901,6 +1018,7 @@ def main():
     start_candles_api()
     iq = connect_retry()
     _ensure_telegram_worker()
+    start_telegram_controls()
 
     last_closed_stamp = {}
     last_order_candle = {}
@@ -985,6 +1103,10 @@ def main():
                 except Exception:
                     logging.exception("Error analizando el par %s", pair)
                     continue
+
+            # El botón DETENER pausa nuevas órdenes, pero mantiene el análisis de los pares.
+            if not _bot_is_active():
+                candidates = []
 
             # Escoge un único candidato global por minuto. La estrategia ya exige presión,
             # reversión cerrada, rechazo y ubicación antes de permitir una señal.
