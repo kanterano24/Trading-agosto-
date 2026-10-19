@@ -946,7 +946,7 @@ def main():
                 try:
                     closed, current, server_now = get_candles(iq, pair)
                     broker_now = server_now if broker_now is None else max(broker_now, server_now)
-                    if len(closed) < 4 or current is None:
+                    if len(closed) < 13 or current is None:
                         continue
 
                     PAIR = pair
@@ -955,7 +955,7 @@ def main():
                     last_closed_stamp[pair] = closed_stamp
                     second = int(server_now - current["timestamp"])
                     current_stamp = current["timestamp"]
-                    res = analyze_market(closed[-10:], current=current, pair=pair)
+                    res = analyze_market(closed[-13:], current=current, pair=pair)
 
                     # Reduce ruido de logs: una línea por par y vela de broker.
                     if last_scan_log.get(pair) != current_stamp:
@@ -970,10 +970,11 @@ def main():
                         continue
                     if res.get("entry_candle_timestamp") != current_stamp:
                         continue
-                    # La vela de presión ya está completamente cerrada. Ejecutar
-                    # en la apertura de la vela M1 siguiente, no 30 segundos después.
-                    # Se permite una ventana corta por la latencia de la API/red.
-                    if not (0 <= second <= 8):
+                    # Solo tomar las configuraciones fuertes, y solo al inicio
+                    # de la vela nueva: si la API llega tarde, se omite la entrada.
+                    if res.get("score", 0) < int(os.getenv("MIN_OPPORTUNITY_SCORE", "75")):
+                        continue
+                    if not (0 <= second <= 1):
                         continue
                     if last_order_candle.get(pair) == current_stamp:
                         continue
