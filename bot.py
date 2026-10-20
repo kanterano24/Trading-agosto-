@@ -27,7 +27,7 @@ PAIR = os.getenv("PAIR", "ARBUSD-OTC").strip().upper()
 # la lista se vuelve a comprobar cada 15 minutos.
 PREFERRED_PAIRS = ["EURUSD-OTC", "GBPUSD-OTC", "USDJPY-OTC", "AUDUSD-OTC", "EURJPY-OTC", "GBPJPY-OTC"]
 PAIRS = []
-MAX_OTC_PAIRS = 2
+MAX_OTC_PAIRS = 50
 AUTO_DISCOVER_PAIRS = True
 # La lista rota únicamente después de que los dos pares activos ejecuten
 # una operación aceptada cada uno.
