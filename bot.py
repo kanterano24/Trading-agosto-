@@ -27,7 +27,7 @@ PAIR = os.getenv("PAIR", "ARBUSD-OTC").strip().upper()
 # la lista se vuelve a comprobar cada 15 minutos.
 PREFERRED_PAIRS = ["EURUSD-OTC", "GBPUSD-OTC", "USDJPY-OTC", "AUDUSD-OTC", "EURJPY-OTC", "GBPJPY-OTC"]
 PAIRS = []
-MAX_OTC_PAIRS = 6
+MAX_OTC_PAIRS = 2
 AUTO_DISCOVER_PAIRS = True
 # La lista rota únicamente después de que los dos pares activos ejecuten
 # una operación aceptada cada uno.
@@ -37,7 +37,7 @@ COUNT = 200
 EXPIRATION = 1
 # Importe predeterminado: mínimo habitual de IQ Option.
 # Si Railway tiene AMOUNT configurado, esa variable prevalece.
-AMOUNT = float(os.getenv("AMOUNT", "5"))
+AMOUNT = float(os.getenv("AMOUNT", "8"))
 if AMOUNT <= 0:
     raise ValueError("AMOUNT debe ser mayor que 0")
 
